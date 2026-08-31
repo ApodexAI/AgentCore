@@ -10,6 +10,7 @@ from typing import Any
 
 from agent_core.errors import (
     LLMCallExhausted,
+    LLMDeadlineExceeded,
     LLMReasoningRunaway,
     LLMStreamStalled,
 )
@@ -108,6 +109,8 @@ def _default_rate_limit_backoff(attempt: int) -> float:
 #
 # The semaphore is loop-affine: rebuilt whenever the running loop
 # changes (worker = one loop for life; tests get one per case).
+# Suffix resolved through the shared ``AGENT_CORE_`` / compatibility-prefix
+# cascade by ``_env_int``.
 _LLM_GATE_ENV = "LLM_MAX_CONCURRENT"
 _llm_gate_state: tuple[Any, asyncio.Semaphore] | None = None
 
@@ -303,14 +306,16 @@ async def call_llm(
 
     def _effective_timeout_or_deadline_exhausted(
         *, attempt: int, reason: str,
-    ) -> float:
+    ) -> tuple[float, str]:
         effective_timeout = timeout
+        timeout_deadline_reason = ""
         deadline_remaining, deadline_reason = _nearest_deadline()
         if deadline_remaining is not None and deadline_remaining < timeout:
             if deadline_remaining < _WALL_DEADLINE_FLOOR_S:
-                deadline_exc = TimeoutError(
-                    f"{deadline_reason} reached ({deadline_remaining:.0f}s left "
-                    f"< {_WALL_DEADLINE_FLOOR_S:.0f}s floor)",
+                deadline_exc = LLMDeadlineExceeded(
+                    deadline_reason,
+                    f"{deadline_remaining:.0f}s left "
+                    f"< {_WALL_DEADLINE_FLOOR_S:.0f}s attempt floor",
                 )
                 logger.warning(
                     "LLM call refused: %.0fs to %s (< %.0fs "
@@ -330,6 +335,7 @@ async def call_llm(
                     deadline_exc, deadline_reason, prior_exc=last_exc,
                 ) from deadline_exc
             effective_timeout = deadline_remaining
+            timeout_deadline_reason = deadline_reason
             logger.info(
                 "LLM call timeout clamped to %s remaining: %ds → %.0fs "
                 "(turn=%d, attempt=%d/%d, reason=%s)",
@@ -337,7 +343,7 @@ async def call_llm(
                 timeout, effective_timeout, turn, attempt + 1, max_retries,
                 reason,
             )
-        return effective_timeout
+        return effective_timeout, timeout_deadline_reason
 
     def _deadline_allows_retry_after(delay_s: float) -> bool:
         deadline_remaining, _deadline_reason = _nearest_deadline()
@@ -398,8 +404,10 @@ async def call_llm(
         # Budget closure: clamp this attempt to the remaining wall (when
         # a deadline is stamped) so a retry chain can never outlive the
         # loop's own budget. Under the floor, refuse to start at all.
-        effective_timeout = _effective_timeout_or_deadline_exhausted(
-            attempt=attempt, reason="pre_gate",
+        effective_timeout, attempt_deadline_reason = (
+            _effective_timeout_or_deadline_exhausted(
+                attempt=attempt, reason="pre_gate",
+            )
         )
         physical_attempt_index += 1
         attempt_index = physical_attempt_index
@@ -546,12 +554,20 @@ async def call_llm(
                                 gate.acquire(), timeout=gate_wait_timeout,
                             )
                         except TimeoutError as exc:
+                            deadline_exc = LLMDeadlineExceeded(
+                                _deadline_reason,
+                                "concurrency-gate wait consumed the remaining budget",
+                            )
                             raise LLMCallExhausted(
-                                exc, _deadline_reason, prior_exc=last_exc,
+                                deadline_exc,
+                                _deadline_reason,
+                                prior_exc=last_exc,
                             ) from exc
                     gate_acquired = True
-                    effective_timeout = _effective_timeout_or_deadline_exhausted(
-                        attempt=attempt, reason="post_gate",
+                    effective_timeout, attempt_deadline_reason = (
+                        _effective_timeout_or_deadline_exhausted(
+                            attempt=attempt, reason="post_gate",
+                        )
                     )
                 if attempt_delta is None:
                     response = await asyncio.wait_for(
@@ -589,7 +605,7 @@ async def call_llm(
                                 _effective_timeout_or_deadline_exhausted(
                                     attempt=attempt,
                                     reason="stream_empty_tool_arguments",
-                                ),
+                                )[0],
                                 max(
                                     effective_timeout
                                     - (stream_ended_at - attempt_started),
@@ -950,23 +966,29 @@ async def call_llm(
                 raise LLMCallExhausted(exc, "chain_advance") from exc
             backoff = _transient_backoff(attempt)
         except TimeoutError as exc:
+            prior_exc = last_exc
             last_exc = exc
             retry_error = exc
             retry_reason = "timeout"
             deadline_remaining, deadline_reason = _nearest_deadline()
             if (
-                deadline_remaining is not None
+                attempt_deadline_reason
+                and deadline_remaining is not None
                 and deadline_remaining <= 0
-                and deadline_reason == "logical_call_deadline"
+                and deadline_reason == attempt_deadline_reason
             ):
+                deadline_exc = LLMDeadlineExceeded(
+                    deadline_reason,
+                    "deadline-clamped provider attempt exhausted its budget",
+                )
                 await _finish_attempt(
                     outcome=ATTEMPT_FAILED,
                     reason=deadline_reason,
                     recovery_action="raise",
-                    error=exc,
+                    error=deadline_exc,
                 )
                 raise LLMCallExhausted(
-                    exc, deadline_reason,
+                    deadline_exc, deadline_reason, prior_exc=prior_exc,
                 ) from exc
             logger.warning(
                 "LLM call timed out (turn=%d, attempt=%d/%d)",
@@ -1134,8 +1156,9 @@ async def call_llm(
                 # budget, go salvage" from "this key's retries are spent,
                 # try another leg", even though the attempt event emitted
                 # just above already reported ``deadline_reason``.
-                deadline_exc = TimeoutError(
-                    f"{deadline_reason} reached before retry "
+                deadline_exc = LLMDeadlineExceeded(
+                    deadline_reason,
+                    "reached before retry "
                     f"(backoff {int(backoff)}s + {_WALL_DEADLINE_FLOOR_S:.0f}s "
                     f"floor > {deadline_remaining:.0f}s left)",
                 )

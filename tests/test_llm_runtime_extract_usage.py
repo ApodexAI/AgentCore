@@ -6,8 +6,8 @@ with keys ``provider`` / ``model`` / ``prompt_tokens`` /
 ``completion_tokens`` / ``cache_read_tokens`` / ``cache_write_tokens`` /
 ``cached_tokens`` / ``cache_creation_tokens`` / ``reasoning_tokens``.
 ``provider`` comes from ``response_metadata.provider_actually_used``
-(stamped by ``LLMFallbackChain`` per attempt) — empty string when no
-chain wrapper stamped it. Both LangChain ``usage_metadata``
+(stamped by a provider-chain wrapper per attempt) — empty string when no
+chain wrapper stamped it. Both the legacy canonical ``usage_metadata``
 (``input_tokens`` / ``output_tokens``, no ``model``) and OpenAI raw
 ``response_metadata.token_usage`` must fold to that target shape.
 
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from agent_core.llm import LLMResponse
 from agent_core.runtime.loop._response import _pick_int
 from agent_core.runtime.loop.llm_client import extract_usage
 
@@ -50,8 +51,27 @@ def test_returns_none_when_no_usage_anywhere() -> None:
                                                "output_tokens": 0})) is None
 
 
-def test_langchain_usage_metadata_shape() -> None:
-    # langchain canonical: input_tokens / output_tokens, model in response_metadata.
+def test_native_response_zero_fills_reasoning_tokens() -> None:
+    usage = extract_usage(LLMResponse(
+        model="native-model",
+        usage={"prompt_tokens": 7, "completion_tokens": 3},
+    ))
+
+    assert usage == {
+        "provider": "",
+        "model": "native-model",
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+
+
+def test_canonical_usage_metadata_shape() -> None:
+    # Canonical input/output token fields; model lives in response_metadata.
     resp = _resp(
         usage_metadata={
             "input_tokens": 120,
@@ -102,7 +122,7 @@ def test_openai_raw_token_usage_shape() -> None:
 
 
 def test_usage_metadata_takes_precedence_over_token_usage() -> None:
-    """When both shapes are present, prefer the LangChain canonical one."""
+    """When both shapes are present, prefer the canonical metadata one."""
     resp = _resp(
         usage_metadata={"input_tokens": 1, "output_tokens": 2},
         response_metadata={
@@ -174,9 +194,8 @@ def test_response_metadata_alt_keys() -> None:
     }
 
 
-def test_langchain_cache_creation_and_reasoning_tokens() -> None:
-    """LangChain canonical: cache_creation via input_token_details,
-    reasoning via output_token_details. Anthropic + o-series via langchain."""
+def test_canonical_cache_creation_and_reasoning_tokens() -> None:
+    """Canonical cache creation and reasoning token detail fields."""
     resp = _resp(
         usage_metadata={
             "input_tokens": 500,
@@ -305,8 +324,8 @@ def test_qwen_null_cached_tokens_normalises_to_zero() -> None:
 
 
 def test_provider_actually_used_stamped_by_chain() -> None:
-    """When ``LLMFallbackChain._stamp_metadata`` writes
-    ``provider_actually_used``, extract_usage surfaces it as ``provider``
+    """When a provider-chain wrapper writes ``provider_actually_used``,
+    extract_usage surfaces it as ``provider``
     so downstream billing can attribute the call per vendor."""
     resp = _resp(
         usage_metadata={"input_tokens": 100, "output_tokens": 20},
@@ -449,7 +468,7 @@ def test_bedrock_via_openai_gateway_nests_anthropic_cache_read_under_ptd() -> No
 
 
 def test_apodex_canonical_path_finds_nested_cache_creation() -> None:
-    """The apodex shape with LangChain canonical metadata populated but
+    """A gateway shape with canonical metadata populated but
     empty details — fallback to ptd.cache_creation_input_tokens MUST
     still pick up the write count via the cross-check that the canonical
     path runs when its own details came back empty.
@@ -568,8 +587,8 @@ def test_pick_int_skips_none_and_invalid_falls_through_to_real_signal() -> None:
 
 
 def test_usage_metadata_object_coerces_to_dict() -> None:
-    """LangChain may return a Pydantic model for ``usage_metadata``; we
-    coerce via ``dict(...)`` like the original implementation did."""
+    """A compatibility adapter may return an object for ``usage_metadata``;
+    coerce it via ``dict(...)`` rather than requiring a concrete dict."""
     class UM:
         def keys(self):
             return ("input_tokens", "output_tokens")

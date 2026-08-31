@@ -20,8 +20,8 @@ Anthropic content-block shape (``[{"type": "thinking", ...}, {"type": "text", ..
 is preserved as the ``content`` value when the underlying client returns it;
 callers that need flat text use :func:`text_of`.
 
-This module replaces ``langchain_core.messages`` (BaseMessage / SystemMessage /
-HumanMessage / AIMessage / ToolMessage). It is intentionally dependency-free.
+This module replaces the former framework-specific message classes with a
+small, dependency-free wire contract.
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ Role = Literal["system", "user", "assistant", "tool"]
 class ToolCall(TypedDict):
     """OpenAI-style tool_call payload — ``function.arguments`` is JSON-encoded.
 
-    Wire key order is fixed ``{type, id, function}`` to match the LangChain
-    serializer the served checkpoints were aligned against; do not reorder.
+    Wire key order is fixed ``{type, id, function}`` to match the serializer
+    byte shape the served checkpoints were aligned against; do not reorder.
     """
 
     id: str
@@ -141,7 +141,7 @@ def for_wire(messages: list[Message]) -> list[Message]:
 
 # Key insertion order: ``content`` first, then ``role``. Some served
 # checkpoints are sensitive to this byte shape (wire byte-equality with
-# LangChain's ``_convert_message_to_dict`` — see migration gotcha #2). Do
+# the legacy message serializer — see migration gotcha #2). Do
 # not reorder these dict literals.
 
 

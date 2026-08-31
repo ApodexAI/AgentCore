@@ -6,12 +6,12 @@ semantics are transient — sleeping + retrying the same key fixes it.
 
 Until this fix, ``call_llm`` treated every 400 as non-transient and
 returned ``None`` immediately, surfacing the failure to the caller as
-"sub-agent's LLM call failed; report is partial." Observed in
-``temp/2026-05-12_heavy_mode_sdk_multiturn.md`` §"Side observations".
+"sub-agent's LLM call failed; report is partial." This was observed in a
+multi-turn smoke against an OpenAI-compatible proxy.
 
 The fix delegates the classification to
-``agent_core.infra.retriable.is_transient_network``, which both this
-call site and ``workflows/heavy_mode/utils/provider_chain.py`` share.
+``agent_core.runtime.retriable.is_transient_network``, the shared predicate
+used by this call site and product provider-chain wrappers.
 """
 
 from __future__ import annotations

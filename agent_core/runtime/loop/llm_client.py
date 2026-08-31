@@ -11,6 +11,7 @@ from agent_core.errors import (
     LLMCallExhausted as LLMCallExhausted,
 )
 from agent_core.errors import (
+    LLMDeadlineExceeded,
     LLMReasoningRunaway,
     LLMStreamStalled,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "RUNAWAY_STATE_KEY",
     "TRUNCATION_CONTINUATION_GUIDANCE",
     "LLMCallExhausted",
+    "LLMDeadlineExceeded",
     "LLMReasoningRunaway",
     "LLMStreamStalled",
     "ThinkTagSplitter",

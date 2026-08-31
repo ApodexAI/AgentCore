@@ -10,6 +10,8 @@ a raw ``Exception`` into one of a small number of decisions:
   safety-filter rejection, model-not-hosted, and auth failure: a wrong or
   unauthorised key is fixed by the next leg, not by sleeping.
 - *Short-circuit to salvage* — input exceeded the model's context.
+- *Surface the enclosing deadline* — the run or logical call budget ended;
+  neither sleeping nor rotating providers can buy more time.
 - *Surface immediately* — everything left over, e.g. a malformed-request
   4xx that no key or provider can satisfy.
 
@@ -64,6 +66,9 @@ Public predicates (each pure on a single ``Exception``):
   already retried this endpoint/key up to its stall threshold and then
   surfaced for chain advance. Do not classify it as transient-network;
   same-key backoff would repeat the dead-stream budget.
+- :class:`~agent_core.errors.LLMDeadlineExceeded` — carries either
+  ``wall_deadline`` or ``logical_call_deadline`` and is deliberately excluded
+  from transient-network retry.
 
 Composed predicate:
 
@@ -77,7 +82,8 @@ Composed predicate:
 
 Label helper:
 
-- ``classify_error(err)`` — returns one of ``"context_length"`` /
+- ``classify_error(err)`` — returns a deadline reason when given
+  :class:`~agent_core.errors.LLMDeadlineExceeded`, otherwise one of ``"context_length"`` /
   ``"safety_filter"`` / ``"model_unavailable"`` / ``"auth_failure"`` /
   ``"empty_completion"`` / ``"overloaded"`` / ``"credit_exhausted"`` /
   ``"stream_stall"`` / ``"rate_limited"`` / ``"transient_network"`` /
@@ -92,6 +98,8 @@ observer, a test.
 from __future__ import annotations
 
 import re
+
+from agent_core.errors import LLMDeadlineExceeded
 
 _OVERLOAD_PATTERNS = (
     re.compile(r"overload", re.IGNORECASE),
@@ -339,6 +347,8 @@ def is_transient_network(err: BaseException) -> bool:
     keeps priority so a 503 with ``overloaded_error`` in the body still
     routes to rotation rather than backoff.
     """
+    if isinstance(err, LLMDeadlineExceeded):
+        return False
     if is_stream_stall(err):
         return False
     if is_overloaded_error(err):
@@ -481,7 +491,8 @@ def classify_error(err: BaseException) -> str:
     """Short reason label for the ``report.fallback`` SSE payload.
 
     Precedence (top wins):
-      ``context_length`` → ``safety_filter`` → ``model_unavailable`` →
+      runtime deadline → ``context_length`` → ``safety_filter`` →
+      ``model_unavailable`` →
       ``auth_failure`` → ``empty_completion`` → ``overloaded`` →
       ``credit_exhausted`` → ``stream_stall`` → ``rate_limited`` →
       ``transient_network`` → ``other``.
@@ -500,6 +511,8 @@ def classify_error(err: BaseException) -> str:
     empty body, so labelling it by its own shape keeps a silent-empty
     endpoint from being read as ordinary overload.
     """
+    if isinstance(err, LLMDeadlineExceeded):
+        return err.reason
     if is_context_length_error(err):
         return "context_length"
     if is_safety_filter(err):

@@ -1,6 +1,6 @@
 """Streaming assembly invariants in ``_stream_llm_response``.
 
-History: against langchain, ``AIMessageChunk + AIMessageChunk`` merged
+History: the legacy chunk merger combined
 ``response_metadata`` with ``merge_dicts``, which **concatenated** string
 values across chunks. Correct for tokenized content (one stream → one
 string) but wrong for header-like fields an OpenAI-compatible proxy
@@ -14,8 +14,8 @@ carries only ``content`` / ``reasoning_content`` / ``tool_call_deltas``
 — no ``response_metadata`` to merge, so there is nothing to double.
 ``_stream_llm_response`` folds the deltas into an ``LLMResponse`` whose
 ``content`` is the clean concatenation. ``response_metadata`` stays empty
-UNLESS the serving leg stamped a vendor: ``LLMFallbackChain.stream`` sets
-``StreamDelta.provider``, which the assembler folds into
+UNLESS a serving-leg wrapper stamps ``StreamDelta.provider``, which the
+assembler folds into
 ``response_metadata["provider_actually_used"]`` so streamed calls carry
 billing attribution (the doubling bug still cannot recur — only one
 known key is written, never a per-chunk dict merge). ``usage`` /
@@ -154,8 +154,7 @@ async def test_streaming_carries_terminal_usage_and_finish_reason(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_streaming_folds_provider_actually_used(monkeypatch):
-    """A leg-stamped ``StreamDelta.provider`` (set by
-    ``LLMFallbackChain.stream`` / ``with_provider_stamp``) is folded into the
+    """A serving-leg-stamped ``StreamDelta.provider`` is folded into the
     assembled response's ``response_metadata`` so streamed calls bill against
     the right vendor — the gap that split mirothinker into a ``provider=""``
     bucket and an ``@apodex`` bucket. ``extract_usage`` then surfaces it."""
@@ -196,7 +195,7 @@ async def test_streaming_folds_provider_actually_used(monkeypatch):
 async def test_streaming_many_chunks_content_clean(monkeypatch):
     """Three content deltas still concatenate cleanly into one body with
     no per-chunk metadata bleed — pins that adding chunks never
-    re-introduces the doubling the langchain merge produced."""
+    re-introduces the doubling the legacy merge produced."""
     real_sleep = asyncio.sleep
 
     async def _noop(_):

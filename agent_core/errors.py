@@ -94,6 +94,22 @@ class LLMStreamStalled(LLMError, TimeoutError):
             f"(chunks_seen={chunks_seen}, elapsed={elapsed_s:.0f}s)",
         )
 
+
+class LLMDeadlineExceeded(LLMError, TimeoutError):
+    """An LLM attempt was stopped by an enclosing runtime deadline.
+
+    ``reason`` is deliberately carried on the underlying exception as well as
+    on :class:`LLMCallExhausted`. Some callers unwrap ``last_exc`` before
+    handing it to a provider-chain policy; a dedicated type prevents that
+    policy from mistaking an exhausted run budget for an ordinary transient
+    provider timeout.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}")
+
+
 class LLMCallExhausted(LLMError, RuntimeError):
     """Raised by ``call_llm`` when retries are exhausted or the error is
     structurally unrecoverable (4xx without proxy-wrap, or a chain-aware
@@ -106,11 +122,11 @@ class LLMCallExhausted(LLMError, RuntimeError):
     wrapper calls ``classify_error(last_exc)`` directly.
 
     ``last_exc`` must always agree with ``reason``: it is the exception that
-    *caused this raise*, not merely the most recent failure seen. A
-    deadline refusal therefore carries the deadline ``TimeoutError`` even
-    when earlier attempts failed for unrelated reasons — otherwise a chain
-    wrapper classifying ``last_exc`` would read, say, ``rate_limited`` off a
-    stale 429 and retry straight past the deadline the reason announced.
+    *caused this raise*, not merely the most recent failure seen. A deadline
+    refusal therefore carries :class:`LLMDeadlineExceeded` even when earlier
+    attempts failed for unrelated reasons. The wrapper's ``reason`` remains
+    authoritative, while the underlying exception preserves the same reason
+    if a caller unwraps it before classification.
 
     ``prior_exc`` is where that earlier, superseded failure goes: diagnostic
     context for logs and post-mortems, deliberately outside the field
@@ -138,6 +154,7 @@ __all__ = [
     "InvalidStateTransition",
     "KernelError",
     "LLMCallExhausted",
+    "LLMDeadlineExceeded",
     "LLMError",
     "LLMReasoningRunaway",
     "LLMStreamStalled",

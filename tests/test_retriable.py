@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_core.errors import LLMDeadlineExceeded
 from agent_core.runtime.retriable import (
     classify_error,
     is_credit_exhausted,
@@ -18,7 +19,17 @@ from agent_core.runtime.retriable import (
     is_rate_limited,
     is_retriable_with_fallback,
     is_stream_stall,
+    is_transient_network,
 )
+
+
+@pytest.mark.parametrize("reason", ["wall_deadline", "logical_call_deadline"])
+def test_runtime_deadline_is_not_a_transient_provider_timeout(reason: str) -> None:
+    err = LLMDeadlineExceeded(reason, "budget consumed")
+
+    assert classify_error(err) == reason
+    assert not is_transient_network(err)
+    assert not is_retriable_with_fallback(err)
 
 # ── is_overloaded_error ──────────────────────────────────────────────
 
@@ -141,8 +152,8 @@ def test_empty_completion_not_overmatched() -> None:
 
 
 def test_empty_completion_is_retriable_with_fallback() -> None:
-    """The 2026-05-29 fix: a reasoning-runaway empty completion (LangChain's
-    bare ``ValueError('No generation chunks were returned')``) must advance
+    """A reasoning-runaway empty completion carrying the observed bare
+    ``ValueError('No generation chunks were returned')`` must advance
     the chain instead of being fatal — otherwise one empty among a heavy
     run's ~150 calls kills the whole run."""
     assert is_retriable_with_fallback(
@@ -480,8 +491,8 @@ def test_classify_precedence_model_unavailable_before_overload() -> None:
 
 
 # ── is_auth_failure (chaos-discovered gap, 2026-05-21) ────────────────
-# Background: scenarios/01 of scripts/chaos_heavy_mode.py set
-# OPENROUTER_API_KEY to garbage and expected the chain to advance.
+# Background: a key-clobber chaos scenario supplied invalid credentials and
+# expected the chain to advance.
 # Instead the run crashed exit=1 because the resulting
 # openai.AuthenticationError ("Missing Authentication header", 401)
 # wasn't in is_retriable_with_fallback. These tests pin the four wire
