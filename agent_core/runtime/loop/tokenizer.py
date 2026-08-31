@@ -25,7 +25,6 @@ use :func:`get_encoding_nonblocking`.
 
 from __future__ import annotations
 
-import importlib
 import logging
 import threading
 from typing import Any
@@ -49,8 +48,9 @@ def _load(name: str) -> None:
     """Blocking tiktoken init — only ever runs on a daemon thread."""
     enc: Any
     try:
-        tiktoken: Any = importlib.import_module("tiktoken")
-        enc = tiktoken.get_encoding(name)
+        import tiktoken  # pyright: ignore[reportMissingImports]
+
+        enc = tiktoken.get_encoding(name)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
     except Exception:  # not installed / fetch failure / bad name
         enc = False
         logger.debug("tiktoken encoding %r unavailable; using heuristic", name)
