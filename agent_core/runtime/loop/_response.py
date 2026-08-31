@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from agent_core.llm import LLMResponse
+from agent_core.loop_types import UsageMetadata
 from agent_core.messages import Message
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ def _pick_int(*candidates: Any) -> int:
     return 0
 
 
-def extract_usage(response: Any) -> dict[str, int | str] | None:
+def extract_usage(response: Any) -> UsageMetadata | None:
     """Extract token usage from an LLM response, normalized to OpenAI shape.
 
     Returns a dict with keys ``provider`` / ``model`` / ``prompt_tokens`` /
@@ -186,7 +187,7 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
             # the pre-split cache fields.
             cache_read = int(usage.get("cached_tokens", 0) or 0)
             cache_write = int(usage.get("cache_creation_tokens", 0) or 0)
-        out_dict: dict[str, int | str] = {
+        out_dict: UsageMetadata = {
             "provider": provider,
             "model": response.model or "",
             "prompt_tokens": inp,
@@ -228,7 +229,7 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
         cached: int,
         cache_create: int,
         reasoning: int,
-    ) -> dict[str, int | str]:
+    ) -> UsageMetadata:
         # ``cached`` carries cache READ; ``cache_create`` carries cache
         # WRITE. The legacy ``cached_tokens`` / ``cache_creation_tokens``
         # keys are kept as a derived sum and an alias respectively so

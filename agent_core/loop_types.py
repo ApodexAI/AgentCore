@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from agent_core.messages import Message
 
@@ -16,6 +16,23 @@ logger = logging.getLogger(__name__)
 
 # Absolute monotonic soft deadline stored in execution-scope metadata.
 WALL_DEADLINE_MONOTONIC_KEY = "wall_deadline_monotonic"
+
+
+class UsageMetadata(TypedDict, total=False):
+    """Normalized observer-facing usage and model attribution."""
+
+    provider: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    cached_tokens: int
+    cache_creation_tokens: int
+    reasoning_tokens: int
+    estimated: bool
 
 
 def deadline_remaining_s(metadata: Mapping[str, Any] | None) -> float | None:
@@ -135,7 +152,7 @@ class TurnContext:
     thinking: str
     tool_calls: list[dict[str, Any]]
     messages: list[Message]
-    usage: dict[str, int] | None
+    usage: UsageMetadata | None
     metadata: dict[str, Any]
     # Reasoning recovered from tags leaked into visible content.
     leaked_reasoning: str = ""
@@ -209,7 +226,7 @@ class LLMAttemptContext:
     recovery_action: str = ""
     duration_ms: int = 0
     ttft_ms: int | None = None
-    usage: dict[str, int] | None = None
+    usage: dict[str, Any] | None = None
     finish_reason: str = ""
     visible_chars: int = 0
     reasoning_chars: int = 0
