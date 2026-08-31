@@ -17,6 +17,9 @@ Version `0.1.x` contains the converged foundation layer:
 - compaction policy and deterministic compactor;
 - context-budget estimation and non-blocking tokenizer access;
 - message trimming.
+- provider-neutral LLM response, stream, and client contracts;
+- loop configuration, lifecycle contexts, observer protocol, intervention
+  merging, and observer dispatch helpers.
 
 The initial extraction is based on the already-merged integration branches:
 
@@ -26,11 +29,10 @@ The initial extraction is based on the already-merged integration branches:
 Those revisions are provenance, not runtime dependencies. AgentCore tests and
 builds without either product checkout.
 
-The LLM call runtime and agent loop are the next migration slice. They remain
-in the products until their remaining dependencies (`loop_types`, tool
-execution, model profiles, retry classification, and runtime hooks) have a
-product-neutral boundary. Moving those files before that boundary exists would
-only hide product coupling inside this package.
+The LLM call runtime and agent loop remain in the products until tool
+execution, model profiles, retry classification, execution-context storage,
+and runtime hooks have product-neutral boundaries. Moving those files before
+that boundary exists would only hide product coupling inside this package.
 
 ## Repository boundary
 
@@ -106,8 +108,9 @@ edit both products' core copies, that is evidence it belongs here.
 
 1. **Foundation** (this version): messages, token estimation, compaction,
    context budget, trimming.
-2. **Runtime contracts:** errors, LLM/tool protocols, loop types, execution
-   context, retry classification, and explicit product hooks.
+2. **Runtime contracts** (in progress): LLM protocols and loop types are now
+   shared; errors, execution-context storage, retry classification, and
+   explicit product hooks remain.
 3. **LLM runtime:** binding, calls, streaming, response normalization, runaway
    recovery, and the public `llm_client` facade.
 4. **Agent loop:** model/tool parsing, tool execution, and `agent_loop`.
