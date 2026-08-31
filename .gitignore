@@ -1,0 +1,10 @@
+/.venv/
+/dist/
+/build/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/.pyright/
+__pycache__/
+*.py[cod]
+*.egg-info/
