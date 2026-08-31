@@ -83,9 +83,8 @@ class LLMClient(Protocol):
     ) -> AsyncIterator[StreamDelta]:
         """Stream a completion as a sequence of incremental ``StreamDelta``s.
 
-        The terminal ``LLMResponse`` (with assembled content + finalised
-        tool_calls + usage) is accessible via :meth:`last_response` after the
-        stream is exhausted.
+        Terminal metadata is carried by late deltas; the consuming runtime is
+        responsible for assembling those deltas into its final response.
         """
         ...
 

@@ -50,6 +50,11 @@ def test_no_inject_messages_stays_none_not_empty_list():
     assert merge_interventions([Intervention(), Intervention()]).inject_messages is None
 
 
+def test_explicit_empty_inject_messages_stays_empty_not_none():
+    merged = merge_interventions([Intervention(), Intervention(inject_messages=[]), Intervention()])
+    assert merged.inject_messages == []
+
+
 def test_stop_reason_first_non_none_wins():
     merged = merge_interventions(
         [
@@ -59,6 +64,13 @@ def test_stop_reason_first_non_none_wins():
         ]
     )
     assert merged.stop_reason == "first"
+
+
+def test_empty_stop_reason_does_not_shadow_later_reason():
+    merged = merge_interventions(
+        [Intervention(stop_reason=""), Intervention(stop_reason="budget_exhausted")]
+    )
+    assert merged.stop_reason == "budget_exhausted"
 
 
 @pytest.mark.parametrize(
@@ -228,6 +240,8 @@ def test_deadline_rejects_bad_shapes_and_failing_lease() -> None:
     key = lt.WALL_DEADLINE_MONOTONIC_KEY
     assert lt.deadline_remaining_s({key: BrokenLease()}) is None
     assert lt.deadline_remaining_s({key: object()}) is None
+    assert lt.deadline_remaining_s({key: True}) is None
+    assert lt.deadline_remaining_s({key: False}) is None
     assert lt.deadline_remaining_s(None) is None
 
 
@@ -249,6 +263,49 @@ async def test_passive_observer_is_non_blocking_and_return_is_ignored() -> None:
     await lt.drain_background_observers()
 
 
+@pytest.mark.asyncio
+async def test_loop_end_does_not_drain_another_loops_passive_hooks() -> None:
+    foreign_entered = asyncio.Event()
+    foreign_release = asyncio.Event()
+    end_completed = asyncio.Event()
+
+    class Foreign(lt.BaseObserver):
+        async def on_turn_end(self, ctx):
+            foreign_entered.set()
+            await foreign_release.wait()
+
+    async def foreign_loop() -> None:
+        await lt.notify_observers([Foreign()], "on_turn_end", None)
+        await foreign_entered.wait()
+        await foreign_release.wait()
+
+    async def ending_loop() -> None:
+        await lt.notify_observers([], "on_loop_end", None)
+        end_completed.set()
+
+    foreign_task = asyncio.create_task(foreign_loop())
+    try:
+        await foreign_entered.wait()
+        await asyncio.wait_for(ending_loop(), timeout=1)
+        assert end_completed.is_set()
+    finally:
+        foreign_release.set()
+        await foreign_task
+
+
+@pytest.mark.asyncio
+async def test_loop_cancelled_drains_its_passive_cleanup() -> None:
+    cleanup_finished = asyncio.Event()
+
+    class Passive(lt.BaseObserver):
+        async def on_loop_cancelled(self):
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+    await lt.notify_observers([Passive()], "on_loop_cancelled")
+    assert cleanup_finished.is_set()
+
+
 def test_legacy_observer_satisfies_runtime_protocol() -> None:
     class Legacy:
         critical = True
@@ -263,3 +320,12 @@ def test_legacy_observer_satisfies_runtime_protocol() -> None:
         async def on_loop_end(self, result): ...
 
     assert isinstance(Legacy(), lt.LoopObserver)
+    assert not isinstance(Legacy(), lt.CompactionObserver)
+    assert not isinstance(Legacy(), lt.CancellationObserver)
+
+
+def test_base_observer_satisfies_optional_hook_protocols() -> None:
+    observer = lt.BaseObserver()
+    assert isinstance(observer, lt.LoopObserver)
+    assert isinstance(observer, lt.CompactionObserver)
+    assert isinstance(observer, lt.CancellationObserver)

@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from agent_core.messages import Message
@@ -48,7 +49,10 @@ def deadline_remaining_s(metadata: Mapping[str, Any] | None) -> float | None:
             return float(remaining_s())
         except Exception:
             return None
-    if not isinstance(deadline, (int, float)):
+    # ``bool`` is an ``int`` subclass, but it is never a meaningful monotonic
+    # instant. Treat it as a bad metadata shape instead of expiring the lease at
+    # process time 0 or 1.
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
         return None
     return float(deadline) - time.monotonic()
 
@@ -309,7 +313,12 @@ class CompactionEvent:
 
 @runtime_checkable
 class LoopObserver(Protocol):
-    """Structural contract implemented by agent-loop observers."""
+    """Required structural contract implemented by agent-loop observers.
+
+    Compaction and cancellation notifications are optional so legacy observers
+    remain valid. Hosts can narrow those hooks with :class:`CompactionObserver`
+    and :class:`CancellationObserver`; :class:`BaseObserver` implements both.
+    """
 
     critical: bool
 
@@ -339,6 +348,20 @@ class LoopObserver(Protocol):
     async def on_turn_end(self, ctx: TurnContext) -> Intervention | None: ...
 
     async def on_loop_end(self, result: AgentLoopResult) -> None: ...
+
+
+@runtime_checkable
+class CompactionObserver(Protocol):
+    """Optional observer hook for completed history compactions."""
+
+    async def on_compaction(self, event: CompactionEvent) -> None: ...
+
+
+@runtime_checkable
+class CancellationObserver(Protocol):
+    """Optional observer hook for cancellation cleanup."""
+
+    async def on_loop_cancelled(self) -> None: ...
 
 
 class BaseObserver:
@@ -389,8 +412,10 @@ class BaseObserver:
         """Release resources when cancellation bypasses ``on_loop_end``."""
 
 
-# Prevent GC of fire-and-forget observer tasks.
-_background_tasks: set[asyncio.Task[None]] = set()
+# Prevent GC of fire-and-forget observer tasks without coupling independent
+# loops. Agent loops execute their dispatches from one owning asyncio task, so
+# that task is the natural lifecycle boundary for the passive hooks it starts.
+_background_tasks_by_owner: dict[asyncio.Task[Any], set[asyncio.Task[None]]] = {}
 
 
 # Log each observer-hook failure once at warning level.
@@ -423,6 +448,19 @@ def _handle_observer_error(
     )
 
 
+def _discard_background_task(
+    owner: asyncio.Task[Any],
+    completed: asyncio.Task[None],
+) -> None:
+    """Release a completed passive hook and its empty owner bucket."""
+    tasks = _background_tasks_by_owner.get(owner)
+    if tasks is None:
+        return
+    tasks.discard(completed)
+    if not tasks:
+        _background_tasks_by_owner.pop(owner, None)
+
+
 async def notify_observers(
     observers: list[Any],
     method: str,
@@ -431,7 +469,8 @@ async def notify_observers(
 ) -> list[Intervention]:
     """Run hooks, awaiting critical observers and isolating hook errors.
 
-    ``on_loop_end`` drains passive hooks so their side effects are visible on return.
+    Loop end and cancellation drain this loop's passive hooks so their side
+    effects are visible on return.
     """
     interventions: list[Intervention] = []
 
@@ -462,34 +501,42 @@ async def notify_observers(
                     _handle_observer_error(observer, m, exc)
 
             task = asyncio.create_task(_run())
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+            owner = asyncio.current_task()
+            if owner is None:  # pragma: no cover - create_task also needs a running loop
+                raise RuntimeError("observer dispatch requires an owning asyncio task")
+            _background_tasks_by_owner.setdefault(owner, set()).add(task)
+            task.add_done_callback(partial(_discard_background_task, owner))
 
-    if method == "on_loop_end":
+    if method in {"on_loop_end", "on_loop_cancelled"}:
         await drain_background_observers()
 
     return interventions
 
 
 async def drain_background_observers() -> None:
-    """Drain outstanding passive observer tasks."""
-    pending = [task for task in _background_tasks if not task.done()]
+    """Drain passive observer tasks owned by the current agent loop."""
+    owner = asyncio.current_task()
+    if owner is None:
+        return
+    pending = [task for task in _background_tasks_by_owner.get(owner, ()) if not task.done()]
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
 def merge_interventions(interventions: list[Intervention]) -> Intervention:
-    """Merge messages, take the first stop reason, and OR boolean controls."""
+    """Merge messages, take the first non-empty stop, and OR boolean controls."""
     all_messages: list[str] = []
+    inject_messages_set = False
     stop_reason: str | None = None
     skip: bool = False
     pop_last: bool = False
     continue_turn: bool = False
 
     for iv in interventions:
-        if iv.inject_messages:
+        if iv.inject_messages is not None:
+            inject_messages_set = True
             all_messages.extend(iv.inject_messages)
-        if stop_reason is None and iv.stop_reason is not None:
+        if stop_reason is None and iv.stop_reason:
             stop_reason = iv.stop_reason
         if iv.skip_tool_execution:
             skip = True
@@ -499,7 +546,7 @@ def merge_interventions(interventions: list[Intervention]) -> Intervention:
             continue_turn = True
 
     return Intervention(
-        inject_messages=all_messages if all_messages else None,
+        inject_messages=all_messages if inject_messages_set else None,
         stop_reason=stop_reason,
         skip_tool_execution=skip,
         pop_last_message=pop_last,
@@ -572,7 +619,9 @@ __all__ = [
     "WALL_DEADLINE_MONOTONIC_KEY",
     "AgentLoopResult",
     "BaseObserver",
+    "CancellationObserver",
     "CompactionEvent",
+    "CompactionObserver",
     "Intervention",
     "LLMAttemptContext",
     "LLMDeltaContext",
