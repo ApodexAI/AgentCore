@@ -1,7 +1,7 @@
 # AgentCore
 
 AgentCore is the single source of truth for product-neutral agent runtime code
-shared by MiroHarness and FrontierAgentInternal.
+shared by ApodexHarness and FrontierAgentInternal.
 
 The repository exists to remove a failure-prone workflow: implementing a core
 change independently in two products and then opening more pull requests to
@@ -20,10 +20,11 @@ Version `0.1.x` contains the converged foundation layer:
 - provider-neutral LLM response, stream, and client contracts;
 - loop configuration, lifecycle contexts, observer protocol, intervention
   merging, and observer dispatch helpers.
+- streamed tool-call recovery checks for missing required arguments.
 
 The initial extraction is based on the already-merged integration branches:
 
-- MiroHarness `c1229050` (PR #501);
+- ApodexHarness `c1229050` (PR #501);
 - FrontierAgentInternal `63b89c8` (PR #92).
 
 Those revisions are provenance, not runtime dependencies. AgentCore tests and
@@ -96,7 +97,7 @@ clean checkout and CI unreproducible.
 1. Reproduce a shared bug with an AgentCore test.
 2. Change AgentCore in one pull request and pass its standalone CI.
 3. Merge and record the immutable commit SHA (or publish a tagged version).
-4. Automation opens dependency-bump PRs in MiroHarness and
+4. Automation opens dependency-bump PRs in ApodexHarness and
    FrontierAgentInternal.
 5. Product CI validates adapters and end-to-end behavior. Product PRs must not
    patch vendored/shared implementation code.
