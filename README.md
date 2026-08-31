@@ -16,7 +16,7 @@ Version `0.1.x` contains the converged foundation layer:
 - token-estimation helpers;
 - compaction policy and deterministic compactor;
 - context-budget estimation and non-blocking tokenizer access;
-- message trimming.
+- message trimming;
 - provider-neutral LLM response, stream, and client contracts;
 - loop configuration, lifecycle contexts, observer protocol, intervention
   merging, and observer dispatch helpers.

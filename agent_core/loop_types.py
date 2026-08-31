@@ -22,6 +22,24 @@ def deadline_remaining_s(metadata: Mapping[str, Any] | None) -> float | None:
 
     Execution-context storage belongs to each host product. Passing only its
     metadata keeps this frozen contract module independent of either host.
+
+    ``None`` means no deadline is stamped (no wall observer — plain swarm,
+    tests, HTTP API): callers keep their configured timeouts unchanged. The
+    result may be negative once the deadline has passed.
+
+    Two stamp shapes are accepted, and the check is **structural, not
+    nominal**:
+
+    * any object exposing ``remaining_s() -> float`` — a renewable lease view.
+      The concrete renewable-lease implementation is a product concern and
+      must stay out of this module: importing it here to run an ``isinstance``
+      check would put a product-side dependency inside the frozen contract
+      module and break the ``agent_core`` import closure. Do not "clean this
+      up" into an ``isinstance`` check.
+    * a bare ``int``/``float`` absolute ``time.monotonic()`` instant.
+
+    Anything else yields ``None``. ``int``/``float`` have no ``remaining_s``,
+    so the ordering below is unambiguous.
     """
     deadline = (metadata or {}).get(WALL_DEADLINE_MONOTONIC_KEY)
     remaining_s = cast(Callable[[], Any] | None, getattr(deadline, "remaining_s", None))
@@ -565,6 +583,9 @@ __all__ = [
     "ToolResult",
     "TurnContext",
     "deadline_remaining_s",
+    "drain_background_observers",
     "merge_interventions",
     "notify_observers",
+    "notify_tool_call",
+    "notify_tool_result",
 ]
