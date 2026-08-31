@@ -37,9 +37,9 @@ class StreamDelta:
     usage: dict[str, int] = field(default_factory=dict[str, int])
     finish_reason: str = ""
     model: str = ""
-    # Vendor label of the leg serving this stream, stamped by
-    # ``LLMFallbackChain.stream`` (constant once the chain commits to an
-    # entry — failover only fires before the first yield). The stream
+    # Vendor label of the leg serving this stream, stamped by a product's
+    # provider-chain wrapper (constant once the chain commits to an entry —
+    # failover only fires before the first yield). The stream
     # assembler folds it into ``LLMResponse.response_metadata`` so per-call
     # billing attribution works for streamed calls too — without this the
     # streaming path had no channel for the provider and every billing

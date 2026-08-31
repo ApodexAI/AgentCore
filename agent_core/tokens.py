@@ -49,7 +49,7 @@ def _tool_calls_text(tool_calls: Any) -> str:
     """Serialise ``tool_calls`` the way their token cost is actually incurred.
 
     Reading named keys off each call was the earlier approach and it silently
-    measured nothing: it looked for ``name`` / ``args``, which is the LangChain
+    measured nothing: it looked for the legacy flat ``name`` / ``args``
     shape, while the canonical shape in ``core.messages.ToolCall`` is OpenAI's
     ``{"id", "type", "function": {"name", "arguments"}}``. Every OpenAI-shaped
     tool call therefore contributed zero, and tool arguments are routinely the

@@ -1,5 +1,6 @@
 """Product-neutral building blocks for Apodex agent runtimes."""
 
+from agent_core.errors import AgentCoreError
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import (
     Message,
@@ -11,6 +12,7 @@ from agent_core.messages import (
 )
 
 __all__ = [
+    "AgentCoreError",
     "LLMClient",
     "LLMResponse",
     "Message",

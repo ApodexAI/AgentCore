@@ -34,6 +34,20 @@ line-length = 100
 select = ["E", "F", "I", "UP", "FA", "B", "SIM", "RUF"]
 ignore = ["E501", "RUF001", "RUF002", "RUF003"]
 
+[tool.ruff.lint.per-file-ignores]
+# ``call_llm``'s per-attempt async closures are created and awaited inside the
+# same physical-attempt iteration; none escapes to observe a later loop
+# binding. B023 cannot infer that lifetime and reports all 21 captured
+# attempt-local values.
+#
+# Do NOT "fix" this by binding them as default arguments (the usual B023
+# remedy): ``_finish_attempt`` MUST observe ``attempt_index`` /
+# ``attempt_started`` / ``attempt_first_delta`` as they stand when it runs,
+# because the empty-tool-arguments replay rebinds all three mid-iteration to
+# open a second physical attempt. Snapshotting them at definition time would
+# silently bill the replay against the discarded stream's attempt id.
+"agent_core/runtime/loop/_call.py" = ["B023"]
+
 [tool.pyright]
 pythonVersion = "3.12"
 include = ["agent_core"]
