@@ -1,22 +1,23 @@
 """Error classification for the LLM-call retry / chain-escalation machinery.
 
-LLM call sites (the generic runtime ``call_llm``, the heavy_mode reporter
-``run_with_chain``, future workflow-specific retry helpers) all need to
-turn a raw ``Exception`` into one of a small number of decisions:
+Every LLM call site — this package's ``call_llm``, a product's
+provider-chain wrapper, any workflow-specific retry helper — needs to turn
+a raw ``Exception`` into one of a small number of decisions:
 
 - *Same key, sleep + retry* — transient network glitches, 429
   rate-limits, proxy-wrapped upstream blips.
-- *Different key (or provider), no sleep* — overload, credit exhaustion.
+- *Different key (or provider), no sleep* — overload, credit exhaustion,
+  safety-filter rejection, model-not-hosted, and auth failure: a wrong or
+  unauthorised key is fixed by the next leg, not by sleeping.
 - *Short-circuit to salvage* — input exceeded the model's context.
-- *Surface immediately* — structural bugs (auth, schema, etc.).
+- *Surface immediately* — everything left over, e.g. a malformed-request
+  4xx that no key or provider can satisfy.
 
-This module is the **single source of truth** for that classification.
-Lives in ``agent_core/infra`` rather than under a specific workflow so
-``agent_core/core/runtime/loop/llm_client.py`` and
-``workflows/heavy_mode/utils/provider_chain.py`` can converge on the same
-patterns — keeping behaviour consistent for swarm sub-agents (which go
-through the generic engine) and heavy_reporter (which goes through the
-chain helper).
+This module is the **single source of truth** for that classification. It
+sits in the shared package rather than beside any one caller so the
+generic retry loop and a product's chain helper cannot drift apart —
+consistency here is what makes a sub-agent going through the generic
+engine and a reporter going through the chain helper behave the same way.
 
 Public predicates (each pure on a single ``Exception``):
 
@@ -69,7 +70,7 @@ Composed predicate:
 - ``is_retriable_with_fallback(err)`` — ``overload`` OR
   ``credit_exhausted`` OR ``safety_filter`` OR ``model_unavailable``
   OR ``auth_failure`` OR ``empty_completion`` OR ``stream_stall``. The
-  chain-escalation trigger used by ``run_with_chain`` to advance L1 → L2 → L3.
+  chain-escalation trigger a chain wrapper uses to advance L1 → L2 → L3.
   Intentionally narrower than "anything we might retry" — rate-limit and
   transient-network errors retry on the same key, so they are NOT
   included here.
@@ -125,8 +126,8 @@ _CONTEXT_LENGTH_PATTERNS = (
 # + ``new_api_error`` are the new-api gateway's way of forwarding an
 # upstream 5xx / timeout as a 400 envelope to the client — sleeping and
 # retrying the same key is the right response, NOT raising a 400 as
-# non-transient. Observed in heavy-mode smokes against the OpenAI proxy
-# (see ``temp/2026-05-12_heavy_mode_sdk_multiturn.md`` §"Side observations").
+# non-transient. Observed 2026-05-12 in multi-turn smokes against an
+# OpenAI-compatible proxy.
 _TRANSIENT_NETWORK_PATTERNS = (
     re.compile(r"\btimeout\b", re.IGNORECASE),
     re.compile(r"timed[\s_]*out", re.IGNORECASE),
@@ -157,7 +158,7 @@ _STREAM_STALL_PATTERNS = (
 #
 # - Aliyun PAI-EAS / DashScope wraps Qwen behind a ``数据安全检查`` layer;
 #   rejection shape is 400 + ``code: data_inspection_failed`` +
-#   ``type: data_inspection_failed`` (observed in heavy_mode_browsecomp
+#   ``type: data_inspection_failed`` (observed in a browse-comparison
 #   smoke against Italian/political prompts).
 # - Anthropic returns ``input_filtered`` / ``output_filtered`` blocks on
 #   policy violations (rare on Claude 4.x but documented).
@@ -225,13 +226,12 @@ _MODEL_UNAVAILABLE_PATTERNS = (
     re.compile(r"\bunknown[_\s]*model\b", re.IGNORECASE),
 )
 
-# Authentication failures from upstream providers. Discovered by the
-# heavy_mode chaos test (``scripts/chaos_heavy_mode.py`` scenarios 01 /
-# 02 / 08, 2026-05-21): a bare ``OPENROUTER_API_KEY`` clobber surfaced
-# ``openai.AuthenticationError`` with body ``{"error": {"message":
-# "Missing Authentication header", "code": 401}}``. Without auth here,
-# ``is_retriable_with_fallback`` returned False and the chain wrapper
-# (``workflows/heavy_mode/utils/provider_chain.run_with_chain``) never
+# Authentication failures from upstream providers. Discovered by a
+# key-clobber chaos scenario (2026-05-21): a bare ``OPENROUTER_API_KEY``
+# clobber surfaced ``openai.AuthenticationError`` with body
+# ``{"error": {"message": "Missing Authentication header", "code": 401}}``.
+# Without auth here, ``is_retriable_with_fallback`` returned False and the
+# product's chain wrapper never
 # advanced to L2 / L3 — the reporter crashed with exit 1. Real users
 # hit this every time a key is revoked or scoped wrong; rotating to the
 # next chain leg (different key OR different provider) is the only
@@ -272,9 +272,9 @@ def _stringify(err: BaseException) -> str:
 def get_status_code(err: BaseException) -> int | None:
     """Best-effort integer HTTP status extraction.
 
-    Public so ``core/runtime/loop/_call.py`` can share this heuristic
-    instead of keeping its own copy — both call sites need the exact same
-    status-attribute lookup order.
+    Public so :mod:`agent_core.runtime.loop._call` can share this
+    heuristic instead of keeping its own copy — both call sites need the
+    exact same status-attribute lookup order.
     """
     for attr in ("status_code", "status", "code"):
         val = getattr(err, attr, None)
@@ -414,14 +414,14 @@ def is_auth_failure(err: BaseException) -> bool:
     return any(p.search(blob) for p in _AUTH_FAILURE_PATTERNS)
 
 
-# LangChain raises a bare ``ValueError("No generation chunks were
-# returned")`` when an upstream stream completes but yields no usable
-# *content* — the dominant failure shape for reasoning models (e.g.
-# apodex/mirothinker) that run away in the ``reasoning_content`` channel
-# and never emit a content token before hitting ``max_tokens``. Observed
-# 2026-05-29: a single empty completion among the ~150 LLM calls of a
-# heavy run was fatal because nothing classified it as recoverable, so
-# every multi-call heavy run eventually died on one. The HTTP call
+# A bare ``ValueError("No generation chunks were returned")`` — the shape
+# LangChain-based clients raise — arrives when an upstream stream completes
+# but yields no usable *content*. That is the dominant failure shape for
+# self-hosted reasoning models that run away in the ``reasoning_content``
+# channel and never emit a content token before hitting ``max_tokens``.
+# Observed 2026-05-29: a single empty completion among the ~150 LLM calls of
+# one run was fatal because nothing classified it as recoverable, so every
+# multi-call run eventually died on one. The HTTP call
 # *succeeded* — this is not a timeout/network class — so it gets its own
 # detector rather than folding into ``is_transient_network``.
 _EMPTY_COMPLETION_PATTERNS = (
@@ -482,8 +482,9 @@ def classify_error(err: BaseException) -> str:
 
     Precedence (top wins):
       ``context_length`` → ``safety_filter`` → ``model_unavailable`` →
-      ``auth_failure`` → ``overloaded`` → ``credit_exhausted`` →
-      ``stream_stall`` → ``rate_limited`` → ``transient_network`` → ``other``.
+      ``auth_failure`` → ``empty_completion`` → ``overloaded`` →
+      ``credit_exhausted`` → ``stream_stall`` → ``rate_limited`` →
+      ``transient_network`` → ``other``.
 
     Context-length wins outright because its caller behaviour differs
     (short-circuit to salvage). Safety-filter wins next because the
@@ -494,6 +495,10 @@ def classify_error(err: BaseException) -> str:
     above overload/credit because the operator action is also a
     config fix (rotate / revoke key) — splitting it out from
     ``other`` makes dashboards immediately point at the right knob.
+    ``empty_completion`` outranks overload/credit for the same reason in
+    reverse: several gateways answer a capacity problem with a 200 and an
+    empty body, so labelling it by its own shape keeps a silent-empty
+    endpoint from being read as ordinary overload.
     """
     if is_context_length_error(err):
         return "context_length"

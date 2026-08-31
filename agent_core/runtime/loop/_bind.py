@@ -16,8 +16,8 @@ class _BoundLLM:
     """Lightweight binding wrapper around a native :class:`LLMClient`.
 
     The agent loop builds its per-turn LLM by chaining
-    ``bind_tools(bind_session_id(llm, task_id), tools)``. Native clients
-    have no langchain ``Runnable.bind`` to attach kwargs to, so the bound
+    ``bind_tools(bind_session_id(llm, task_id), tools)``. :class:`LLMClient`
+    is a plain protocol with no bind-style hook of its own, so the bound
     knobs are carried here and threaded into :meth:`LLMClient.chat` /
     :meth:`LLMClient.stream` per call. Each ``bind_*`` returns a fresh
     wrapper via :func:`dataclasses.replace` — never a mutation of the
@@ -46,12 +46,11 @@ class _BoundLLM:
         """Merge the bound fields with any kwarg-style overrides.
 
         ``_BoundLLM`` is bind-style (knobs live on the dataclass), but it
-        gets nested *underneath* kwarg-style callers — ``LLMProxy`` and the
-        fallback-chain wrappers unconditionally forward
+        gets nested *underneath* kwarg-style callers: product proxies and
+        provider-chain wrappers unconditionally forward
         ``tools=/temperature=/max_tokens=/extra_headers=`` to their inner
-        client. When that inner client is a ``_BoundLLM`` (e.g.
-        ``LLMProxy(inner=_BoundLLM(...))`` built by
-        ``create_subagent._bind_sub_agent_llm``), a bind-only signature
+        client. When that inner client is a ``_BoundLLM`` — the shape a
+        product's sub-agent spawning helper builds — a bind-only signature
         raised ``TypeError: stream() got an unexpected keyword argument
         'tools'`` and killed every sub-agent on turn 1. Accepting + merging
         these kwargs makes ``_BoundLLM`` a tolerant drop-in.
@@ -155,9 +154,9 @@ def bind_session_id(
     """Attach ``x-upstream-session-id: <task_id>`` to every LLM request.
 
     Pinning it at client-construction time is the obvious approach, but
-    our LLM is per-profile-cached (one client shared across tasks), so we
-    bind the header per-call via LangChain's ``.bind(extra_headers=...)``
-    which flows through to the OpenAI SDK ``extra_headers`` kwarg.
+    the LLM is per-profile-cached (one client shared across tasks), so the
+    header is bound per-call as ``extra_headers`` instead, which the
+    OpenAI-compatible adapter forwards to the SDK's ``extra_headers`` kwarg.
 
     Why it matters: EAS-backed gateways use this header for **session
     affinity** — the same session-id consistently
@@ -165,8 +164,9 @@ def bind_session_id(
     turns.
 
     No-op when ``task_id`` is empty (standalone debug) or when
-    the product session-affinity kill switch is falsey. This header is set ONLY
-    here — ``create_swarm_llm`` does not use it. Sticky routing was once
+    the product session-affinity kill switch is falsey. This header is set
+    ONLY here, so a client built without going through this bind is
+    deliberately unpinned. Sticky routing was once
     suspected of amplifying a high-concurrency stampede and disabled for it;
     that attribution was retracted when the real cause turned out to be silent
     mid-stream stalls, now handled by the stall watchdog.
@@ -194,8 +194,8 @@ def bind_max_tokens(llm: Any, max_tokens: int) -> Any:
     """Bind ``max_tokens`` for a single invocation (fresh ``_BoundLLM``).
 
     Public counterpart to :func:`bind_temperature` for callers outside
-    ``core/runtime/loop`` (e.g. sub-agent spawning) that need to override a
-    child LLM's ``max_tokens`` without reaching into ``_ensure_bound``/
+    this package (e.g. sub-agent spawning) that need to override a child
+    LLM's ``max_tokens`` without reaching into ``_ensure_bound`` /
     ``_BoundLLM`` directly.
     """
     return replace(_ensure_bound(llm), max_tokens=max_tokens)

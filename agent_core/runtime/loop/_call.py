@@ -124,9 +124,9 @@ def _llm_gate() -> asyncio.Semaphore | None:
 
 
 # ── Wall-deadline budget closure ──────────────────────────────────────
-# ``WallClockDeadlineObserver`` stamps the loop's absolute monotonic
-# soft deadline into scope metadata; ``collect_reports`` already clamps
-# its sub-agent wait to it. ``call_llm`` was the remaining leak: each
+# A product observer stamps the loop's absolute monotonic soft deadline
+# into execution-scope metadata, and its sub-agent fan-in already clamps
+# its wait to it. ``call_llm`` was the remaining leak: each
 # attempt got the full configured timeout regardless of remaining wall
 # — an attempt with a fresh 1200 s budget could launch with 90 s of wall
 # left. Each attempt now clamps its timeout to the
@@ -136,9 +136,9 @@ def _llm_gate() -> asyncio.Semaphore | None:
 # Floor: below this many remaining seconds an LLM attempt can't return
 # anything useful — fail fast with reason="wall_deadline" so the loop
 # stops cleanly and the post-loop salvage (force_final_answer) gets the
-# reserve instead. The remaining-budget read itself is the shared
-# ``loop_types.wall_deadline_remaining_s`` (same helper collect_reports
-# clamps with).
+# reserve instead. The remaining budget is not read from here: the product
+# owns that lookup and injects it as the ``wall_deadline_remaining``
+# callback, so this package never touches context-local storage.
 _WALL_DEADLINE_FLOOR_S = 20.0
 
 # Floor for the non-streaming replay that recovers a tool call whose streamed
@@ -221,10 +221,11 @@ async def call_llm(
     2) — and only when an outer provider chain is active — the call
     raises ``LLMCallExhausted(reason="chain_advance")`` instead of
     retrying the same black-holed endpoint. What the caller does with it
-    is turn-dependent (see ``agent_loop``): a turn-1 exhaustion is
-    re-raised to ``run_with_chain`` to rotate to the next leg; past turn 1
-    the loop stops with ``llm_error`` and hands off to salvage. Either way
-    the retry budget is no longer burned on a dead gateway.
+    is turn-dependent and decided by the caller's loop: a turn-1
+    exhaustion is re-raised to the outer chain wrapper to rotate to the next
+    leg; past turn 1 the loop stops with ``llm_error`` and hands off to
+    salvage. Either way the retry budget is no longer burned on a dead
+    gateway.
 
     When ``retry_wait_fixed`` is set (int seconds), all transient retries
     use that fixed wait regardless of error class — used by noisy-endpoint
@@ -319,8 +320,14 @@ async def call_llm(
                     _WALL_DEADLINE_FLOOR_S,
                     turn, attempt + 1, max_retries, reason,
                 )
+                # ``last_exc`` must match ``reason``: a chain wrapper
+                # classifies it directly, so handing it a stale 429 from an
+                # earlier attempt under reason="wall_deadline" would have it
+                # back off and retry straight past the deadline we are
+                # refusing to cross. The superseded failure stays available
+                # as ``prior_exc`` for the post-mortem.
                 raise LLMCallExhausted(
-                    last_exc or deadline_exc, deadline_reason,
+                    deadline_exc, deadline_reason, prior_exc=last_exc,
                 ) from deadline_exc
             effective_timeout = deadline_remaining
             logger.info(
@@ -382,7 +389,7 @@ async def call_llm(
     guard_max_tokens = reasoning_only_max_tokens
     # One PHYSICAL request per index, not one retry per index. They only
     # diverge when a stream is discarded and replayed inside a single retry
-    # (empty tool arguments, below): ``agent_loop`` derives ``attempt_id``
+    # (empty tool arguments, below): the caller derives ``attempt_id``
     # from this number, so reusing it would emit two ``finished`` events
     # under one id and double-count that attempt's usage downstream.
     physical_attempt_index = 0
@@ -540,7 +547,7 @@ async def call_llm(
                             )
                         except TimeoutError as exc:
                             raise LLMCallExhausted(
-                                exc, _deadline_reason,
+                                exc, _deadline_reason, prior_exc=last_exc,
                             ) from exc
                     gate_acquired = True
                     effective_timeout = _effective_timeout_or_deadline_exhausted(
@@ -917,8 +924,8 @@ async def call_llm(
             # ~180-330s = 207 minutes on a single endpoint this way.
             # When an outer chain is
             # active, stop burning the retry budget and surface
-            # ``chain_advance``. ``agent_loop`` then either rotates the leg
-            # (turn 1) or stops with ``llm_error`` for salvage (turn > 1) —
+            # ``chain_advance``. The caller's loop then either rotates the
+            # leg (turn 1) or stops with ``llm_error`` for salvage (turn > 1) —
             # both stop the wall-burn. With no chain configured there's
             # nothing to advance to, so fall through to the normal transient
             # retry (wall-clamped).
@@ -1006,7 +1013,7 @@ async def call_llm(
             # Chain-aware shortcut: model_not_found / overload / credit
             # / safety_filter is deterministic on this (provider, input).
             # Skip the rest of the retry budget and surface so an outer
-            # ``run_with_chain`` can advance the leg right now.
+            # chain wrapper can advance the leg right now.
             if is_retriable_with_fallback(exc):
                 # Overload (503) and empty completions frequently clear on a
                 # same-key resample (temperature>0 re-rolls the sampler). When
@@ -1120,13 +1127,20 @@ async def call_llm(
                     recovery_action="abandon_retry",
                     error=retry_error,
                 )
-                if deadline_reason == "wall_deadline":
-                    break
-                deadline_exc = retry_error or TimeoutError(
-                    f"{deadline_reason} reached before retry",
+                # Both deadline kinds surface the same way. Wall-deadline
+                # exhaustion used to ``break`` into the generic
+                # reason="exhausted" raise below, which threw the signal
+                # away: the caller could not tell "the run is out of wall
+                # budget, go salvage" from "this key's retries are spent,
+                # try another leg", even though the attempt event emitted
+                # just above already reported ``deadline_reason``.
+                deadline_exc = TimeoutError(
+                    f"{deadline_reason} reached before retry "
+                    f"(backoff {int(backoff)}s + {_WALL_DEADLINE_FLOOR_S:.0f}s "
+                    f"floor > {deadline_remaining:.0f}s left)",
                 )
                 raise LLMCallExhausted(
-                    deadline_exc, deadline_reason,
+                    deadline_exc, deadline_reason, prior_exc=retry_error,
                 ) from deadline_exc
             await _finish_attempt(
                 outcome=ATTEMPT_DISCARDED,

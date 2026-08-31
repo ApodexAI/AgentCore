@@ -99,17 +99,38 @@ class LLMCallExhausted(LLMError, RuntimeError):
     structurally unrecoverable (4xx without proxy-wrap, or a chain-aware
     fallback signal like ``model_not_found``).
 
-    Wraps the last exception encountered so the caller (typically
-    ``run_agent_loop``) can surface it to a chain wrapper for L1→L2→L3
-    rotation. Carries ``last_exc`` separately because ``raise from`` is
-    too opaque for chain-aware classification — ``provider_chain`` calls
-    ``classify_error(last_exc)`` directly.
+    Wraps the last exception encountered so the caller (typically the
+    product's agent loop) can surface it to a provider-chain wrapper for
+    L1→L2→L3 rotation. Carries ``last_exc`` separately because
+    ``raise from`` is too opaque for chain-aware classification — a chain
+    wrapper calls ``classify_error(last_exc)`` directly.
+
+    ``last_exc`` must always agree with ``reason``: it is the exception that
+    *caused this raise*, not merely the most recent failure seen. A
+    deadline refusal therefore carries the deadline ``TimeoutError`` even
+    when earlier attempts failed for unrelated reasons — otherwise a chain
+    wrapper classifying ``last_exc`` would read, say, ``rate_limited`` off a
+    stale 429 and retry straight past the deadline the reason announced.
+
+    ``prior_exc`` is where that earlier, superseded failure goes: diagnostic
+    context for logs and post-mortems, deliberately outside the field
+    classification reads.
     """
 
-    def __init__(self, last_exc: BaseException, reason: str) -> None:
+    def __init__(
+        self,
+        last_exc: BaseException,
+        reason: str,
+        *,
+        prior_exc: BaseException | None = None,
+    ) -> None:
         self.last_exc = last_exc
         self.reason = reason
-        super().__init__(f"call_llm {reason}: {last_exc!r}")
+        self.prior_exc = prior_exc
+        detail = f"call_llm {reason}: {last_exc!r}"
+        if prior_exc is not None and prior_exc is not last_exc:
+            detail += f" (after {prior_exc!r})"
+        super().__init__(detail)
 
 
 __all__ = [

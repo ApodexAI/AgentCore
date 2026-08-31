@@ -54,9 +54,9 @@ _FIRST_CHUNK_ENV = "LLM_FIRST_CHUNK_S"
 # stalled stream is likely gateway black-holing, and same-key retries keep
 # hitting the same dead backend.
 #
-# What "surface" buys depends on which turn stalled (``agent_loop`` decides):
-# only a turn-1 exhaustion is re-raised to the outer ``run_with_chain`` to
-# rotate to the next provider leg; past turn 1 the loop instead stops with
+# What "surface" buys depends on which turn stalled (the product's agent
+# loop decides): only a turn-1 exhaustion is re-raised to the outer chain
+# wrapper to rotate to the next provider leg; past turn 1 the loop stops with
 # ``llm_error`` to preserve partial content and hand off to salvage. Either
 # way the win is the same — we stop burning the wall budget on a dead
 # gateway instead of retrying it to exhaustion.
@@ -183,22 +183,27 @@ async def _stream_llm_response(
     """Stream ``StreamDelta``s through ``on_delta`` and fold them into an
     ``LLMResponse``.
 
-    Native ``LLMClient.stream`` yields normalised ``StreamDelta``s, so the
-    langchain ``AIMessageChunk`` merge / ``message_chunk_to_message`` dance
-    is gone: visible content is concatenated, reasoning is accumulated, and
-    tool-calls are stitched by ``index`` (id set-once, name/arguments
-    appended). Note: OpenAI streaming surfaces usage / finish_reason / model
-    only on the final chunk, which the client adapter does not forward into
-    ``StreamDelta`` — so the assembled ``LLMResponse`` carries empty
-    usage/finish_reason for streamed calls (the non-streaming path has them).
+    ``LLMClient.stream`` yields normalised ``StreamDelta``s, so assembly is
+    a plain fold: visible content is concatenated, reasoning is accumulated,
+    and tool-calls are stitched by ``index`` (id set-once, name/arguments
+    appended).
 
-    Tool-call argument streaming: per-chunk ``tool_call_chunks`` are
-    extracted from ``AIMessageChunk`` and forwarded to ``on_delta`` as
-    the ``tool_call_args_chunks`` keyword arg so observers can decode
-    a specific arg's value progressively (e.g. ``submit_report.content``
-    markdown body → ``response.output_text.delta``). The callback is
-    invoked when any of visible text / thinking / tool-call chunks is
-    present in the chunk.
+    Terminal metadata: OpenAI streaming surfaces usage / finish_reason /
+    model only on the last chunks — usage on a separate ``choices=[]`` chunk
+    under ``include_usage``, finish_reason on the final content chunk.
+    ``StreamDelta`` carries all three (plus the chain-stamped ``provider``),
+    and the fold below keeps the last non-empty value of each, so the
+    assembled ``LLMResponse`` reports real usage and finish_reason for
+    streamed calls exactly like the non-streaming path. Before those fields
+    existed a streamed run billed 0 tokens and no observer could see
+    ``finish_reason="length"``.
+
+    Tool-call argument streaming: each chunk's ``tool_call_deltas`` are
+    re-shaped and forwarded to ``on_delta`` as the ``tool_call_args_chunks``
+    keyword arg so observers can decode a specific arg's value
+    progressively (e.g. a report tool's markdown ``content`` body streamed
+    out as text). The callback is invoked when any of visible text /
+    thinking / tool-call chunks is present in the chunk.
 
     Stall watchdog: the gap between consecutive chunks is bounded by the
     inter-chunk stall timeout (see :data:`_STREAM_STALL_ENV`). A stream
@@ -234,8 +239,8 @@ async def _stream_llm_response(
     final_usage: dict[str, int] = {}
     final_finish_reason = ""
     final_model = ""
-    # Vendor label stamped on the deltas by ``LLMFallbackChain.stream`` —
-    # folded into the assembled response's ``response_metadata`` below so
+    # Vendor label stamped on the deltas by a product's provider-chain
+    # wrapper — folded into ``response_metadata`` below so
     # streamed calls carry billing attribution like the non-streaming path.
     final_provider = ""
     think_splitter = _ThinkTagSplitter()
@@ -515,10 +520,9 @@ async def _stream_llm_response(
     return _assembled_response()
 
 
-# Public alias — callers outside ``core/runtime/loop`` (e.g. the standalone
-# terminal-bench reasoning-effort router) should depend on this name rather
-# than reaching into the underscore-prefixed module directly; re-exported
-# from ``llm_client``.
+# Public alias — callers outside this package should depend on this name
+# rather than reaching into the underscore-prefixed module directly;
+# re-exported from ``llm_client``.
 ThinkTagSplitter = _ThinkTagSplitter
 
 

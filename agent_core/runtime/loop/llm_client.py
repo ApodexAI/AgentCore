@@ -7,8 +7,6 @@ turn-level operations.
 
 from __future__ import annotations
 
-import logging
-
 from agent_core.errors import (
     LLMCallExhausted as LLMCallExhausted,
 )
@@ -42,8 +40,6 @@ from agent_core.tokens import (
     estimate_message_tokens,
     estimate_text_tokens,
 )
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "RUNAWAY_STATE_KEY",

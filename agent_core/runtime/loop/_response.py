@@ -34,8 +34,11 @@ def _strip_thinking_blocks(text: str) -> str:
 
 
 def _flatten_message_text(content: Any) -> str:
-    """Collapse an ``AIMessage.content`` (str | list of str/text blocks |
-    other) into plain text. Thinking blocks are NOT stripped here."""
+    """Collapse an assistant message's ``content`` (str | list of str/text
+    blocks | other) into plain text. Thinking blocks are NOT stripped here.
+
+    The list form covers providers that return typed content blocks; both
+    the current ``text`` key and the legacy ``content`` key are accepted."""
     if not content:
         return ""
     if isinstance(content, str):
@@ -60,7 +63,7 @@ def _visible_response_text(response: Any) -> str:
 def extract_final_content(messages: list[Message]) -> str:
     """Find the most recent assistant message with non-empty visible text.
 
-    Walks backward past empty AIMessages so we surface the last
+    Walks backward past empty assistant messages so we surface the last
     meaningful answer instead of an empty shell (common when the final
     turn was a tool-only call or a safety-driven empty reply). Inlined
     ``<think>…</think>`` blocks are stripped — they're history-only
@@ -78,12 +81,11 @@ def extract_final_content(messages: list[Message]) -> str:
 def extract_leaked_reasoning(response: Any) -> str:
     """Pull reasoning recovered from leaked think/reasoning tags, if any.
 
-    ``MultiFormatToolCallParser`` stashes the salvaged inner text on
-    ``response.additional_kwargs[LEAKED_REASONING_KEY]`` when it strips
-    out leaked ``<think_never_used_…>`` / ``<model:thinking>`` /
-    ``<think>`` blocks during ``parse()``. Mirroring it onto
-    ``TurnContext.leaked_reasoning`` lets observers surface it without
-    grovelling through the raw response.
+    A product's tool-call parser stashes the salvaged inner text under
+    ``response.response_metadata[LEAKED_REASONING_KEY]`` when it strips out
+    leaked ``<think_never_used_…>`` / ``<model:thinking>`` / ``<think>``
+    blocks. Mirroring it onto the turn context lets observers surface it
+    without grovelling through the raw response.
     """
     meta = getattr(response, "response_metadata", None) or {}
     value = meta.get(LEAKED_REASONING_KEY, "")
@@ -124,15 +126,16 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
     ``cached_tokens`` / ``cache_creation_tokens`` / ``reasoning_tokens``
     (the shape consumed by the protocol stream and worker-trace observers),
     or ``None`` when the response carries
-    no usage info. Handles both LangChain ``usage_metadata`` (canonical
-    ``input_tokens`` / ``output_tokens``, no ``model`` key — that lives in
-    ``response_metadata.model_name``) and the OpenAI raw
-    ``response_metadata.token_usage`` shape.
+    no usage info. Besides the native :class:`LLMResponse`, it still
+    handles the two legacy response shapes products may hand it: the
+    canonical ``usage_metadata`` map (``input_tokens`` / ``output_tokens``,
+    no ``model`` key — that lives in ``response_metadata.model_name``) and
+    the OpenAI raw ``response_metadata.token_usage`` shape.
 
     ``provider`` is sourced from ``response_metadata.provider_actually_used``
-    (stamped by ``LLMFallbackChain`` per attempt). Empty string when the
-    construction path didn't stamp it (e.g. a plain ``ChatOpenAI`` with no
-    fallback chain wrapper). Downstream billing should treat ``""`` as
+    (stamped per attempt by a product's provider-chain wrapper). Empty
+    string when the construction path didn't stamp it — a bare client with
+    no chain wrapper around it. Downstream billing should treat ``""`` as
     "vendor unknown — fall back to whatever the model id implies".
 
     Cache token fields:
@@ -151,22 +154,26 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
 
     ``reasoning_tokens`` captures OpenAI o-series / Gemini thinking
     output, billed as completion tokens but worth surfacing separately.
+
+    Every key above is present on every non-``None`` return, zero-filled
+    when the provider reported nothing, so consumers can index the shape
+    without probing which response object they were handed.
     """
     # Native path: ``LLMResponse.usage`` is already normalised by the client
     # adapter (prompt/completion/total/cached_tokens), so read it directly.
-    # The langchain ``usage_metadata`` / ``token_usage`` parsing below is
-    # retained as a fallback for compatible legacy response objects.
+    # The ``usage_metadata`` / ``token_usage`` parsing below is retained as a
+    # fallback for legacy response objects that expose those shapes.
     if isinstance(response, LLMResponse):
         usage = response.usage or {}
         inp = int(usage.get("prompt_tokens", 0) or 0)
         out = int(usage.get("completion_tokens", 0) or 0)
         if not inp and not out:
             return None
-        # Vendor label stamped by ``LLMFallbackChain`` (``_stamp_metadata`` on
-        # the non-streaming path; ``_stream_llm_response`` folds the streamed
-        # ``StreamDelta.provider`` here). Empty when the client was built
+        # Vendor label stamped by a provider-chain wrapper on the
+        # non-streaming path; ``_stream_llm_response`` folds the streamed
+        # ``StreamDelta.provider`` in here. Empty when the client was built
         # without a provider-stamp wrapper — downstream billing treats ""
-        # as "vendor unknown", same as the langchain branch below.
+        # as "vendor unknown", same as the legacy branches below.
         rmd = response.response_metadata or {}
         provider = str(rmd.get("provider_actually_used") or "") if isinstance(
             rmd, dict,
@@ -192,20 +199,21 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
         # Reasoning/thinking tokens (Anthropic extended thinking / OpenAI
         # reasoning models). They are part of completion_tokens but surfaced
         # separately for cost / analysis; the client's usage dict carries them.
-        # Omitted (backward-compat) when absent/zero.
-        reasoning = int(usage.get("reasoning_tokens", 0) or 0)
-        if reasoning:
-            out_dict["reasoning_tokens"] = reasoning
+        # Always present, including as 0: this branch and the legacy shapes
+        # below must return the SAME key set, or a consumer indexing
+        # ``usage["reasoning_tokens"]`` works on one response object and
+        # raises KeyError on the other.
+        out_dict["reasoning_tokens"] = int(usage.get("reasoning_tokens", 0) or 0)
         return out_dict
 
     rmd = getattr(response, "response_metadata", None) or {}
     if not isinstance(rmd, dict):
         rmd = {}
-    # ``model_actually_used`` is stamped by ``LLMFallbackChain`` and is
-    # the only model identifier present on streaming chunks (the
-    # provider's own ``model_name`` lands on ``ainvoke`` responses but
-    # not on ``astream`` usage chunks). Falling through to it keeps
-    # streaming usage attribution alive.
+    # ``model_actually_used`` is stamped by a provider-chain wrapper and is
+    # the only model identifier present on streaming chunks (the provider's
+    # own ``model_name`` lands on non-streaming responses but not on
+    # streamed usage chunks). Falling through to it keeps streaming usage
+    # attribution alive.
     model = (
         rmd.get("model_name")
         or rmd.get("model")
@@ -246,7 +254,7 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
             "reasoning_tokens": int(reasoning or 0),
         }
 
-    # LangChain canonical shape (input_tokens / output_tokens).
+    # Legacy canonical shape (input_tokens / output_tokens).
     um = getattr(response, "usage_metadata", None)
     if um is not None and not isinstance(um, dict):
         try:
@@ -267,14 +275,13 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
         reasoning = _pick_int(odetails.get("reasoning"))
         if inp or out:
             # Apodex (and some other OpenAI-compatible gateways) on
-            # non-streaming ``ainvoke`` populate ``input_tokens`` /
+            # non-streaming calls populate ``input_tokens`` /
             # ``output_tokens`` on the canonical map but leave
             # ``input_token_details`` empty — cache hits only show up
             # on the raw ``prompt_tokens_details.cached_tokens`` field.
-            # Cross-check the raw shape when the canonical pass came
-            # back zero so streaming-vs-ainvoke don't silently disagree
-            # on cached token attribution. Same fix lives in
-            # ``infra/usage.py`` for the SDK aux path.
+            # Cross-check the raw shape when the canonical pass came back
+            # zero so streaming and non-streaming don't silently disagree
+            # on cached token attribution.
             if not cached or not cache_create or not reasoning:
                 tu_raw = rmd.get("token_usage") or rmd.get("usage")
                 if isinstance(tu_raw, dict):
@@ -415,7 +422,7 @@ def extract_model_name(
     1. ``profile["llm"]["model"]`` if a profile dict was passed (workflow
        YAML profiles are the authoritative source — they're what the
        benchmark run was configured with).
-    2. Common LangChain attributes on the bound LLM
+    2. Common model-id attributes on the bound LLM
        (``model_name`` / ``model`` / ``model_id``) — covers OpenAI,
        Anthropic, Qwen alike.
 

@@ -37,10 +37,9 @@ _RUNAWAY_RETRY_MAX_TOKENS = 8192
 _RUNAWAY_EXPAND_FACTOR = 1.5
 _RUNAWAY_CONTEXT_RESERVE_TOKENS = 1024
 # The reminder rides as a ``user`` turn, NOT a trailing ``system`` one.
-# Providers disagree on non-leading system messages: the Anthropic adapter
-# only lifts a LEADING system message out of the array
-# (``anthropic_client._split_system``) and maps anything else through the
-# ``{"role": "user"}`` fallthrough, and reasoning-model chat templates on
+# Providers disagree on non-leading system messages: an Anthropic adapter
+# only lifts a LEADING system message out of the array and maps anything
+# else through the ``{"role": "user"}`` fallthrough, and chat templates on
 # SGLang/vLLM commonly render only the first system block. A user turn means
 # every provider sees the same instruction in the same position.
 _RUNAWAY_EXPANDED_GUIDANCE = (
@@ -64,18 +63,16 @@ _RUNAWAY_DIRECT_RECOVERY_GUIDANCE = (
 )
 
 
-_ENV_PREFIXES = ("AGENT_CORE_", "MIROHARNESS_", "FRONTIER_AGENT_")
-
-
 def _env_value(suffix: str) -> tuple[str, str] | None:
     """Return the first configured shared/legacy environment value.
 
     ``AGENT_CORE_*`` is the portable spelling. The product-prefixed names
-    remain supported while the shared package is extracted. A fixed order is
-    intentional so the same implementation has the same behaviour in both
-    repositories if more than one spelling is configured.
+    remain supported while the shared package is extracted. The order is
+    fixed and owned by :data:`agent_core.runtime.env.ENV_PREFIXES` — a
+    second copy here would let the two drift apart the moment a prefix is
+    added or reordered in only one of them.
     """
-    return first_configured(suffix, _ENV_PREFIXES)
+    return first_configured(suffix)
 
 
 def _env_int(suffix: str, default: int) -> int:
@@ -112,7 +109,7 @@ _RUNAWAY_THINKING_BUDGET_MIN = 512
 # A lowered retry budget intentionally skips the expensive expanded phase.
 _RUNAWAY_EXPAND_ENABLED = _RUNAWAY_MAX_RETRIES >= _RUNAWAY_DISABLE_THINKING_AFTER
 _RUNAWAY_EXPANDED_OUTPUT_RESERVE = 0.25
-# Key under which the agent loop threads cross-turn runaway state
+# Key under which a caller threads cross-turn runaway state
 # (a mutable dict) through its metadata into ``call_llm``. Contents:
 #   consecutive_turns                   — diagnostic streak counter (log only)
 #   last_call_runaway_responses         — surfaced on ``llm_finished``
@@ -232,7 +229,7 @@ def _bind_reduced_max_tokens(
     """Bind the runaway-retry ``max_tokens`` cap for follow-up attempts.
 
     Mirrors :func:`bind_temperature` — falls back to the original LLM
-    when the wrapper doesn't support ``.bind()`` kwargs.
+    when no usable cap can be inferred.
     """
     retry_max_tokens = (
         _runaway_retry_max_tokens(response)
