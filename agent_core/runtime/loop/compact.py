@@ -65,6 +65,13 @@ OMITTED_TOOL_RESULT_PLACEHOLDER = (
     "same call will not restore it. Rely on your notes and later messages."
 )
 
+# Prior wording, replaced when the text above was adopted from the peer side
+# during the shared-core merge (see git history). A session checkpointed
+# before that merge can resume with tool messages still carrying this text;
+# recognise it too so the idempotency check below does not wrap it in a
+# second, nested placeholder.
+_LEGACY_OMITTED_TOOL_RESULT_PLACEHOLDERS = ("Tool result is omitted to save tokens.",)
+
 URL_RE = re.compile(r'https?://[^\s\)>"\'<]+')
 _TOOL_RESULT_COMPACT_MAX_CHARS = 1_200
 
@@ -469,7 +476,9 @@ class KeepLastNToolResultsCompactor:
                 out.append(msg)  # protected fan-in result — never blank
                 continue
             content = text_of(msg.get("content"))
-            if content.startswith(OMITTED_TOOL_RESULT_PLACEHOLDER):
+            if content.startswith(OMITTED_TOOL_RESULT_PLACEHOLDER) or content.startswith(
+                _LEGACY_OMITTED_TOOL_RESULT_PLACEHOLDERS
+            ):
                 out.append(msg)
                 continue
             placeholder = OMITTED_TOOL_RESULT_PLACEHOLDER
