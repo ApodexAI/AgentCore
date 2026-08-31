@@ -34,6 +34,12 @@ line-length = 100
 select = ["E", "F", "I", "UP", "FA", "B", "SIM", "RUF"]
 ignore = ["E501", "RUF001", "RUF002", "RUF003"]
 
+[tool.ruff.lint.per-file-ignores]
+# These async closures are created and awaited inside the same physical-attempt
+# iteration; none escapes to observe a later loop binding. B023 cannot infer
+# that lifetime and reports every captured attempt-local value.
+"agent_core/runtime/loop/_call.py" = ["B023"]
+
 [tool.pyright]
 pythonVersion = "3.12"
 include = ["agent_core"]
