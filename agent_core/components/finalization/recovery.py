@@ -23,7 +23,7 @@ from typing import Any
 from agent_core.components.observers.leaked_tool_call_retry import (
     LEAKED_TOOL_CALL_NUDGE,
 )
-from agent_core.messages import text_of
+from agent_core.messages import Message, text_of
 from agent_core.runtime.loop.context_budget import (
     truncate_text_to_tokens as _truncate_text_to_tokens,
 )
@@ -72,7 +72,7 @@ def fallback_leg_count(llm: object) -> int:
 
 async def chat_with_fallback_budget(
     llm: object,
-    messages: list[dict],
+    messages: Sequence[Message],
     *,
     per_leg_timeout_s: float,
 ) -> Any:
@@ -85,7 +85,7 @@ async def chat_with_fallback_budget(
     outer_timeout_s = timeout_s * fallback_leg_count(llm) + 5.0
     chat = llm.chat
     return await asyncio.wait_for(
-        chat(messages, timeout=timeout_s),
+        chat(list(messages), timeout=timeout_s),
         timeout=outer_timeout_s,
     )
 
