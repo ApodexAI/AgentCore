@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 
 from agent_core.components.middleware.llm.base import (
@@ -40,10 +41,12 @@ class SummarizationMiddleware(LLMMiddleware):
         threshold: int = 80000,
         keep_recent: int = 6,
         summary_llm: LLMClient | None = None,
+        summary_addendum: Callable[[], str] | None = None,
     ) -> None:
         self._threshold = threshold
         self._keep_recent = keep_recent
         self._summary_llm = summary_llm  # raw LLM, bypasses proxy
+        self._summary_addendum = summary_addendum
 
     @property
     def name(self) -> str:
@@ -120,8 +123,17 @@ class SummarizationMiddleware(LLMMiddleware):
         else:
             # Fallback: truncate without LLM
             summary_text = self._truncate_summary(to_summarize)
+        addendum = ""
+        if self._summary_addendum is not None:
+            try:
+                addendum = self._summary_addendum().strip()
+            except Exception:
+                logger.warning("Summary addendum provider failed", exc_info=True)
+        if addendum:
+            addendum = f"\n\n{addendum}"
         summary_msg = user_msg(
-            f"[Previous conversation summary ({len(to_summarize)} messages compressed)]\n{summary_text}"
+            f"[Previous conversation summary ({len(to_summarize)} messages compressed)]\n"
+            f"{summary_text}{addendum}"
         )
         result = [*system_msgs, summary_msg, *keep]
         logger.info(

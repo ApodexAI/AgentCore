@@ -9,7 +9,9 @@ from agent_core.components.middleware.llm.base import (
     LLMMiddlewareChain,
 )
 from agent_core.components.middleware.llm.proxy import LLMProxy
+from agent_core.components.middleware.llm.summarization import SummarizationMiddleware
 from agent_core.llm import LLMResponse
+from agent_core.messages import text_of, user_msg
 from agent_core.models.agent_definition import AgentDefinition
 from agent_core.models.pipeline_spec import PipelineSpec
 from agent_core.runtime.registries.agents import AgentRegistry
@@ -45,6 +47,18 @@ async def test_shared_artifact_pool_deduplicates_ids() -> None:
     pool = SharedArtifactPool()
     await pool.add([{"id": "a", "value": 1}, {"id": "a", "value": 2}, {"value": 3}])
     assert pool.get_all() == [{"id": "a", "value": 1}, {"value": 3}]
+
+
+@pytest.mark.asyncio
+async def test_summarization_accepts_product_addendum_provider() -> None:
+    middleware = SummarizationMiddleware(
+        threshold=1,
+        keep_recent=1,
+        summary_addendum=lambda: "[Structured findings]\nportable evidence",
+    )
+    messages = [user_msg("old " * 100), user_msg("middle " * 100), user_msg("recent")]
+    compacted = await middleware.before_llm(LLMCallContext(), messages)
+    assert "portable evidence" in text_of(compacted[0]["content"])
 
 
 def test_agent_and_pipeline_registries_round_trip() -> None:
