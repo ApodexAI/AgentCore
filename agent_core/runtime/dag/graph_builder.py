@@ -421,7 +421,9 @@ def _make_generic_executor_nd(node_def: NodeDefinition) -> Any:
         from agent_core.runtime.registries import services as kernel_registry
         from agent_core.runtime.registries.agents import AgentRegistry
 
-        resource_mgr = kernel_registry.get(LLMResourceProvider)
+        resource_mgr = kernel_registry.get_optional(LLMResourceProvider)
+        if resource_mgr is None:
+            raise RuntimeError("No LLMResourceProvider is registered")
         agent_reg = kernel_registry.get(AgentRegistry)
 
         template = Template(node_def.prompt_template)
