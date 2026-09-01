@@ -232,6 +232,33 @@ def test_partition_still_shrinks_the_window_when_it_can() -> None:
     assert middle == history[1:3]
 
 
+def test_partition_summarises_everything_when_nothing_is_kept() -> None:
+    """``keep_recent=0`` asks for the whole history to be summarised.
+
+    The kept window is then empty, so the orphan guard has nothing to protect:
+    walking forward runs off the end, and the backward walk added for a
+    tool-result tail indexed one past it — an ``IndexError`` that callers
+    summarising a finished session (``keep_recent=0`` is how they ask for it)
+    swallowed as "no summary available", silently losing the rollup.
+    """
+    history: list[Message] = [
+        system_msg("S"),
+        user_msg("q"),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "a", "function": {"name": "web_search", "arguments": "{}"}}],
+        },
+        tool_msg("result a", "a"),
+    ]
+
+    system, middle, recent = LLMSummaryCompactor._partition(history, keep_recent=0)
+
+    assert system == [history[0]]
+    assert middle == history[1:]
+    assert recent == []
+
+
 def test_rate_limit_naming_a_retry_delay_is_still_transient() -> None:
     """A bare ``400`` inside a provider message is not a status code.
 
