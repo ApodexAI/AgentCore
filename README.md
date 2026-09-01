@@ -19,6 +19,10 @@ Version `0.1.x` contains the converged foundation layer:
 - message trimming;
 - bounded LLM summaries, projected-token triggers, and tiered compaction;
 - session-isolated, content-addressed spill storage for recoverable tool output;
+- product-neutral identity/status types, kernel events, and task-local execution
+  context propagation;
+- failure-isolated async event dispatch and composable fail-closed tool
+  permission policy;
 - provider-neutral LLM response, stream, and client contracts;
 - loop configuration, lifecycle contexts, observer protocol, intervention
   merging, and observer dispatch helpers.
@@ -126,7 +130,9 @@ edit both products' core copies, that is evidence it belongs here.
    execution, and `agent_loop` orchestration.
 5. **Context management Phase 2** (complete in AgentCore): calibrated trigger,
    bounded LLM summary, tier selection, observability, and spill storage.
-6. Remove product compatibility facades after downstream imports have moved to
+6. **Runtime foundation** (complete in AgentCore): task identity/status,
+   execution ContextVars, kernel events, event dispatch, and tool permissions.
+7. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
 
 Each slice must leave product CI green and must not depend on a floating branch.
