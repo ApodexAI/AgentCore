@@ -383,7 +383,7 @@ class LLMSummaryCompactor:
             forward += 1
         if forward < len(rest):
             split_idx = forward
-        else:
+        elif split_idx < len(rest):
             # The whole tail is tool results — a parallel tool-call turn that
             # emitted at least ``keep_recent`` of them. Walking forward runs off
             # the end and leaves the last result orphaned (the bug this guard
@@ -393,6 +393,10 @@ class LLMSummaryCompactor:
             # recent history survives, not a cap.
             while split_idx > 0 and is_tool_msg(rest[split_idx]):
                 split_idx -= 1
+        # ``split_idx == len(rest)`` (``keep_recent=0``: summarise everything) is
+        # neither case. The kept window is EMPTY, so no orphan is possible, and
+        # both walks are meaningless — the forward one has nothing to scan and
+        # the backward one would index one past the end. Leave the split alone.
 
         return sys_msgs, rest[:split_idx], rest[split_idx:]
 
