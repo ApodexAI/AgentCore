@@ -31,7 +31,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent_core.llm import LLMResponse
+from agent_core.loop_types import UsageMetadata
 from agent_core.runtime.loop._response import _pick_int
 from agent_core.runtime.loop.llm_client import extract_usage
 
@@ -603,3 +606,71 @@ def test_usage_metadata_object_coerces_to_dict() -> None:
     assert u["prompt_tokens"] == 7
     assert u["completion_tokens"] == 3
     assert u["model"] == "x"
+
+
+# --- key-set invariant ---------------------------------------------------
+#
+# The three response shapes are parsed by three separate branches, and a
+# consumer indexing ``usage["reasoning_tokens"]`` must not work on one
+# response object and raise KeyError on another. ``UsageMetadata`` states
+# that invariant in the type system; a TypedDict validates nothing at
+# runtime, so pin it here against the declared required keys — the type and
+# all three branches move together or this fails.
+
+
+_NATIVE = LLMResponse(
+    content="x",
+    model="m",
+    usage={"prompt_tokens": 1, "completion_tokens": 2},
+    response_metadata={"provider_actually_used": "p"},
+)
+_CANONICAL = SimpleNamespace(
+    usage_metadata={"input_tokens": 1, "output_tokens": 2},
+    response_metadata={"model_name": "m"},
+)
+_RAW = SimpleNamespace(
+    usage_metadata=None,
+    response_metadata={
+        "token_usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        "model_name": "m",
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "response"),
+    [("native", _NATIVE), ("canonical", _CANONICAL), ("raw", _RAW)],
+)
+def test_every_branch_returns_exactly_the_required_key_set(
+    label: str, response: object,
+) -> None:
+    usage = extract_usage(response)
+    assert usage is not None, label
+    assert set(usage) == UsageMetadata.__required_keys__, label
+
+
+def test_model_is_coerced_to_str_on_the_legacy_path() -> None:
+    """``UsageMetadata`` declares ``model: str``; the source dict is untyped.
+
+    A gateway echoing a non-string ``model_name`` would land that object
+    verbatim behind a field consumers format as text. ``provider`` was
+    already coerced; ``model`` was the asymmetric one.
+    """
+    usage = extract_usage(
+        _resp(
+            usage_metadata={"input_tokens": 1, "output_tokens": 2},
+            response_metadata={"model_name": {"id": "oops"}},
+        )
+    )
+    assert usage is not None
+    assert isinstance(usage["model"], str)
+    assert usage["model"] == "{'id': 'oops'}"
+
+
+def test_model_falls_back_to_empty_string_not_none() -> None:
+    usage = extract_usage(
+        _resp(usage_metadata={"input_tokens": 1, "output_tokens": 2},
+              response_metadata={})
+    )
+    assert usage is not None
+    assert usage["model"] == ""

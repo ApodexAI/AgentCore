@@ -8,7 +8,8 @@ cheapest high-value thing to pin.
 from __future__ import annotations
 
 import asyncio
-from typing import get_type_hints
+from collections.abc import Mapping
+from typing import Any, get_type_hints
 
 import pytest
 
@@ -35,14 +36,28 @@ def test_usage_metadata_contract_marks_normalized_keys_required():
         }
     )
     assert lt.UsageMetadata.__optional_keys__ == frozenset(
-        {"input_tokens", "output_tokens", "estimated"}
+        {"input_tokens", "output_tokens", "total_tokens", "estimated"}
     )
     assert "UsageMetadata" in lt.__all__
+    assert "UsageMetadataExtras" in lt.__all__
 
 
-def test_attempt_context_reuses_normalized_usage_contract():
-    usage_type = get_type_hints(lt.LLMAttemptContext)["usage"]
-    assert usage_type == lt.UsageMetadata | None
+@pytest.mark.parametrize("cls_name", ["TurnContext", "LLMAttemptContext"])
+def test_observer_usage_field_stays_an_open_mapping(cls_name: str):
+    """``usage`` must NOT be typed as the ``UsageMetadata`` TypedDict.
+
+    Hosts are the producers of these contexts and they hand over shapes a
+    TypedDict rejects outright: partial literals in test doubles
+    (``{"prompt_tokens": 182_000}``), alias-only budget shapes
+    (``{"input_tokens": .., "output_tokens": ..}``), and
+    ``dict(event["usage"])`` re-wraps whose value type is ``Any``. None of
+    those are assignable to a TypedDict, under strict OR standard mode, so
+    narrowing this field breaks the exact product loops the normalized
+    contract was introduced to unblock. ``UsageMetadata`` stays the
+    producer-side return type of ``extract_usage`` instead.
+    """
+    usage_type = get_type_hints(getattr(lt, cls_name))["usage"]
+    assert usage_type == Mapping[str, Any] | None
 
 
 def _tool_result(name: str = "t", result: str = "r"):
