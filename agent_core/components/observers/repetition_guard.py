@@ -1,3 +1,4 @@
+# pyright: reportUnusedFunction=false
 """RepetitionGuard — hint when consecutive turns repeat the same tool call.
 
 The generic counterpart to the two narrower guards:
@@ -54,6 +55,22 @@ from agent_core.loop_types import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["REPEATED_TOOL_CALLS_STOP_REASON", "RepetitionGuard"]
+
+
+def _tool_signature(tool_call: dict[str, Any]) -> str:
+    """Backward-compatible signature for one tool call.
+
+    The guard itself signs the complete turn, but older product tests and
+    diagnostics still use this single-call helper.
+    """
+    name = str(tool_call.get("name") or "")
+    args = tool_call.get("args")
+    try:
+        payload = json.dumps(args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        payload = repr(args)
+    digest = hashlib.blake2b(payload.encode(), digest_size=8).hexdigest()
+    return f"{name}:{digest}"
 
 
 def _turn_signature(tool_calls: list[dict[str, Any]]) -> str:
