@@ -16,16 +16,22 @@ from typing import Any
 
 from pydantic import BaseModel, Field, PrivateAttr
 
+from agent_core.runtime.env import first_configured
+
 logger = logging.getLogger(__name__)
 
 _CONFIG_FILENAMES = ["extensions_config.json", "mcp_config.json"]
-_ENV_VAR = "MIROHARNESS_EXTENSIONS_CONFIG_PATH"
+# Resolved through the shared prefix cascade (``AGENT_CORE_`` wins, then the
+# MiroHarness / FrontierAgent compatibility spellings) rather than the single
+# ``MIROHARNESS_``-prefixed name this module used to hardcode.
+_ENV_SUFFIX = "EXTENSIONS_CONFIG_PATH"
 
 
 def _find_config_file() -> Path | None:
     """Search for extensions config in standard locations."""
-    env_path = os.getenv(_ENV_VAR)
-    if env_path:
+    configured = first_configured(_ENV_SUFFIX)
+    if configured:
+        _, env_path = configured
         p = Path(env_path)
         if p.is_file():
             return p

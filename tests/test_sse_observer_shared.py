@@ -1,6 +1,7 @@
 """Tests for SSEObserver."""
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest.mock import AsyncMock
 
 import pytest
@@ -215,3 +216,77 @@ async def test_skill_loaded_ignores_non_skill_reads():
 
     assert mock_es.append.await_count == 1
     assert mock_es.append.await_args[0][2]["trace_type"] == "react_tool_call"
+
+
+# ---------------------------------------------------------------------------
+# skill_loaded resolves the display name through a registered SkillLoader
+# ---------------------------------------------------------------------------
+
+
+class _FakeSkill:
+    skill_id = "chart-visualization"
+    name = "Chart Visualization"
+    description = "charts"
+    version = "1.0.0"
+    tags: ClassVar[list[str]] = []
+    allowed_tools: ClassVar[list[str]] = []
+    content = ""
+    root_dir = "/skills/chart-visualization"
+    enabled = True
+
+
+class _FakeSkillLoader:
+    """Structural ``SkillLoader`` — registered under its own concrete type."""
+
+    def list_skills(self):
+        return [_FakeSkill()]
+
+    def get_skill(self, skill_id: str):
+        return _FakeSkill() if skill_id == _FakeSkill.skill_id else None
+
+    def get_enabled_skills(self):
+        return [_FakeSkill()]
+
+    def toggle_skill(self, skill_id: str, enabled: bool) -> bool:
+        return False
+
+    def reload(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_skill_loaded_uses_registered_loader_display_name():
+    from agent_core.runtime.registries import services as registry
+    from agent_core.runtime.registries.scope import use_scope
+
+    mock_es = AsyncMock()
+    obs = SSEObserver(event_store=mock_es, task_id="task-001")
+    ctx = _make_ctx()
+
+    with use_scope(name="sse-skill-name", fallback_to_process=False):
+        registry.register(_FakeSkillLoader, _FakeSkillLoader())
+        await obs.on_tool_result(
+            ctx, _make_skill_read("skills/chart-visualization/SKILL.md"),
+        )
+
+    payload = mock_es.append.await_args_list[1][0][2]
+    assert payload["skill_id"] == "chart-visualization"
+    assert payload["skill_name"] == "Chart Visualization"
+    assert payload["detail"] == "Loaded skill: Chart Visualization"
+
+
+@pytest.mark.asyncio
+async def test_skill_loaded_falls_back_to_id_without_loader():
+    from agent_core.runtime.registries.scope import use_scope
+
+    mock_es = AsyncMock()
+    obs = SSEObserver(event_store=mock_es, task_id="task-001")
+    ctx = _make_ctx()
+
+    with use_scope(name="sse-no-loader", fallback_to_process=False):
+        await obs.on_tool_result(
+            ctx, _make_skill_read("skills/chart-visualization/SKILL.md"),
+        )
+
+    payload = mock_es.append.await_args_list[1][0][2]
+    assert payload["skill_name"] == "chart-visualization"

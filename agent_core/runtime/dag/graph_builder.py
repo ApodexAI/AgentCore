@@ -45,6 +45,16 @@ class DynamicGraphBuilder:
     """
 
     def __init__(self, *, node_context_factory: NodeContextFactory | None = None) -> None:
+        """Construct the builder.
+
+        ``node_context_factory`` builds the object injected as the second
+        argument of every ``(state, ctx)`` node. The default is
+        :class:`~agent_core.models.node_context.NodeContext`, which carries
+        identity only — hosts whose nodes call ``ctx.call_llm`` /
+        ``ctx.call_tool`` / ``ctx.run_agent_loop`` must pass a factory for a
+        context that provides those; the identity-only default raises an
+        AttributeError naming this parameter if they don't.
+        """
         if node_context_factory is None:
             from agent_core.models.node_context import DefaultNodeContext
 
@@ -180,7 +190,10 @@ def _wrap_with_node_context(
     fn: Any,
     node_context_factory: NodeContextFactory,
 ) -> Any:
-    """Wrap node function to inject DefaultNodeContext as second arg.
+    """Wrap node function to inject the node context as second arg.
+
+    The context comes from ``node_context_factory`` — identity-only by
+    default; see :meth:`DynamicGraphBuilder.__init__`.
 
     If the function has a single-param ``(state)`` signature (legacy),
     it passes through unchanged — backward compatible with solver specs

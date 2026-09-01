@@ -260,3 +260,95 @@ def test_discover_nonexistent_directory(tmp_path):
     )
     skills = ldr.discover()
     assert len(skills) == 0
+
+
+# ── Injected SKILL.md path follows the loader's skill_dirs ────────────────
+
+
+def _injected_paths(loader_obj) -> list[str]:
+    from agent_core.components.middleware.llm.skill_injection import (
+        SkillInjectionMiddleware,
+    )
+
+    section = SkillInjectionMiddleware(
+        loader_obj, role_filter=lambda _: True,
+    )._build_skill_section()
+    return [
+        line.strip().removeprefix("<path>").removesuffix("</path>")
+        for line in section.splitlines()
+        if line.strip().startswith("<path>")
+    ]
+
+
+def test_injected_skill_path_points_at_real_file(loader, skill_dir):
+    """A custom ``skill_dirs`` must still yield a readable path.
+
+    The path is what the LLM hands to ``read_text``; a hardcoded
+    ``plugins/skills/`` prefix would name a file that does not exist for
+    any loader configured with another directory.
+    """
+    paths = _injected_paths(loader)
+    assert len(paths) == 2
+    for p in paths:
+        assert Path(p).is_file()
+    assert {Path(p).parent.name for p in paths} == {"code-review", "debug"}
+
+
+def test_injected_skill_path_relative_when_under_cwd(tmp_path, monkeypatch):
+    from agent_core.components.skills import ExtensionsConfig
+
+    skills = tmp_path / "custom" / "skills"
+    (skills / "planner").mkdir(parents=True)
+    (skills / "planner" / "SKILL.md").write_text(
+        "---\nname: Planner\ndescription: Plans\n---\nBody"
+    )
+    monkeypatch.chdir(tmp_path)
+    ldr = FileSystemSkillLoader(
+        skill_dirs=[skills], extensions_config=ExtensionsConfig(),
+    )
+    assert _injected_paths(ldr) == ["custom/skills/planner/SKILL.md"]
+
+
+def test_injected_skill_path_falls_back_without_root_dir():
+    from agent_core.components.middleware.llm.skill_injection import (
+        SkillInjectionMiddleware,
+    )
+
+    skill = SkillConfig(skill_id="legacy", name="Legacy", description="d")
+    assert (
+        SkillInjectionMiddleware._skill_md_path(skill)
+        == "plugins/skills/legacy/SKILL.md"
+    )
+
+
+# ── ExtensionsConfig env-var prefix cascade ───────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    [
+        "AGENT_CORE_EXTENSIONS_CONFIG_PATH",
+        "MIROHARNESS_EXTENSIONS_CONFIG_PATH",
+        "FRONTIER_AGENT_EXTENSIONS_CONFIG_PATH",
+    ],
+)
+def test_extensions_config_env_prefixes(tmp_path, monkeypatch, env_var):
+    from agent_core.components.skills import ExtensionsConfig
+
+    cfg = tmp_path / "extensions_config.json"
+    cfg.write_text('{"skills": {"debug": {"enabled": false}}}')
+    monkeypatch.chdir(tmp_path.parent)
+    monkeypatch.setenv(env_var, str(cfg))
+    assert ExtensionsConfig.from_file().is_skill_enabled("debug") is False
+
+
+def test_extensions_config_agent_core_prefix_wins(tmp_path, monkeypatch):
+    from agent_core.components.skills import ExtensionsConfig
+
+    portable = tmp_path / "portable.json"
+    portable.write_text('{"skills": {"debug": {"enabled": true}}}')
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text('{"skills": {"debug": {"enabled": false}}}')
+    monkeypatch.setenv("AGENT_CORE_EXTENSIONS_CONFIG_PATH", str(portable))
+    monkeypatch.setenv("MIROHARNESS_EXTENSIONS_CONFIG_PATH", str(legacy))
+    assert ExtensionsConfig.from_file().is_skill_enabled("debug") is True

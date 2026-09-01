@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent_core.components.middleware.llm.base import (
@@ -11,7 +13,7 @@ from agent_core.components.middleware.llm.base import (
 from agent_core.messages import Message, system_msg, text_of
 
 if TYPE_CHECKING:
-    from agent_core.protocols import SkillLoader
+    from agent_core.protocols import Skill, SkillLoader
 logger = logging.getLogger(__name__)
 RoleFilter = Callable[[str], bool]
 
@@ -81,6 +83,26 @@ class SkillInjectionMiddleware(LLMMiddleware):
             truncated = truncated[:last_space]
         return truncated + "…"
 
+    @staticmethod
+    def _skill_md_path(skill: Skill) -> str:
+        """Path the LLM passes to ``read_text`` to load the full SKILL.md.
+
+        Derived from the loader-reported ``root_dir`` rather than assuming
+        the default ``plugins/skills/`` layout: ``FileSystemSkillLoader``
+        accepts arbitrary ``skill_dirs``, and a hardcoded prefix would hand
+        the model a path that does not exist. Made relative to the working
+        directory when the skill lives under it, since that is the spelling
+        a workspace-scoped ``read_text`` accepts; absolute otherwise.
+        Loaders that leave ``root_dir`` empty keep the legacy default.
+        """
+        root = getattr(skill, "root_dir", "") or ""
+        if not root:
+            return f"plugins/skills/{skill.skill_id}/SKILL.md"
+        path = Path(root) / "SKILL.md"
+        with suppress(ValueError):
+            return str(path.relative_to(Path.cwd()))
+        return str(path)
+
     def _build_skill_section(self) -> str:
         """Build lightweight skill metadata (cached after first call).
         Budget-aware: per-skill descriptions capped at _SKILL_DESC_MAX_CHARS,
@@ -107,7 +129,7 @@ class SkillInjectionMiddleware(LLMMiddleware):
                 lines = [
                     f'  <skill name="{s.name}" id="{s.skill_id}">',
                     f"    <description>{desc}</description>",
-                    f"    <path>plugins/skills/{s.skill_id}/SKILL.md</path>",
+                    f"    <path>{self._skill_md_path(s)}</path>",
                 ]
                 if s.allowed_tools:
                     tools_str = ", ".join(s.allowed_tools)

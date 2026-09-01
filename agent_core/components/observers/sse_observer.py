@@ -149,5 +149,22 @@ class SSEObserver:
 
     @staticmethod
     def _lookup_skill_name(skill_id: str) -> str | None:
-        """Skill loading is not part of the trimmed OSS distribution."""
-        return None
+        """Best-effort display-name lookup via a registered SkillLoader.
+
+        Resolved structurally against the ``SkillLoader`` Protocol, so a
+        loader registered under its concrete type (e.g.
+        ``FileSystemSkillLoader``) is still found. ``None`` when no loader
+        is registered or the id is unknown — the caller then falls back to
+        the raw ``skill_id``.
+        """
+        try:
+            from agent_core.protocols import SkillLoader
+            from agent_core.runtime.registries import services as registry
+
+            loader = registry.get_optional(SkillLoader)
+            if loader is None:
+                return None
+            skill = loader.get_skill(skill_id)
+            return skill.name if skill else None
+        except Exception:
+            return None
