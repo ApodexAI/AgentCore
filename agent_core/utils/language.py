@@ -1,4 +1,21 @@
-"""Generic language detection and instruction utilities."""
+"""Generic language detection and instruction utilities.
+
+Workflow-agnostic helpers for working with a ``state["language"]`` value,
+which comes in two flavours:
+
+* Legacy ISO-style codes — ``"auto"``, ``"en"``, ``"zh"``, ``"ja"``, ``"ko"``.
+* Free-form natural-language labels emitted by an LLM detector — e.g.
+  ``"simplified Chinese"``, ``"Spanish"``, ``"English"``.
+
+``normalize_language`` collapses both flavours to a single display label that
+is safe to interpolate into a prompt; ``language_instruction`` returns an
+empty string when no instruction is needed (English / unset / ``"auto"``),
+so callers can append it unconditionally.
+
+Lives in AgentCore (not a workflow) because it is pure text
+heuristics with no domain vocabulary — core observers and every workflow
+share it.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +24,11 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol
+
+
+class LanguageNodeContext(Protocol):
+    async def call_llm(self, messages: list[dict[str, str]]) -> str: ...
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +181,8 @@ def language_instruction(language: str) -> str:
 # A single LLM call that resolves the answer language for *any* language,
 # covering the cases the character heuristic above collapses to English
 # (Spanish, Vietnamese, Thai, …). Lives here in core so every workflow can
-# share it; both entry points fall back to :func:`detect_language` on any LLM failure.
+# share it (moved from ``workflows.default_research.utils.language_detect``);
+# both entry points fall back to :func:`detect_language` on any LLM failure.
 
 # Cap the user question fed to the detector. The heuristic only needs a few
 # hundred chars to gauge CJK density, but the LLM detector also has to see an
@@ -187,12 +209,75 @@ question itself happens to be written in.
    - Chinese-English mixed input → bias to Chinese ("simplified Chinese" or "traditional Chinese").
    - Pure non-English input → that language's English name (e.g. "Japanese", "Spanish", "Korean").
    - Pure English → "English".
+3. Punctuation style is not language evidence. Full-width punctuation such as
+   `：`, `，`, `！`, or `？` does not make otherwise-English text Chinese.
+   Likewise, URLs, filenames, code, product names, and isolated foreign terms
+   do not by themselves make a question mixed-language.
+4. A language named as a TOPIC is not a request to use it. "What did the
+   Chinese government announce?" is an English question about China, not a
+   request for a Chinese answer — only rule 1 phrasing ("in Chinese",
+   "用中文回答") counts as a request.
 
 Output a single JSON object with exactly one key: "language".
 Output ONLY valid JSON, no other text.
 
-Example: {{"language": "simplified Chinese"}}
+Examples:
+- `Why is this necessary?` → {{"language": "English"}}
+- `Why is this necessary？` → {{"language": "English"}}
+- `请解释这个机制。` → {{"language": "simplified Chinese"}}
+- `Please respond in Chinese.` → {{"language": "simplified Chinese"}}
 """
+
+
+# "Chinese" as written in the languages a request for it plausibly arrives in.
+# Latin/Cyrillic only — Han-script names are handled by the ``has_han`` check.
+_CHINESE_LANG_WORD = (
+    r"(?:simplified\s+|traditional\s+)?"
+    r"(?:chinese|mandarin|cantonese|chino|chinois|chinesisch|cinese|"
+    r"chin[eê]s|kinesisk|chinees|kiinaksi|китайск\w*|"
+    r"zh(?:-(?:cn|tw|hans|hant))?)"
+)
+
+# Cues that turn a *mention* of the language into a *request to answer in it*.
+# The cue must sit immediately before the language name: "reply in Chinese"
+# qualifies, "the Chinese government" / "this Chinese paper" do not — the
+# latter are exactly the English questions an LLM detector over-triggers on.
+_CHINESE_REQUEST_CUE = (
+    r"in|into|to|en|em|auf|na|su|use|using|write|speak|say|reply|respond|"
+    r"answer|output|translate|на|по"
+)
+
+_CHINESE_REQUEST_RE = re.compile(
+    # Latin / Cyrillic: cue + language name ("answer in Chinese",
+    # "responde en chino", "auf Chinesisch", "ответь на китайском").
+    rf"\b(?:{_CHINESE_REQUEST_CUE})[\s-]+{_CHINESE_LANG_WORD}\b"
+    # Explicit locale tags stand on their own ("language: zh-CN"); bare "zh"
+    # does not — it collides with ordinary words and filenames.
+    r"|\bzh-(?:cn|tw|hans|hant)\b"
+    # Korean puts the language first ("중국어로 답해줘") and has no Han to key on;
+    # Vietnamese "tiếng Trung" is specific enough to stand without a cue.
+    r"|중국어|중국말|tiếng\s+trung"
+    # Han-script names — redundant with ``has_han``, kept explicit for clarity.
+    r"|中文|汉语|漢語|简体|繁体|繁體|中国語",
+    re.IGNORECASE,
+)
+
+
+def _validate_detected_language(question: str, detected: str) -> str:
+    """Reject Chinese classifications unsupported by text or an instruction."""
+    if not is_chinese_label(detected):
+        return detected
+    has_han = bool(re.search(r"[一-鿿]", question))
+    if has_han or _CHINESE_REQUEST_RE.search(question):
+        return detected
+    fallback = detect_language(question)
+    logger.warning(
+        "LLM language detector returned %r without Chinese text or an explicit "
+        "Chinese-language request; fallback → %r",
+        detected,
+        fallback,
+    )
+    return fallback
 
 
 def _parse_language(content: str) -> str:
@@ -230,8 +315,14 @@ async def detect_language_from_prompt(
         raw = await ask(DETECT_PROMPT.format(question=truncated))
         label = _parse_language(raw)
         normalized = normalize_language(label) or label
-        logger.debug("LLM language detector: %r → %r", label, normalized)
-        return normalized
+        validated = _validate_detected_language(truncated, normalized)
+        logger.debug(
+            "LLM language detector: %r → %r → %r",
+            label,
+            normalized,
+            validated,
+        )
+        return validated
     except Exception as exc:
         fallback = detect_language(truncated)
         logger.warning(
@@ -240,3 +331,17 @@ async def detect_language_from_prompt(
             fallback,
         )
         return fallback
+
+
+async def detect_language_llm(question: str, ctx: LanguageNodeContext) -> str:
+    """Thin :class:`NodeContext` wrapper around :func:`detect_language_from_prompt`.
+
+    Kept byte-for-byte compatible with the original detector so the clarify
+    node (and any other ``ctx``-based caller) resolves the language exactly as
+    before; routes the LLM call through ``ctx.call_llm``.
+    """
+
+    async def _ask(prompt: str) -> str:
+        return await ctx.call_llm([{"role": "human", "content": prompt}])
+
+    return await detect_language_from_prompt(question, _ask)
