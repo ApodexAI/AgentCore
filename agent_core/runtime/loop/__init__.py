@@ -1,6 +1,10 @@
 """Shared loop foundation primitives."""
 
 from agent_core.runtime.loop.agent_loop import AgentLoopHooks, run_agent_loop
+from agent_core.runtime.loop.budget_consistency import (
+    COMPACTION_TRIGGER_RATIO,
+    check_context_budget,
+)
 from agent_core.runtime.loop.compact import (
     DefaultCompactionPolicy,
     DefaultMessageCompactor,
@@ -38,6 +42,7 @@ from agent_core.runtime.loop.model_profile import (
     configure_model_registry,
 )
 from agent_core.runtime.loop.tiered_compact import (
+    DEFAULT_TRIGGER_RATIO,
     InputTokenGauge,
     InputTokenThresholdPolicy,
     TieredCompactor,
@@ -54,6 +59,8 @@ from agent_core.runtime.loop.tool_exec import (
 )
 
 __all__ = [
+    "COMPACTION_TRIGGER_RATIO",
+    "DEFAULT_TRIGGER_RATIO",
     "RUNAWAY_STATE_KEY",
     "TRUNCATION_CONTINUATION_GUIDANCE",
     "AgentLoopHooks",
@@ -84,6 +91,7 @@ __all__ = [
     "bind_temperature",
     "bind_tools",
     "call_llm",
+    "check_context_budget",
     "compaction_trigger_tokens",
     "configure_model_registry",
     "execute_tools",

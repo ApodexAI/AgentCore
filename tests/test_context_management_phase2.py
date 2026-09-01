@@ -58,6 +58,23 @@ def test_prompt_style_is_explicit_and_auto_requires_host_metadata() -> None:
     ) == HANDOFF_COMPACTION_PROMPT
 
 
+def test_auto_dispatch_is_the_documented_default() -> None:
+    """The default has to be ``auto``, or the routing never fires for any caller.
+
+    Both compactors pass ``prompt_builder=compaction_prompt`` with no style, so a
+    ``research`` default made the measured handoff routing unreachable while the
+    docstring said it was on. It is behaviour-preserving: without a
+    tool-category callback ``auto`` returns the research prompt.
+    """
+    machine_work = [assistant_msg("", tool_calls=[_call("bash", {"cmd": "pytest"})])]
+
+    assert compaction_prompt(machine_work) == RESEARCH_COMPACTION_PROMPT
+    assert compaction_prompt(
+        machine_work,
+        tool_category=lambda _name: "compute",
+    ) == HANDOFF_COMPACTION_PROMPT
+
+
 @pytest.mark.asyncio
 async def test_summary_compactor_uses_host_prompt_builder() -> None:
     class CaptureLLM:
@@ -178,3 +195,91 @@ def test_tiered_rejects_two_spill_owners(tmp_path: Path) -> None:
             spill=lambda _name, _body: None,
             spill_store=store,
         )
+
+
+@pytest.mark.asyncio
+async def test_unseen_results_stay_verbatim_when_the_store_cannot_name_a_path(
+    tmp_path: Path,
+) -> None:
+    """A spill store with no ``visible_root`` recovers nothing, so it protects nothing.
+
+    ``spill_compacted_body`` writes with ``require_visible=True`` and returns
+    ``None`` for every body here, so a candidate that shortened the latest
+    tool-call turn would discard results the model has not seen once, with no
+    path in the manifest to read them back from.
+    """
+    store = SpillStore(tmp_path, "session")
+    latest = "new body " * 400
+    history = [
+        user_msg("research"),
+        assistant_msg("", tool_calls=[_call("web_fetch", {}, "old")]),
+        tool_msg("old body " * 400, "old"),
+        assistant_msg("", tool_calls=[_call("web_fetch", {}, "new")]),
+        tool_msg(latest, "new"),
+    ]
+    compactor = TieredCompactor(
+        keep_tool_result=1,
+        summary_llm=None,
+        relief_target=600,
+        spill_store=store,
+    )
+
+    result = await compactor.compact(history, keep_recent=1)
+
+    bodies = {
+        message.get("tool_call_id"): str(message.get("content") or "")
+        for message in result
+        if message.get("role") == "tool"
+    }
+    assert bodies["new"] == latest
+    assert compactor.last_event is not None
+    assert not compactor.last_event.selected.startswith("tool_compression_")
+
+
+@pytest.mark.asyncio
+async def test_unseen_results_may_be_compressed_once_a_path_is_recoverable(
+    tmp_path: Path,
+) -> None:
+    store = SpillStore(tmp_path, "session", visible_root="/spill")
+    latest = "new body " * 400
+    history = [
+        user_msg("research"),
+        assistant_msg("", tool_calls=[_call("web_fetch", {}, "old")]),
+        tool_msg("old body " * 400, "old"),
+        assistant_msg("", tool_calls=[_call("web_fetch", {}, "new")]),
+        tool_msg(latest, "new"),
+    ]
+    compactor = TieredCompactor(
+        keep_tool_result=1,
+        summary_llm=None,
+        relief_target=600,
+        spill_store=store,
+    )
+
+    result = await compactor.compact(history, keep_recent=1)
+
+    bodies = {
+        message.get("tool_call_id"): str(message.get("content") or "")
+        for message in result
+        if message.get("role") == "tool"
+    }
+    assert len(bodies["new"]) < len(latest)
+    assert any(message.get("spill_refs") for message in result)
+
+
+def test_budget_consistency_shares_the_trigger_ratio() -> None:
+    from agent_core.runtime.loop import budget_consistency
+    from agent_core.runtime.loop.tiered_compact import DEFAULT_TRIGGER_RATIO
+
+    assert budget_consistency.COMPACTION_TRIGGER_RATIO == DEFAULT_TRIGGER_RATIO
+
+
+def test_budget_consistency_is_reachable_from_the_package_api() -> None:
+    from agent_core.runtime import loop
+
+    assert loop.check_context_budget(
+        max_len=262_144,
+        max_input_tokens=229_376,
+        max_tokens=32_768,
+        label="test",
+    ) == []

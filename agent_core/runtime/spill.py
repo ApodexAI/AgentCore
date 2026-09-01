@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_AGGREGATE_RESULT_CHARS",
+    "PreviewShape",
     "SpillStore",
     "TruncationMode",
     "budgeted_preview",
@@ -31,6 +32,11 @@ __all__ = [
 ]
 
 TruncationMode = Literal["middle", "head"]
+
+#: What the preview actually kept. ``head_and_tail`` is the only shape that
+#: carries an in-band gap marker; promising one that is not there makes the
+#: model read the truncation point as the end of the content.
+PreviewShape = Literal["head", "head_and_tail"]
 
 DEFAULT_AGGREGATE_RESULT_CHARS = 200_000
 _MIN_AGGREGATE_KEEP = 2_000
@@ -65,6 +71,40 @@ def _tail_start(text: str, budget: int) -> int:
     return newline + 1 if newline != -1 else start
 
 
+def _truncate_with_shape(
+    text: str,
+    budget: int,
+    *,
+    mode: TruncationMode = "middle",
+) -> tuple[str, PreviewShape]:
+    """Truncate and report which shape was produced.
+
+    ``middle`` degrades to a head-only prefix whenever a marked gap does not
+    fit, so the shape has to come from here rather than from the requested mode:
+    the footer describes it to the model, and inspecting the returned text for a
+    marker would also match a body that merely quotes one.
+    """
+
+    if budget <= 0:
+        return "", "head"
+    if len(text) <= budget:
+        return text, "head_and_tail"
+    if mode == "head":
+        return text[: _head_end(text, budget)], "head"
+
+    room = budget - len(_elision(len(text)))
+    if room < 2 * _MIN_SIDE_CHARS:
+        return text[: _head_end(text, budget)], "head"
+    head_end = _head_end(text, room // 2)
+    tail_start = _tail_start(text, room - room // 2)
+    if tail_start <= head_end:
+        return text[: _head_end(text, budget)], "head"
+    return (
+        text[:head_end] + _elision(tail_start - head_end) + text[tail_start:],
+        "head_and_tail",
+    )
+
+
 def truncate_preview(
     text: str,
     budget: int,
@@ -73,24 +113,22 @@ def truncate_preview(
 ) -> str:
     """Return a bounded head-only or head-and-tail preview."""
 
-    if budget <= 0:
-        return ""
-    if len(text) <= budget:
-        return text
-    if mode == "head":
-        return text[: _head_end(text, budget)]
-
-    room = budget - len(_elision(len(text)))
-    if room < 2 * _MIN_SIDE_CHARS:
-        return text[: _head_end(text, budget)]
-    head_end = _head_end(text, room // 2)
-    tail_start = _tail_start(text, room - room // 2)
-    if tail_start <= head_end:
-        return text[: _head_end(text, budget)]
-    return text[:head_end] + _elision(tail_start - head_end) + text[tail_start:]
+    return _truncate_with_shape(text, budget, mode=mode)[0]
 
 
-def _spill_footer(ref: str, *, full_len: int, note: str = "") -> str:
+def _shown_clause(shape: PreviewShape) -> str:
+    if shape == "head_and_tail":
+        return "head and tail; the gap is marked above"
+    return "the beginning only; the remainder is elided without a marker"
+
+
+def _spill_footer(
+    ref: str,
+    *,
+    full_len: int,
+    note: str = "",
+    shape: PreviewShape = "head_and_tail",
+) -> str:
     suffix = f" {note}" if note else ""
     if not ref:
         return (
@@ -99,9 +137,9 @@ def _spill_footer(ref: str, *, full_len: int, note: str = "") -> str:
         )
     directory = ref.rsplit("/", 1)[0]
     return (
-        f"\n\n[... only part of this {full_len:,}-char result is shown (head and "
-        f"tail; the gap is marked above). Full content is saved read-only at "
-        f"{ref}. Only if the elided middle is required, read that path with "
+        f"\n\n[... only part of this {full_len:,}-char result is shown "
+        f"({_shown_clause(shape)}). Full content is saved read-only at "
+        f"{ref}. Only if the elided content is required, read that path with "
         f"whichever tool you have — read_file, `cat` via bash, or "
         f'grep_search(pattern="...", path="{directory}"). It is read-only; '
         f"do not write there.{suffix}]"
@@ -117,12 +155,32 @@ def budgeted_preview(
     note: str = "",
     mode: TruncationMode = "middle",
 ) -> str:
-    """Build a preview plus recovery pointer within one character budget."""
+    """Build a preview plus recovery pointer within one character budget.
+
+    The footer is charged to ``cap``, but its wording depends on the truncation
+    that actually happened — so room is reserved for the longest variant and the
+    footer is rebuilt from the preview produced.
+
+    ``body`` is returned unchanged when no bounded rewrite would be shorter than
+    it. ``_MIN_PREVIEW_CHARS`` is a floor on the preview, so for a small ``cap``
+    the composed result can be longer than the body it replaces; a rewrite that
+    grows the payload while claiming to bound it is worse than the payload, and
+    a footer pointing at a recovery file is pointless when nothing was elided.
+    """
 
     total = len(body) if full_len is None else full_len
-    footer = _spill_footer(ref, full_len=total, note=note)
-    preview_budget = max(cap - len(footer), _MIN_PREVIEW_CHARS)
-    return truncate_preview(body, preview_budget, mode=mode) + footer
+    reserve = max(
+        len(_spill_footer(ref, full_len=total, note=note, shape=shape))
+        for shape in ("head", "head_and_tail")
+    )
+    preview_budget = max(cap - reserve, _MIN_PREVIEW_CHARS)
+    if preview_budget >= len(body) and total <= len(body):
+        return body
+    preview, shape = _truncate_with_shape(body, preview_budget, mode=mode)
+    composed = preview + _spill_footer(ref, full_len=total, note=note, shape=shape)
+    if len(composed) >= len(body) and total <= len(body):
+        return body
+    return composed
 
 
 class SpillStore:

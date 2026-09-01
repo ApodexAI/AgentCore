@@ -48,8 +48,10 @@ logger = logging.getLogger(__name__)
 # sent (see :class:`InputTokenThresholdPolicy`) is what removed the failures; the
 # margin was never the binding constraint. Hosts may pass an explicit ratio so
 # the question can be revisited without forking this implementation.
-_DEFAULT_TRIGGER_RATIO = 0.8
-def compaction_trigger_tokens(max_len: int, ratio: float = _DEFAULT_TRIGGER_RATIO) -> int:
+DEFAULT_TRIGGER_RATIO = 0.8
+
+
+def compaction_trigger_tokens(max_len: int, ratio: float = DEFAULT_TRIGGER_RATIO) -> int:
     """The absolute token threshold tiered compaction should fire at.
 
     Keeping the ratio explicit makes environment/config ownership a host concern
@@ -58,6 +60,29 @@ def compaction_trigger_tokens(max_len: int, ratio: float = _DEFAULT_TRIGGER_RATI
     if not 0.0 < ratio < 1.0:
         raise ValueError(f"ratio must be between 0 and 1 (got {ratio})")
     return int(max_len * ratio)
+
+
+def _spill_can_recover(spill: Callable[[str, str], str | None] | None) -> bool:
+    """Whether a spill callback can actually hand the model back a path.
+
+    ``SpillStore.spill_compacted_body`` writes with ``require_visible=True`` and
+    so returns ``None`` for every body when the store has no ``visible_root`` —
+    a configuration ``docs/context-management-boundary.md`` explicitly allows for
+    a backend that cannot name host paths. A candidate selected on the strength
+    of "a spill callback exists" would then shorten results with nothing
+    recoverable behind them, so the question has to be whether the callback can
+    produce a ref, not whether it is set.
+
+    A bound method of an unmounted store answers for itself; any other callable
+    is the host's own and is taken at its word.
+    """
+    if spill is None:
+        return False
+    owner = getattr(spill, "__self__", None)
+    if isinstance(owner, SpillStore):
+        return owner.visible_root is not None
+    return True
+
 
 _FULL_TEXT_PREFIX = "[Full text] "
 _SPILL_MANIFEST_MAX_PATHS = 20
@@ -195,6 +220,12 @@ class TieredCompactor:
         # path, so nothing would be recoverable afterwards.
         self._protect = frozenset(protect_tool_names)
         self._spill = spill_callback
+        self._spill_recoverable = _spill_can_recover(spill_callback)
+        if spill_callback is not None and not self._spill_recoverable:
+            logger.info(
+                "TieredCompactor: spill store has no visible_root — unseen tool "
+                "results stay verbatim, as if no spill were configured",
+            )
         # ``emit_event`` has existed on LLMSummaryCompactor all along with no
         # caller, so the summary it produced reached nothing. Used here as the
         # internal channel that carries the summary text up to ``last_event``;
@@ -479,11 +510,12 @@ class TieredCompactor:
             )
 
         # Cheap fallback can reach large results inside the protected recent
-        # window. With a spill store, a selected candidate persists every body
-        # it shortens below. Without one, keep the latest tool-call turn whole:
-        # compaction runs before the model has seen those results even once.
+        # window. With a spill store that can name a readable path, a selected
+        # candidate persists every body it shortens below. Without one, keep the
+        # latest tool-call turn whole: compaction runs before the model has seen
+        # those results even once.
         latest_result_ids: frozenset[str] = (
-            frozenset() if self._spill is not None
+            frozenset() if self._spill_recoverable
             else self._latest_tool_result_ids(messages)
         )
         candidates: list[tuple[str, list[Message], int]] = [

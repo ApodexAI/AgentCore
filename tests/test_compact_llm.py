@@ -27,7 +27,10 @@ from agent_core.messages import (
     tool_msg,
     user_msg,
 )
-from agent_core.runtime.loop.compact_llm import LLMSummaryCompactor
+from agent_core.runtime.loop.compact_llm import (
+    LLMSummaryCompactor,
+    is_transient_summary_error,
+)
 
 
 class _StaticSummaryLLM:
@@ -168,3 +171,87 @@ async def test_short_history_below_keep_recent_is_unchanged() -> None:
     out = await compactor.compact(history, keep_recent=4)
 
     assert out == history
+
+
+def test_partition_keeps_a_parallel_tool_turn_whole() -> None:
+    """A tail made only of tool results must not leave one of them orphaned.
+
+    Walking the split point forward past the tool results runs off the end of the
+    history, and the last result is then kept while the ``AIMessage`` carrying
+    its ``tool_call_id`` is summarised away — exactly the HTTP 400 this guard
+    exists to prevent.
+    """
+    history: list[Message] = [
+        system_msg("S"),
+        user_msg("q"),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "a", "function": {"name": "web_search", "arguments": "{}"}},
+                {"id": "b", "function": {"name": "web_search", "arguments": "{}"}},
+            ],
+        },
+        tool_msg("result a", "a"),
+        tool_msg("result b", "b"),
+    ]
+
+    _system, _middle, recent = LLMSummaryCompactor._partition(history, keep_recent=2)
+
+    assert recent[0].get("role") == "assistant"
+    answered = {
+        str(call.get("id"))
+        for message in recent
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    orphans = {
+        str(message.get("tool_call_id"))
+        for message in recent
+        if message.get("role") == "tool"
+    } - answered
+    assert not orphans
+
+
+def test_partition_still_shrinks_the_window_when_it_can() -> None:
+    history: list[Message] = [
+        system_msg("S"),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "a", "function": {"name": "web_search", "arguments": "{}"}}],
+        },
+        tool_msg("result a", "a"),
+        user_msg("next"),
+    ]
+
+    _system, middle, recent = LLMSummaryCompactor._partition(history, keep_recent=2)
+
+    # The tool result at the head of the window is walked past, not kept.
+    assert recent == [history[-1]]
+    assert middle == history[1:3]
+
+
+def test_rate_limit_naming_a_retry_delay_is_still_transient() -> None:
+    """A bare ``400`` inside a provider message is not a status code.
+
+    OpenAI-compatible endpoints put the retry hint in the message text, so a
+    substring match read "try again in 400ms" as a permanent HTTP 400 and burned
+    the whole retry budget of a textbook retriable 429.
+    """
+    assert is_transient_summary_error(
+        RuntimeError("Rate limit reached for model. Please try again in 400ms."),
+    )
+    assert is_transient_summary_error(RuntimeError("request req_413abc failed: overloaded"))
+    assert not is_transient_summary_error(RuntimeError("HTTP 400: invalid_request_error"))
+
+
+def test_a_structured_status_field_beats_the_message_text() -> None:
+    class Rejected(RuntimeError):
+        status_code = 422
+
+    class Throttled(RuntimeError):
+        status_code = 429
+
+    assert not is_transient_summary_error(Rejected("unhelpful message"))
+    assert is_transient_summary_error(Throttled("bad request, allegedly"))

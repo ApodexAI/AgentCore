@@ -161,3 +161,37 @@ def test_read_does_not_follow_a_spill_file_symlink_outside_scope(tmp_path: Path)
     link.symlink_to(outside)
 
     assert store.read(link) is None
+
+
+def test_budgeted_preview_never_grows_the_body_it_bounds() -> None:
+    """A cap too small for preview floor plus footer must not inflate the result.
+
+    ``_MIN_PREVIEW_CHARS`` overrides the cap, and the footer is appended on top,
+    so a 700-char body under ``cap=600`` used to come back at ~950 characters —
+    the function that exists to bound a result growing it, and pointing at a
+    recovery file for content that is entirely inline.
+    """
+    body = "x" * 700
+
+    result = budgeted_preview(body, cap=600, ref="/spill/scope/body.md")
+
+    assert result == body
+
+
+def test_head_only_preview_does_not_promise_a_gap_marker() -> None:
+    body = "\n".join(f"line {index}" for index in range(2_000))
+
+    result = budgeted_preview(body, cap=3_000, ref="/spill/scope/body.md", mode="head")
+
+    assert "chars elided" not in result
+    assert "the gap is marked above" not in result
+    assert "the beginning only" in result
+
+
+def test_head_and_tail_preview_reports_its_marked_gap() -> None:
+    body = "\n".join(f"line {index}" for index in range(2_000))
+
+    result = budgeted_preview(body, cap=3_000, ref="/spill/scope/body.md")
+
+    assert "chars elided" in result
+    assert "the gap is marked above" in result

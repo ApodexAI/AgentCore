@@ -27,7 +27,11 @@ store.
 The physical store should be outside every agent-writable workspace. Products
 that expose it inside a sandbox must mount it read-only. A backend that cannot
 name host paths passes no `visible_root`; AgentCore may retain a host-side copy
-for diagnostics, but generated previews do not advertise an unusable path.
+for diagnostics, but generated previews do not advertise an unusable path. Such
+a store recovers nothing the model can read, so tiered compaction treats it as
+if no spill were configured: results from the latest tool-call turn — which the
+model has not seen when compaction runs — are kept verbatim rather than
+shortened against a path nobody can open.
 
 Checkpoint persistence and durable user memory are not context compaction.
 They remain product concerns; AgentCore only preserves spill references in

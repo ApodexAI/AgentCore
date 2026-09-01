@@ -21,15 +21,20 @@ from __future__ import annotations
 
 import logging
 
+from agent_core.runtime.loop.tiered_compact import (
+    DEFAULT_TRIGGER_RATIO as COMPACTION_TRIGGER_RATIO,
+)
+from agent_core.runtime.loop.tiered_compact import compaction_trigger_tokens
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["COMPACTION_TRIGGER_RATIO", "check_context_budget"]
 
-# The ratio of ``max_len`` at which tiered compaction triggers. Duplicated as a
-# literal ``int(max_len * 0.8)`` at each of the three construction sites; named
-# here because this module has to reason about it, and a check that silently
-# disagreed with the trigger would be worse than no check.
-COMPACTION_TRIGGER_RATIO = 0.8
+# The ratio of ``max_len`` at which tiered compaction triggers is re-exported,
+# not restated: a second literal here could silently drift from the trigger, and
+# a check that disagreed with the mechanism it describes would be worse than no
+# check. A host that passes its own ``ratio`` to ``compaction_trigger_tokens``
+# must pass the same one here.
 
 
 def check_context_budget(
@@ -38,6 +43,7 @@ def check_context_budget(
     max_input_tokens: int | None,
     max_tokens: int | None,
     reasoning_only_max_tokens: int | None = None,
+    ratio: float = COMPACTION_TRIGGER_RATIO,
     label: str,
 ) -> list[str]:
     """Warn about token budgets that cannot all hold at once.
@@ -45,6 +51,9 @@ def check_context_budget(
     Returns the warning strings, so a caller (or a test) can assert on them
     rather than scraping the log. Anything unset or non-positive is skipped: a
     missing bound is a deliberate configuration, not an inconsistency.
+
+    ``ratio`` must be the one the loop's compaction trigger was built with; the
+    margin reported below is meaningless against any other.
     """
     problems: list[str] = []
 
@@ -74,7 +83,7 @@ def check_context_budget(
             logger.warning("%s", problem)
         return problems
 
-    trigger = int(max_len * COMPACTION_TRIGGER_RATIO)
+    trigger = compaction_trigger_tokens(max_len, ratio)
 
     if (
         max_input_tokens is not None

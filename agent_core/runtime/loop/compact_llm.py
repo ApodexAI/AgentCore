@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
@@ -66,9 +67,6 @@ _DETERMINISTIC_ERROR_MARKERS = (
     "invalid_request",
     "invalid request",
     "bad request",
-    "400",
-    "413",
-    "422",
     "unauthorized",
     "forbidden",
     "not found",
@@ -86,12 +84,47 @@ _TRANSIENT_ERROR_MARKERS = (
     "rate limit",
     "rate_limit",
     "too many requests",
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
 )
+
+# Status codes, kept apart from the substrings above because a bare number is
+# not a substring worth matching: provider messages carry request ids, durations
+# and quota hints, so "Rate limit reached — try again in 400ms" used to classify
+# a textbook retriable 429 as a permanent 400 and skip its whole retry budget.
+# Matched only as a standalone token, and only after the exception's own status
+# field — which is authoritative when the provider exposes one.
+_DETERMINISTIC_STATUS_CODES = frozenset({400, 401, 403, 404, 413, 422})
+_TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
+_STATUS_ATTRS = ("status_code", "status", "http_status")
+# Neither side of a code may abut a word character, a dot or a percent sign:
+# ``400ms``, ``req_400abc``, ``0.400`` and ``400%`` are not status codes.
+_CODE_PATTERNS = {
+    code: re.compile(rf"(?<![\w.]){code}(?![\w.%])")
+    for code in _DETERMINISTIC_STATUS_CODES | _TRANSIENT_STATUS_CODES
+}
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """The HTTP status an exception carries, if it names one at all."""
+
+    candidates: list[Any] = [getattr(exc, attr, None) for attr in _STATUS_ATTRS]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        candidates.extend(getattr(response, attr, None) for attr in _STATUS_ATTRS)
+    for value in candidates:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value.isdigit():
+                continue
+            value = int(value)
+        if isinstance(value, int) and 100 <= value <= 599:
+            return value
+    return None
+
+
+def _mentions_status(text: str, codes: frozenset[int]) -> bool:
+    return any(_CODE_PATTERNS[code].search(text) for code in codes)
 
 
 # Backoff between transient summary retries: ``min(base * attempt, cap)``.
@@ -130,6 +163,13 @@ def is_transient_summary_error(exc: BaseException) -> bool:
         return False
     if is_transient_network(exc):
         return True
+    # A structured status beats any reading of the message text.
+    status = _status_code(exc)
+    if status is not None:
+        if status in _TRANSIENT_STATUS_CODES:
+            return True
+        if status in _DETERMINISTIC_STATUS_CODES:
+            return False
     text = f"{type(exc).__name__}: {exc}".lower()
     for marker in _DETERMINISTIC_ERROR_MARKERS:
         if marker in text:
@@ -137,7 +177,12 @@ def is_transient_summary_error(exc: BaseException) -> bool:
     for marker in _TRANSIENT_ERROR_MARKERS:
         if marker in text:
             return True
-    return True
+    # Codes last, and transient first among them: a rate limit is a 4xx, so a
+    # message naming both ("429 ... retry after 400ms") must not read as
+    # permanent.
+    if _mentions_status(text, _TRANSIENT_STATUS_CODES):
+        return True
+    return not _mentions_status(text, _DETERMINISTIC_STATUS_CODES)
 
 
 # Type alias for the optional event emitter callback. Signature matches
@@ -330,11 +375,24 @@ class LLMSummaryCompactor:
             return sys_msgs, [], rest
 
         split_idx = len(rest) - keep_recent
-        # Avoid orphan ToolMessage at the head of the kept window: the
+        # Avoid an orphan ToolMessage at the head of the kept window: the
         # matching AIMessage(tool_calls=[...]) would otherwise be left
-        # in the middle and Azure rejects orphan tool_call_id with 400.
-        while split_idx < len(rest) - 1 and is_tool_msg(rest[split_idx]):
-            split_idx += 1
+        # in the middle and Azure rejects an orphan tool_call_id with 400.
+        forward = split_idx
+        while forward < len(rest) and is_tool_msg(rest[forward]):
+            forward += 1
+        if forward < len(rest):
+            split_idx = forward
+        else:
+            # The whole tail is tool results — a parallel tool-call turn that
+            # emitted at least ``keep_recent`` of them. Walking forward runs off
+            # the end and leaves the last result orphaned (the bug this guard
+            # exists to prevent), so walk BACK to the assistant message that
+            # owns the calls and keep that turn whole instead. The kept window
+            # grows past ``keep_recent``; ``keep_recent`` is a floor on how much
+            # recent history survives, not a cap.
+            while split_idx > 0 and is_tool_msg(rest[split_idx]):
+                split_idx -= 1
 
         return sys_msgs, rest[:split_idx], rest[split_idx:]
 

@@ -199,7 +199,7 @@ def _is_machine_work(
 def compaction_prompt(
     messages: list[Message] | None = None,
     *,
-    style: str = "research",
+    style: str = "auto",
     tool_category: Callable[[str], str] | None = None,
 ) -> str:
     """Return a product-neutral summary prompt.
@@ -207,7 +207,9 @@ def compaction_prompt(
     Hosts may select ``research`` or ``handoff`` directly. ``auto`` dispatches
     only when the host supplies a tool-category callback; AgentCore deliberately
     has no dependency on a product plugin registry. Missing or invalid policy
-    falls back to the established research prompt.
+    falls back to the established research prompt — as does ``auto`` itself
+    without a callback or without ``messages``, so the default is identical to
+    ``research`` for a host that wires neither.
 
     ``auto`` (the default) dispatches on the conversation's own tool mix, for the
     reason the apex A/B surfaced: at identical task success the handoff shape
