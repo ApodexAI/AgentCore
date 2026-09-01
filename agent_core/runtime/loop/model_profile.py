@@ -98,7 +98,18 @@ def _load_thinking_format_patterns() -> (
         return ()
     try:
         import yaml
-    except ImportError:  # pragma: no cover — PyYAML is a project dep
+    except ImportError:
+        # AgentCore declares no dependencies, so PyYAML is genuinely optional
+        # here. Failing silently would leave every model on the caller's
+        # default format -- for a content_block provider that means reasoning
+        # is inlined as <think> and the signed blocks are dropped -- while the
+        # host believes its configured registry is in effect.
+        logger.error(
+            "model registry %s is configured but PyYAML is not installed; "
+            "thinking-format inference is disabled and every model falls back "
+            "to the caller-supplied default. Install PyYAML to enable it.",
+            _registry_path,
+        )
         return ()
     try:
         raw = yaml.safe_load(_registry_path.read_text(encoding="utf-8")) or {}
@@ -120,7 +131,17 @@ def _load_thinking_format_patterns() -> (
             continue
         pattern_str = entry.get("pattern")
         fmt = entry.get("format")
-        if not pattern_str or fmt not in _VALID_FORMATS:
+        # ``fmt in _VALID_FORMATS`` raises TypeError for a list or dict, which
+        # an indentation typo (``format: [content_block]``) produces easily and
+        # which would abort the whole load. That is exactly what
+        # :func:`is_thinking_format` exists to prevent.
+        if not isinstance(pattern_str, str) or not pattern_str:
+            logger.warning(
+                "model_registry.yaml: skipped entry with a non-string "
+                "pattern: %r", entry,
+            )
+            continue
+        if not is_thinking_format(fmt):
             logger.warning(
                 "model_registry.yaml: skipped invalid entry %r", entry,
             )
@@ -333,8 +354,14 @@ class MessageNormalizer(Protocol):
         response: Any,
         thinking_result: ThinkingResult,
         policy: HistoryPolicy,
+        thinking_format: ThinkingFormat,
     ) -> Message:
-        """Return the message form appropriate for the conversation history."""
+        """Return the message form appropriate for the conversation history.
+
+        The engine passes the resolved ``thinking_format`` as a fourth
+        argument; the Protocol declared three, so no implementation of it as
+        written could actually be used.
+        """
         ...
 
 
@@ -381,9 +408,19 @@ class DefaultThinkingParser:
             # case this format originally handled.
             typed_rc = _extract_reasoning(response)
             if typed_rc:
+                # The two channels are not exclusive: SGLang qwen3 fills the
+                # typed field AND can leave inline tags in ``content``. Keeping
+                # the raw text as "visible" would replay the same reasoning
+                # twice in history (``to_history`` re-wraps ``thinking``), and
+                # would leave inline reasoning in history even when the policy
+                # explicitly disables it. Strip the tags either way; fold any
+                # inline blocks into the reasoning so nothing is lost.
+                inline = _THINK_RE.findall(raw)
+                visible = _THINK_RE.sub("\n", raw).strip() if inline else raw
+                thinking = "\n".join([typed_rc, *inline]) if inline else typed_rc
                 return ThinkingResult(
-                    thinking=typed_rc,
-                    visible_content=raw,
+                    thinking=thinking,
+                    visible_content=visible,
                     tool_calls=tool_calls,
                 )
             # Every block, not just the first: a turn can reopen <think>

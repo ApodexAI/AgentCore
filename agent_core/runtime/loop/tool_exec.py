@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager, nullcontext, suppress
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from agent_core.loop_types import ToolResult
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PROTECTED_FANIN_TOOLS",
@@ -54,13 +57,18 @@ class DefaultToolResultPostProcessor:
 
     def process(self, tool_result: ToolResult) -> str:
         content = tool_result.result
+        if not isinstance(content, str):
+            content = str(content)
         cap = self._max_chars
-        if cap and isinstance(content, str) and len(content) > cap:
-            return content[:cap] + (
-                f"\n\n[... truncated {len(content) - cap} chars past "
-                f"{cap}-char cap]"
-            )
-        return content if isinstance(content, str) else str(content)
+        # A non-positive cap is the conventional "unlimited" sentinel. Letting
+        # it through would slice from the end (``content[:-3]``) and silently
+        # drop the tail of every tool result.
+        if cap is None or cap <= 0 or len(content) <= cap:
+            return content
+        return content[:cap] + (
+            f"\n\n[... truncated {len(content) - cap} chars past "
+            f"{cap}-char cap]"
+        )
 
 
 TimeoutResolver = Callable[[str, dict[str, Any], int], float]
@@ -145,6 +153,55 @@ def _interrupted_result(_name: str) -> str:
     )
 
 
+def _safe_hook[T](
+    what: str,
+    call: Callable[[], T],
+    fallback: Callable[[], T],
+) -> T:
+    """Run a host hook, falling back to core behavior if it raises.
+
+    Metering, timeout policy and batch budgeting are host concerns layered
+    around execution; a broken one must not turn a whole tool batch -- or the
+    surrounding agent loop -- into a failure. Mirrors the attempt-observer
+    rule in ``_call.py``: passive observability never breaks a valid call.
+    """
+
+    try:
+        return call()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "tool execution hook %s raised; falling back to core default",
+            what,
+            exc_info=True,
+        )
+        return fallback()
+
+
+def _interrupt_requested(task: asyncio.Future[bool], name: str) -> bool:
+    """Did the waiter actually ask for an interrupt?
+
+    A waiter that returns ``False`` means "no interrupt was requested", and a
+    waiter that raises is a broken host observer -- neither is a user
+    interrupt. Treating either as one would cancel a healthy fan-in tool and
+    report collected work as abandoned, so both resolve to ``False`` here.
+    """
+
+    try:
+        return bool(task.result())
+    except asyncio.CancelledError:
+        # The waiter itself was cancelled; that is not a user interrupt.
+        return False
+    except Exception:
+        logger.warning(
+            "tool interrupt waiter for %r raised; treating as no interrupt",
+            name,
+            exc_info=True,
+        )
+        return False
+
+
 @dataclass(frozen=True)
 class ToolExecutionHooks:
     """Host decisions around a shared execution lifecycle.
@@ -164,6 +221,11 @@ class ToolExecutionHooks:
     timeout_result: TimeoutResult = _timeout_result
     failure_result: FailureResult = _failure_result
     interrupted_result: InterruptedResult = _interrupted_result
+    # Which tools may be woken by an interrupt waiter. The default names are
+    # the ones this engine was extracted from; a host whose fan-in tool is
+    # called something else has to be able to say so, or its interrupt waiter
+    # is never consulted no matter that it was supplied.
+    aggregation_tools: frozenset[str] = _AGGREGATION_TOOLS
 
 
 async def execute_tools(
@@ -198,14 +260,24 @@ async def execute_tools(
             return ToolResult(
                 name=name,
                 args=args,
-                result=runtime.unknown_result(name, tuple(sorted(tool_map))),
+                result=_safe_hook(
+                    "unknown_result",
+                    lambda: runtime.unknown_result(
+                        name, tuple(sorted(tool_map))
+                    ),
+                    lambda: _unknown_result(name, tuple(sorted(tool_map))),
+                ),
                 duration_ms=0,
                 tool_call_id=tool_call_id,
                 is_error=True,
             )
 
-        effective_timeout = runtime.resolve_timeout(name, args, timeout)
-        runtime.on_call(name)
+        effective_timeout = _safe_hook(
+            "resolve_timeout",
+            lambda: runtime.resolve_timeout(name, args, timeout),
+            lambda: float(timeout),
+        )
+        _safe_hook("on_call", lambda: runtime.on_call(name), lambda: None)
         invoke_task: asyncio.Future[Any] | None = None
         interrupt_task: asyncio.Future[bool] | None = None
         woke_for_interrupt = False
@@ -216,16 +288,33 @@ async def execute_tools(
                 invocation = runtime.await_call(
                     tool.ainvoke(args), name, args, effective_timeout
                 )
-                if interrupt_waiter is not None and name in _AGGREGATION_TOOLS:
+                if (
+                    interrupt_waiter is not None
+                    and name in runtime.aggregation_tools
+                ):
                     invoke_task = asyncio.ensure_future(invocation)
                     interrupt_task = asyncio.ensure_future(interrupt_waiter(call))
-                    done, _ = await asyncio.wait(
-                        {invoke_task, interrupt_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if interrupt_task in done and bool(interrupt_task.result()):
-                        woke_for_interrupt = True
-                    if invoke_task not in done:
+                    pending: set[asyncio.Future[Any]] = {
+                        invoke_task,
+                        interrupt_task,
+                    }
+                    while pending:
+                        done, pending = await asyncio.wait(
+                            pending, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        # Completed work always wins: if the tool finished in
+                        # the same wake-up as the waiter, keep its result.
+                        if invoke_task in done:
+                            break
+                        # A waiter that finished without requesting an
+                        # interrupt is not a reason to abandon the tool --
+                        # keep waiting on the invocation alone.
+                        if interrupt_task in done and _interrupt_requested(
+                            interrupt_task, name
+                        ):
+                            woke_for_interrupt = True
+                            break
+                    if woke_for_interrupt:
                         invoke_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await invoke_task
@@ -250,8 +339,14 @@ async def execute_tools(
             return ToolResult(
                 name=name,
                 args=args,
-                result=runtime.timeout_result(
-                    name, elapsed / 1000, effective_timeout
+                result=_safe_hook(
+                    "timeout_result",
+                    lambda: runtime.timeout_result(
+                        name, elapsed / 1000, effective_timeout
+                    ),
+                    lambda: _timeout_result(
+                        name, elapsed / 1000, effective_timeout
+                    ),
                 ),
                 duration_ms=elapsed,
                 tool_call_id=tool_call_id,
@@ -260,10 +355,15 @@ async def execute_tools(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            failure = exc
             return ToolResult(
                 name=name,
                 args=args,
-                result=runtime.failure_result(name, exc),
+                result=_safe_hook(
+                    "failure_result",
+                    lambda: runtime.failure_result(name, failure),
+                    lambda: _failure_result(name, failure),
+                ),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 tool_call_id=tool_call_id,
                 is_error=True,
@@ -282,4 +382,9 @@ async def execute_tools(
                     invoke_task.exception()
 
     tasks = [_run_one(call, index) for index, call in enumerate(tool_calls)]
-    return runtime.transform_batch(list(await asyncio.gather(*tasks)))
+    results = list(await asyncio.gather(*tasks))
+    return _safe_hook(
+        "transform_batch",
+        lambda: runtime.transform_batch(results),
+        lambda: results,
+    )

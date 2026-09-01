@@ -136,8 +136,13 @@ async def _no_cancel_cleanup() -> None:
 class AgentLoopHooks:
     """Product-owned runtime state injected around the shared loop engine."""
 
+    # Session affinity has exactly one owner per run. ``bind_session``, when
+    # supplied, fully REPLACES the built-in ``bind_session_id`` binding and
+    # therefore also replaces ``sticky_session_enabled`` -- the engine does not
+    # consult the flag a host binding is free to ignore. Supplying both is a
+    # configuration error and is reported once at loop start.
     sticky_session_enabled: Callable[[], bool] | None = None
-    bind_session: Callable[[Any, str], Any] | None = None
+    bind_session: Callable[[LLMClient, str], LLMClient] | None = None
     wall_deadline_remaining: Callable[[], float | None] = _no_deadline
     chain_fallback_active: Callable[[], bool] = _false
     enter_scope: Callable[
@@ -228,6 +233,12 @@ async def run_agent_loop(
     # Pin one conversation to one upstream worker when affinity is enabled.
     llm_session_id = cfg.llm_session_id or cfg.task_id
     if runtime.bind_session is not None:
+        if runtime.sticky_session_enabled is not None:
+            logger.warning(
+                "AgentLoopHooks got both bind_session and "
+                "sticky_session_enabled; bind_session owns session affinity "
+                "and the sticky flag is ignored"
+            )
         llm_with_session = runtime.bind_session(llm, llm_session_id)
     else:
         llm_with_session = bind_session_id(
@@ -262,6 +273,7 @@ async def run_agent_loop(
             normalizer, tool_map, tool_names, llm_with_session, llm_with_tools,
             messages, metadata, on_turn_complete, pause_check,
             scope=scope, runtime_hooks=runtime,
+            tool_result_cap=_effective_tool_result_cap(cfg, history_policy),
         )
     except asyncio.CancelledError:
         # The loop task was cancelled mid-flight (wall deadline, fan-out
@@ -332,6 +344,7 @@ async def _run_loop_inner(
     pause_check: PauseCheckHook | None = None,
     scope: Any = None,
     runtime_hooks: AgentLoopHooks | None = None,
+    tool_result_cap: int | None = None,
 ) -> AgentLoopResult:
     """Inner loop extracted so run_agent_loop can wrap with ExecutionScope."""
     runtime = runtime_hooks or AgentLoopHooks()
@@ -478,10 +491,20 @@ async def _run_loop_inner(
                 cfg, obs, tool_map, messages, metadata, turn, total_tool_calls,
                 ctx, parsed_calls, runtime.tool_execution,
                 runtime.body_has_spill_reference,
+                result_max_chars=tool_result_cap,
             )
             total_tool_calls += tool_calls_executed
             if stop_reason:
                 break
+        else:
+            # An observer suppressed dispatch but the assistant message with
+            # its ``tool_calls`` is already in history; leaving those ids
+            # unanswered would make the next provider request invalid.
+            _answer_unexecuted_tool_calls(
+                messages,
+                "tool execution was suppressed for this turn; re-issue it if "
+                "still needed.",
+            )
 
         stop_reason = _handle_context_overflow(
             cfg, messages, turn, last_input_tokens, last_output_tokens
@@ -727,6 +750,51 @@ def _answer_dropped_tool_calls(
         answered.add(call_id)
 
 
+def _answer_unexecuted_tool_calls(messages: list[Message], detail: str) -> None:
+    """Answer every ``tool_call_id`` in the last assistant message that no
+    tool message replies to.
+
+    :func:`_answer_dropped_tool_calls` covers calls the engine itself refused
+    to dispatch, but it runs *before* execution and therefore counts the
+    surviving ``parsed_calls`` as answered-by-construction. When an observer
+    intervention keeps the assistant message yet skips execution
+    (``skip_tool_execution``, or ``continue_to_next_turn`` without
+    ``pop_last_message``), that assumption breaks and the next provider
+    request carries unanswered ids -- a hard 400 on OpenAI, Azure and
+    Anthropic alike. This closes the invariant on those paths.
+
+    Answers are *inserted* directly beneath the assistant message rather
+    than appended, because a tool message separated from its call by an
+    injected user message is just as invalid as a missing one.
+    """
+
+    idx = len(messages) - 1
+    while idx >= 0 and not is_assistant_msg(messages[idx]):
+        idx -= 1
+    if idx < 0:
+        return
+    recorded = messages[idx].get("tool_calls") or []
+    if not recorded:
+        return
+    answered = {
+        message.get("tool_call_id")
+        for message in messages[idx + 1:]
+        if is_tool_msg(message)
+    }
+    insert_at = idx + 1
+    while insert_at < len(messages) and is_tool_msg(messages[insert_at]):
+        insert_at += 1
+    for call in recorded:
+        call_id = call.get("id")
+        if not call_id or call_id in answered:
+            continue
+        messages.insert(insert_at, tool_msg(
+            f"[tool call not executed] {detail}", call_id
+        ))
+        insert_at += 1
+        answered.add(call_id)
+
+
 def _pop_last_assistant_turn(messages: list[Message]) -> None:
     """Remove the assistant message a rollback observer rejected, in full.
 
@@ -743,20 +811,31 @@ def _pop_last_assistant_turn(messages: list[Message]) -> None:
     Only this turn's tail is in scope: real tool results are appended
     later, in ``_execute_tool_calls``.
 
-    If no assistant message sits beneath the trailing tool messages, the
-    tail is not this turn's shape at all — leave history untouched rather
-    than popping an unrelated prefix.
+    The tail is not always tool messages either: an interrupt notice or an
+    observer injection appends a ``user`` message after the assistant one.
+    Stopping at the first non-tool message there made this a silent no-op, so
+    a rollback paired with ``continue_to_next_turn`` replayed the same content
+    forever until the attempt buffer ran out. Search past anything for the
+    assistant message, and remove it together with the tool answers that
+    belong to it while leaving later injections in place -- they carry
+    information the rejected assistant turn does not.
+
+    If there is no assistant message at all, the tail is not this turn's
+    shape: leave history untouched rather than popping an unrelated prefix.
     """
     idx = len(messages) - 1
-    while idx >= 0 and is_tool_msg(messages[idx]):
+    while idx >= 0 and not is_assistant_msg(messages[idx]):
         idx -= 1
-    if idx < 0 or not is_assistant_msg(messages[idx]):
+    if idx < 0:
         logger.warning(
-            "_pop_last_assistant_turn: no assistant message beneath the "
-            "trailing tool messages; leaving history unchanged"
+            "_pop_last_assistant_turn: no assistant message in history; "
+            "leaving it unchanged"
         )
         return
-    del messages[idx:]
+    end = idx + 1
+    while end < len(messages) and is_tool_msg(messages[end]):
+        end += 1
+    del messages[idx:end]
 
 
 async def _process_llm_response(
@@ -816,12 +895,15 @@ async def _process_llm_response(
                 if isinstance(tc, dict) and tc.get("id")
             }
             for blocked in blocked_landing_calls:
-                call_id = str(blocked.get("id") or "")
-                if call_id and call_id in native_ids:
+                # Deliberately not named ``call_id``: that parameter holds the
+                # LLM call id used by the attempt events, and rebinding it here
+                # left every later read pointing at the last blocked tool call.
+                blocked_id = str(blocked.get("id") or "")
+                if blocked_id and blocked_id in native_ids:
                     messages.append(tool_msg(
                         "[tool call blocked] final turn accepts only "
                         "workflow-approved landing tools; report current progress.",
-                        call_id,
+                        blocked_id,
                     ))
         parsed_calls = allowed_calls
 
@@ -852,8 +934,17 @@ async def _process_llm_response(
                 "reasoning_tokens": 0, "estimated": True,
             }
     if usage:
-        last_input_tokens = int(usage.get("prompt_tokens", 0) or 0)
-        last_output_tokens = int(usage.get("completion_tokens", 0) or 0)
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        # The zero-filled fallback above records model identity for cost
+        # attribution; it carries no token counts. Letting its zeros overwrite
+        # the previous turn's real numbers would make the context-overflow
+        # guard compute an estimate of 0 and never fire, so a gateway that
+        # omits usage on some routes turns a clean ``context_limit_reached``
+        # into a provider-side rejection. Keep the last known values instead.
+        if prompt_tokens or completion_tokens:
+            last_input_tokens = prompt_tokens
+            last_output_tokens = completion_tokens
 
     leaked_reasoning = extract_leaked_reasoning(response)
     rmd = getattr(response, "response_metadata", None) or {}
@@ -887,6 +978,14 @@ async def _process_llm_response(
         if merged_llm.inject_messages:
             for msg_text in merged_llm.inject_messages:
                 messages.append(user_msg(msg_text))
+        # The turn is being replayed without executing its calls. When the
+        # observer also popped the assistant message this is a no-op; when it
+        # did not, these ids would otherwise reach the next request unanswered.
+        _answer_unexecuted_tool_calls(
+            messages,
+            "the turn was restarted before this call ran; re-issue it if "
+            "still needed.",
+        )
         return (
             parsed_calls, ctx, stop_reason, True, False,
             last_input_tokens, last_output_tokens,
@@ -908,26 +1007,65 @@ async def _process_llm_response(
     )
 
 
+def _effective_tool_result_cap(
+    cfg: LoopConfig, policy: HistoryPolicy | None
+) -> int | None:
+    """Resolve the ToolMessage character cap from both places it is declared.
+
+    ``LoopConfig.tool_result_max_chars`` is the per-run override and wins when
+    set. ``HistoryPolicy.tool_result_max_chars`` is the *role* value (15_000,
+    the sub-agent number) and used to be read by nobody, so a host configuring
+    it saw results bounded only by the 150K spill ceiling -- ten times the
+    intended size entering history, which is what the overflow guard exists to
+    prevent.
+
+    Only a policy the caller actually supplied is consulted. The dataclass
+    default is 15_000, so falling back to it for callers that pass no policy
+    would newly truncate results those runs previously kept in full.
+    """
+
+    if cfg.tool_result_max_chars is not None:
+        return cfg.tool_result_max_chars
+    if policy is None:
+        return None
+    cap = policy.tool_result_max_chars
+    return cap if cap and cap > 0 else None
+
+
 async def _execute_tool_calls(
     cfg: LoopConfig, obs: list, tool_map: dict[str, ToolLike], messages: list[Message], metadata: dict[str, Any],
     turn: int, total_tool_calls: int, ctx: TurnContext, parsed_calls: list[dict],
     execution_hooks: ToolExecutionHooks,
     body_has_spill_reference: Callable[[str], bool],
+    *,
+    result_max_chars: int | None = None,
 ) -> tuple[str, int]:
     executable: list[tuple[int, dict]] = []
     synthetic: list[tuple[int, ToolResult]] = []
     for idx, tc in enumerate(parsed_calls):
+        # Text-mode calls arrive without a provider id. Assign it here, once,
+        # off the ``parsed_calls`` index -- before the batch is split into
+        # skipped and executable halves. ``execute_tools`` numbers off its own
+        # sub-list, so letting it fill the gap made the two halves collide on
+        # the same ``tool_call_id`` whenever an observer skipped an earlier
+        # call. Observers also see the final id this way.
+        if not tc.get("id"):
+            tc = {**tc, "id": f"call_{turn}_{total_tool_calls + idx}"}
         tcv = await notify_tool_call(obs, ctx, tc)
         if tcv.metadata_updates:
             metadata.update(tcv.metadata_updates)
         if tcv.rewrite_args is not None:
             tc = {**tc, "args": tcv.rewrite_args}
         if tcv.skip_with_result is not None:
+            raw_args = tc.get("args")
             synthetic.append((idx, ToolResult(
                 name=str(tc.get("name", "") or ""),
-                args=tc.get("args", {}) if isinstance(tc.get("args"), dict) else {},
+                args=raw_args if isinstance(raw_args, dict) else {},
                 result=tcv.skip_with_result, duration_ms=0,
-                tool_call_id=str(tc.get("id") or f"call_{turn}_{idx}"), is_error=False,
+                tool_call_id=str(
+                    tc.get("id") or f"call_{turn}_{total_tool_calls + idx}"
+                ),
+                is_error=False,
             )))
         else:
             executable.append((idx, tc))
@@ -969,7 +1107,9 @@ async def _execute_tool_calls(
             "dropping the unfilled slot(s)", len(results), len(ordered),
         )
 
-    processor = cfg.tool_result_post_processor or DefaultToolResultPostProcessor(cfg.tool_result_max_chars)
+    processor = cfg.tool_result_post_processor or DefaultToolResultPostProcessor(
+        result_max_chars
+    )
     can_recover = "recover_result" in tool_map
     for tr_result in results:
         tr_result = await notify_tool_result(obs, ctx, tr_result)

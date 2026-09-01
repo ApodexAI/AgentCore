@@ -8,11 +8,16 @@ dependencies = []
 
 [project.optional-dependencies]
 tokenizer = ["tiktoken>=0.12.0"]
+# ``configure_model_registry()`` reads a host-supplied YAML file. The core has
+# no required dependencies, so the parser is an explicit extra rather than an
+# assumption: without it registry inference is disabled and logged loudly.
+registry = ["pyyaml>=6.0"]
 dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.7",
     "pyright[nodejs]>=1.1.400",
+    "pyyaml>=6.0",
 ]
 
 [build-system]
