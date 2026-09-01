@@ -33,6 +33,16 @@ Version `0.1.x` contains the converged foundation layer:
   parsing;
 - parallel tool execution and the complete agent-loop orchestration engine,
   with product behavior isolated behind typed hooks.
+- append-only, scope-isolated durable run journals with content-addressed blob
+  attachments, projections, and event-sourced notes;
+- MiniDAG execution, declarative pipeline models, dynamic graph construction,
+  and scoped service/agent/pipeline/topology registries;
+- reusable LLM middleware for proxying, summarization, skill injection, and
+  stream-repetition detection;
+- portable loop observers for budget/context/wall-clock guards, finalization,
+  repetition detection, SSE events, task boards, and bounded trajectories;
+- shared agent-bus stop signals/pools, filesystem skill loaders, session
+  history, renewable wall-time leases, and language helpers.
 
 The initial extraction is based on the already-merged integration branches:
 
@@ -43,9 +53,10 @@ Those revisions are provenance, not runtime dependencies. AgentCore tests and
 builds without either product checkout.
 
 The shared loop accepts product decisions through explicit hooks. Products own
-execution-context storage, endpoint registries, metering, deadline policy, and
-sandbox mount policy; they no longer need private copies of the orchestration,
-parsing, context-management, or spill-storage engines.
+composition roots, endpoint configuration, metering policy, durable-journal
+root/scope selection, and sandbox mount policy; they no longer need private
+copies of the orchestration, parsing, context-management, DAG, observer, or
+spill-storage engines.
 
 ## Repository boundary
 
@@ -57,9 +68,9 @@ Code belongs in AgentCore when it:
 - accepts product behavior through typed inputs or explicit hooks;
 - has tests that run without either product repository installed.
 
-Provider clients, environment/config loading, session affinity, checkpoint
-persistence, workflow assembly, sandbox mounting, and product-specific
-observers remain in their product.
+Provider clients, session affinity, user/session retention policy, checkpoint
+association, workflow node implementations, sandbox mounting/authorization,
+UI history, and product-specific observers remain in their product.
 
 ## Development
 
@@ -132,7 +143,14 @@ edit both products' core copies, that is evidence it belongs here.
    bounded LLM summary, tier selection, observability, and spill storage.
 6. **Runtime foundation** (complete in AgentCore): task identity/status,
    execution ContextVars, kernel events, event dispatch, and tool permissions.
-7. Remove product compatibility facades after downstream imports have moved to
+7. **Portable runtime batch** (complete in AgentCore): durable run journals,
+   MiniDAG/graph construction, middleware/observers, agent-bus coordination
+   primitives (shared pools and stop signals), skills, session history, models,
+   and scoped registries.
+8. **Agent-bus scheduling** (next): extract the shared communication models,
+   runtime, spawn guard, bus, and fan-in orchestration behind explicit product
+   hooks. Product tool assembly and workflow-specific policy remain downstream.
+9. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
 
 Each slice must leave product CI green and must not depend on a floating branch.

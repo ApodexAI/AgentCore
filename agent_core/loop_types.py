@@ -111,6 +111,14 @@ def deadline_remaining_s(metadata: Mapping[str, Any] | None) -> float | None:
     return float(deadline) - time.monotonic()
 
 
+def wall_deadline_remaining_s() -> float | None:
+    """Return the active execution scope's remaining wall-time budget."""
+    from agent_core.execution_context import get_current_execution_scope
+
+    scope = get_current_execution_scope()
+    return deadline_remaining_s(scope.metadata if scope is not None else None)
+
+
 @dataclass(frozen=True)
 class LoopPolicy:
     """Workflow-specific behavior injected into the generic loop."""

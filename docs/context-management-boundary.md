@@ -33,6 +33,13 @@ if no spill were configured: results from the latest tool-call turn — which th
 model has not seen when compaction runs — are kept verbatim rather than
 shortened against a path nobody can open.
 
-Checkpoint persistence and durable user memory are not context compaction.
-They remain product concerns; AgentCore only preserves spill references in
-messages so a product checkpoint can round-trip them.
+AgentCore also owns a separate run-local durable-journal primitive: append-only
+entries, scope isolation, attachment integrity, note events, and deterministic
+projections. This makes runtime history semantics identical across products;
+it does not choose where a product stores a user's sessions or how long they
+live. See `durable-context-boundary.md`.
+
+Products still own user/session retention, UI/display history, checkpoint-to-
+session association, physical context roots, sandbox access, TTL, and deletion
+policy. AgentCore preserves spill and blob references so those product layers
+can round-trip them without copying persistence mechanics.
