@@ -3,19 +3,40 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
 
+def _normalize_names(names: Iterable[str] | None) -> frozenset[str]:
+    return frozenset(name.lower() for name in names or ())
+
+
 @dataclass(frozen=True)
 class ToolPermissionContext:
-    """Allowlist and denylist constraints for tool names."""
+    """Allowlist and denylist constraints for tool names.
+
+    Names are matched case-insensitively: every constraint is lower-cased on
+    construction, so building a context directly is as safe as going through
+    :meth:`from_iterables`.
+    """
 
     allow_names: frozenset[str] | None = None
     deny_names: frozenset[str] = frozenset()
     deny_prefixes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Normalizing here (rather than only in the factories) keeps direct
+        # construction from silently denying every tool the caller listed with
+        # mixed case, and tolerates any iterable being passed in.
+        if self.allow_names is not None:
+            object.__setattr__(self, "allow_names", _normalize_names(self.allow_names))
+        object.__setattr__(self, "deny_names", _normalize_names(self.deny_names))
+        object.__setattr__(
+            self, "deny_prefixes", tuple(prefix.lower() for prefix in self.deny_prefixes or ())
+        )
 
     def blocks(self, tool_name: str) -> bool:
         lowered = tool_name.lower()
@@ -29,7 +50,7 @@ class ToolPermissionContext:
             return False
         return self.allow_names is None or lowered in self.allow_names
 
-    def filter(self, tool_names: set[str]) -> set[str]:
+    def filter(self, tool_names: Iterable[str]) -> set[str]:
         return {name for name in tool_names if self.allows(name)}
 
     def is_empty(self) -> bool:
@@ -53,22 +74,32 @@ class ToolPermissionContext:
     def from_iterables(
         cls,
         *,
-        allow_names: set[str] | list[str] | tuple[str, ...] | None = None,
-        deny_names: set[str] | list[str] | tuple[str, ...] = (),
-        deny_prefixes: tuple[str, ...] | list[str] = (),
+        allow_names: Iterable[str] | None = None,
+        deny_names: Iterable[str] | None = (),
+        deny_prefixes: Iterable[str] | None = (),
     ) -> ToolPermissionContext:
-        normalized_allow = None
-        if allow_names is not None:
-            normalized_allow = frozenset(name.lower() for name in allow_names)
         return cls(
-            allow_names=normalized_allow,
-            deny_names=frozenset(name.lower() for name in deny_names),
-            deny_prefixes=tuple(prefix.lower() for prefix in deny_prefixes),
+            allow_names=None if allow_names is None else _normalize_names(allow_names),
+            deny_names=_normalize_names(deny_names),
+            deny_prefixes=tuple(prefix.lower() for prefix in deny_prefixes or ()),
         )
 
 
 def from_config_map(mapping: Any | None) -> ToolPermissionContext:
-    """Build a policy from a ``{tool_name: bool}`` configuration map."""
+    """Build a policy from a ``{tool_name: bool}`` configuration map.
+
+    The two boolean values are **not** symmetric toggles:
+
+    * ``False`` adds the tool to the denylist and leaves every unlisted tool
+      alone.
+    * ``True`` adds the tool to the *allowlist* — and because an allowlist is
+      exhaustive by definition, a single ``True`` entry anywhere in the map
+      denies every tool the map does not name.
+
+    So ``{"bash": True}`` means "bash and nothing else", not "additionally
+    enable bash". This is the fail-closed reading: to enable one tool without
+    revoking the rest, list the tools to remove with ``False`` instead.
+    """
     if not isinstance(mapping, dict) or not mapping:
         return ToolPermissionContext()
 
@@ -90,6 +121,12 @@ def from_config_map(mapping: Any | None) -> ToolPermissionContext:
                 enabled,
                 type(enabled).__name__,
             )
+    if allow:
+        logger.debug(
+            "Tool policy map enabled %d tool(s) explicitly; this is an allowlist, "
+            "so every unlisted tool is now denied.",
+            len(allow),
+        )
     return ToolPermissionContext.from_iterables(
         allow_names=allow or None,
         deny_names=deny,
@@ -97,13 +134,17 @@ def from_config_map(mapping: Any | None) -> ToolPermissionContext:
 
 
 def from_execution_policy(policy: Any | None) -> ToolPermissionContext:
-    """Build a policy from an object exposing execution-policy attributes."""
+    """Build a policy from an object exposing execution-policy attributes.
+
+    Attributes that are absent *or* ``None`` fall back to "unconstrained",
+    since ``allow_tools: tuple[str, ...] | None = None`` is a common shape.
+    """
     if policy is None:
         return ToolPermissionContext()
     return ToolPermissionContext.from_iterables(
         allow_names=getattr(policy, "allow_tools", None),
-        deny_names=getattr(policy, "deny_tools", ()),
-        deny_prefixes=getattr(policy, "deny_tool_prefixes", ()),
+        deny_names=getattr(policy, "deny_tools", None) or (),
+        deny_prefixes=getattr(policy, "deny_tool_prefixes", None) or (),
     )
 
 

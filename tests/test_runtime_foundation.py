@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 
@@ -15,6 +17,7 @@ from agent_core.execution_context import (
     get_current_execution_scope,
     get_current_tool_budget,
     get_current_tool_call_id,
+    normalize_execution_context,
     reset_current_execution_scope,
     reset_current_tool_budget,
     reset_current_tool_call_id,
@@ -96,7 +99,7 @@ async def test_event_bus_dispatches_typed_and_global_handlers() -> None:
     seen: list[tuple[str, int]] = []
 
     async def handler(event: dict[str, object]) -> None:
-        seen.append((str(event["event_type"]), int(event["value"])))
+        seen.append((str(event["event_type"]), cast("int", event["value"])))
 
     bus.subscribe(EventType.TOOL_RESULT, handler)
     bus.subscribe_all(handler)
@@ -154,3 +157,143 @@ def test_execution_policy_is_structurally_consumed() -> None:
     assert context.allows("bash")
     assert not context.allows("web_search")
     assert not context.allows("internal_admin")
+
+
+@dataclass
+class _NullPolicy:
+    """The common shape where every constraint is an optional tuple."""
+
+    allow_tools: tuple[str, ...] | None = None
+    deny_tools: tuple[str, ...] | None = None
+    deny_tool_prefixes: tuple[str, ...] | None = None
+
+
+def test_execution_policy_tolerates_none_valued_attributes() -> None:
+    context = from_execution_policy(_NullPolicy())
+    assert context.is_empty()
+    assert context.allows("bash")
+
+
+def test_direct_construction_normalizes_case() -> None:
+    context = ToolPermissionContext(
+        allow_names=frozenset({"Bash", "WEB_SEARCH"}),
+        deny_names=frozenset({"Web_Search"}),
+        deny_prefixes=("Internal_",),
+    )
+    assert context.allows("Bash")
+    assert context.allows("bash")
+    assert not context.allows("web_search")
+    assert not context.allows("INTERNAL_admin")
+
+
+def test_permission_filter_accepts_any_iterable() -> None:
+    context = ToolPermissionContext.from_iterables(deny_names=["bash"])
+    assert context.filter(frozenset({"bash", "python"})) == {"python"}
+    assert context.filter(["bash", "python"]) == {"python"}
+
+
+def test_config_map_true_entry_is_an_exhaustive_allowlist() -> None:
+    """A single ``True`` denies every unlisted tool; ``False`` alone does not."""
+    enabling = from_config_map({"bash": True})
+    assert enabling.allows("bash")
+    assert not enabling.allows("web_search")
+
+    disabling = from_config_map({"web_search": False})
+    assert disabling.allows("bash")
+    assert not disabling.allows("web_search")
+
+
+def test_execution_scope_metadata_is_deeply_independent() -> None:
+    persisted: dict[str, object] = {"labels": {"run": "first"}, "steps": [1]}
+    state = {"execution_context": persisted}
+    scope = build_execution_scope(task_id="t", phase_id="p", role_id="r", state=state)
+
+    labels = cast("dict[str, object]", scope.metadata["labels"])
+    labels["run"] = "second"
+    steps = cast("list[object]", scope.metadata["steps"])
+    steps.append(2)
+
+    assert persisted == {"labels": {"run": "first"}, "steps": [1]}
+
+
+def test_execution_scope_role_id_overrides_stale_persisted_agent_id() -> None:
+    state = {"execution_context": {"agent_id": "previous_role"}}
+    scope = build_execution_scope(
+        task_id="t", phase_id="phase_2", role_id="current_role", state=state
+    )
+    assert scope.metadata["agent_id"] == "current_role"
+    assert scope.metadata["agent_id"] == scope.role_id
+
+    # With no authoritative role to apply, a persisted value is left alone.
+    kept = build_execution_scope(
+        task_id="t", phase_id="phase_2", role_id="", state={"execution_context": {"agent_id": "x"}}
+    )
+    assert kept.metadata["agent_id"] == "x"
+
+
+def test_normalize_execution_context_survives_uncopyable_values() -> None:
+    lock = threading.Lock()
+    normalized = normalize_execution_context({"lock": lock, "count": 1})
+    assert normalized["count"] == 1
+    assert normalized["lock"] is lock
+
+
+@pytest.mark.asyncio
+async def test_event_payload_is_not_shared_between_handlers() -> None:
+    bus = EventBus()
+    observed: list[dict[str, object]] = []
+
+    async def mutator(event: dict[str, object]) -> None:
+        await asyncio.sleep(0)
+        event.pop("value", None)
+        event["injected"] = True
+
+    async def observer(event: dict[str, object]) -> None:
+        await asyncio.sleep(0)
+        observed.append(dict(event))
+
+    bus.subscribe("event", mutator)
+    bus.subscribe("event", observer)
+    await bus.publish("event", {"value": 3})
+
+    assert observed == [{"event_type": "event", "value": 3}]
+
+
+@pytest.mark.asyncio
+async def test_published_event_type_wins_over_payload() -> None:
+    bus = EventBus()
+    seen: list[str] = []
+
+    async def handler(event: dict[str, object]) -> None:
+        seen.append(str(event["event_type"]))
+
+    bus.subscribe(EventType.TOOL_RESULT, handler)
+    await bus.publish(EventType.TOOL_RESULT, {"event_type": "spoofed"})
+    assert seen == ["tool_result"]
+
+
+@pytest.mark.asyncio
+async def test_event_bus_subscriptions_can_be_removed() -> None:
+    bus = EventBus()
+    calls = 0
+
+    async def handler(_event: dict[str, object]) -> None:
+        nonlocal calls
+        calls += 1
+
+    bus.subscribe("event", handler)
+    bus.subscribe_all(handler)
+    await bus.publish("event", {})
+    assert calls == 2
+
+    assert bus.unsubscribe("event", handler)
+    assert not bus.unsubscribe("event", handler)
+    assert bus.unsubscribe_all(handler)
+    assert not bus.unsubscribe_all(handler)
+    await bus.publish("event", {})
+    assert calls == 2
+
+    bus.subscribe("event", handler)
+    bus.clear()
+    await bus.publish("event", {})
+    assert calls == 2

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -9,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from agent_core.types import new_prompt_id, new_session_id, new_step_id
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,10 +40,27 @@ _CHAIN_FALLBACK_ACTIVE: ContextVar[bool] = ContextVar(
 
 
 def normalize_execution_context(value: Any) -> dict[str, Any]:
-    """Return an independent mutable execution-context mapping."""
-    if isinstance(value, dict):
-        return dict(cast("dict[str, Any]", value))
-    return {}
+    """Return a fully independent mutable execution-context mapping.
+
+    The copy is deep: callers mutate scope metadata freely (including nested
+    dicts and lists), and persisted checkpoint state it was loaded from must
+    not change underneath them.
+    """
+    if not isinstance(value, dict):
+        return {}
+    mapping = cast("dict[str, Any]", value)
+    try:
+        return copy.deepcopy(mapping)
+    except Exception:
+        # Persisted state is expected to be plain data, but an in-memory state
+        # dict may carry something uncopyable. Degrading to a shallow copy is
+        # better than failing to build the scope at all.
+        logger.warning(
+            "Execution context could not be deep-copied; falling back to a "
+            "shallow copy, so nested values stay shared with the source state.",
+            exc_info=True,
+        )
+        return dict(mapping)
 
 
 def build_execution_scope(
@@ -52,7 +73,11 @@ def build_execution_scope(
     """Build a scope from task identity and optional persisted state."""
     persisted = state.get("execution_context") if state is not None else None
     metadata = normalize_execution_context(persisted)
-    metadata.setdefault("agent_id", role_id)
+    # ``role_id`` is authoritative for this scope: a resumed task may carry an
+    # ``agent_id`` written during a different phase, and keeping it would
+    # attribute this role's work to the previous agent.
+    if role_id or "agent_id" not in metadata:
+        metadata["agent_id"] = role_id
     return ExecutionScope(
         task_id=task_id,
         phase_id=phase_id,
