@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from agent_core.messages import Message
 
@@ -16,6 +16,60 @@ logger = logging.getLogger(__name__)
 
 # Absolute monotonic soft deadline stored in execution-scope metadata.
 WALL_DEADLINE_MONOTONIC_KEY = "wall_deadline_monotonic"
+
+
+class UsageMetadataExtras(TypedDict, total=False):
+    """Host-specific usage aliases and provenance.
+
+    ``extract_usage`` never emits these; they exist so a host that stamps
+    its own aliases onto a usage mapping can still describe the result as
+    a :class:`UsageMetadata`. ApodexHarness' budget observer reads the
+    ``input_tokens`` / ``output_tokens`` aliases, and its native clients
+    carry ``total_tokens`` on ``LLMResponse.usage``.
+
+    Optional keys are NOT directly indexable under a type checker
+    (``reportTypedDictNotRequiredAccess``) — read them with ``.get(key, 0)``.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated: bool
+
+
+class UsageMetadata(UsageMetadataExtras):
+    """What :func:`agent_core.runtime.loop.extract_usage` returns.
+
+    The normalized fields below are required: every non-``None`` return
+    from ``extract_usage`` carries all of them, zero-filled when the
+    provider reported nothing, so a consumer can index them without
+    probing which response shape it was handed.
+    ``tests/test_llm_runtime_extract_usage.py`` pins that at runtime
+    against ``__required_keys__``.
+
+    This is a *producer* type, deliberately narrower than the
+    ``usage`` fields on :class:`TurnContext` / :class:`LLMAttemptContext`.
+    Those stay ``Mapping[str, Any] | None`` because hosts build usage
+    mappings of their own — partial dicts in test doubles, alias-only
+    shapes, ``dict(event["usage"])`` re-wraps out of a ``dict[str, Any]``
+    attempt event — and neither ``dict[str, int]`` nor ``dict[str, Any]``
+    is assignable to a TypedDict. A consumer that wants the precise shape
+    annotates its own parameter as ``UsageMetadata``; the loop does not
+    force it on producers. Extra keys beyond those declared here are
+    likewise a host's business: a TypedDict cannot express "open" on
+    Python 3.12 (PEP 728 lands later), which is the other reason the
+    dataclass fields stay a plain mapping.
+    """
+
+    provider: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    cached_tokens: int
+    cache_creation_tokens: int
+    reasoning_tokens: int
 
 
 def deadline_remaining_s(metadata: Mapping[str, Any] | None) -> float | None:
@@ -135,7 +189,11 @@ class TurnContext:
     thinking: str
     tool_calls: list[dict[str, Any]]
     messages: list[Message]
-    usage: dict[str, int] | None
+    # Read-only mapping, not ``UsageMetadata``, on purpose: producers are
+    # hosts, and a TypedDict rejects the ``dict[str, int]`` / ``dict[str, Any]``
+    # shapes they build. ``UsageMetadata`` documents what ``extract_usage``
+    # puts here; annotate a consumer's own parameter with it for precision.
+    usage: Mapping[str, Any] | None
     metadata: dict[str, Any]
     # Reasoning recovered from tags leaked into visible content.
     leaked_reasoning: str = ""
@@ -209,7 +267,8 @@ class LLMAttemptContext:
     recovery_action: str = ""
     duration_ms: int = 0
     ttft_ms: int | None = None
-    usage: dict[str, int] | None = None
+    # See ``TurnContext.usage`` for why this is a plain mapping.
+    usage: Mapping[str, Any] | None = None
     finish_reason: str = ""
     visible_chars: int = 0
     reasoning_chars: int = 0
@@ -631,6 +690,8 @@ __all__ = [
     "ToolCallIntervention",
     "ToolResult",
     "TurnContext",
+    "UsageMetadata",
+    "UsageMetadataExtras",
     "deadline_remaining_s",
     "drain_background_observers",
     "merge_interventions",

@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from agent_core.llm import LLMResponse
+from agent_core.loop_types import UsageMetadata
 from agent_core.messages import Message
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ def _pick_int(*candidates: Any) -> int:
     return 0
 
 
-def extract_usage(response: Any) -> dict[str, int | str] | None:
+def extract_usage(response: Any) -> UsageMetadata | None:
     """Extract token usage from an LLM response, normalized to OpenAI shape.
 
     Returns a dict with keys ``provider`` / ``model`` / ``prompt_tokens`` /
@@ -186,7 +187,7 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
             # the pre-split cache fields.
             cache_read = int(usage.get("cached_tokens", 0) or 0)
             cache_write = int(usage.get("cache_creation_tokens", 0) or 0)
-        out_dict: dict[str, int | str] = {
+        out_dict: UsageMetadata = {
             "provider": provider,
             "model": response.model or "",
             "prompt_tokens": inp,
@@ -195,15 +196,13 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
             "cache_write_tokens": cache_write,
             "cached_tokens": cache_read + cache_write,
             "cache_creation_tokens": cache_write,
+            # Reasoning/thinking tokens (Anthropic extended thinking /
+            # OpenAI reasoning models). Part of completion_tokens, but
+            # surfaced separately for cost / analysis; the client's usage
+            # dict carries them. Present even as 0 — see the key-set
+            # invariant on the ``UsageMetadata`` return type.
+            "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
         }
-        # Reasoning/thinking tokens (Anthropic extended thinking / OpenAI
-        # reasoning models). They are part of completion_tokens but surfaced
-        # separately for cost / analysis; the client's usage dict carries them.
-        # Always present, including as 0: this branch and the legacy shapes
-        # below must return the SAME key set, or a consumer indexing
-        # ``usage["reasoning_tokens"]`` works on one response object and
-        # raises KeyError on the other.
-        out_dict["reasoning_tokens"] = int(usage.get("reasoning_tokens", 0) or 0)
         return out_dict
 
     rmd = getattr(response, "response_metadata", None) or {}
@@ -214,7 +213,12 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
     # own ``model_name`` lands on non-streaming responses but not on
     # streamed usage chunks). Falling through to it keeps streaming usage
     # attribution alive.
-    model = (
+    # ``str(...)`` for the same reason ``provider`` gets it: these come off
+    # an untyped provider/gateway metadata dict, and ``UsageMetadata`` declares
+    # ``model`` as ``str``. A gateway echoing a non-string here — a nested
+    # dict, say — would otherwise put that object behind a field consumers
+    # format as text.
+    model = str(
         rmd.get("model_name")
         or rmd.get("model")
         or rmd.get("model_actually_used")
@@ -228,7 +232,7 @@ def extract_usage(response: Any) -> dict[str, int | str] | None:
         cached: int,
         cache_create: int,
         reasoning: int,
-    ) -> dict[str, int | str]:
+    ) -> UsageMetadata:
         # ``cached`` carries cache READ; ``cache_create`` carries cache
         # WRITE. The legacy ``cached_tokens`` / ``cache_creation_tokens``
         # keys are kept as a derived sum and an alias respectively so
