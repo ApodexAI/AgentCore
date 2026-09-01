@@ -144,9 +144,13 @@ edit both products' core copies, that is evidence it belongs here.
 6. **Runtime foundation** (complete in AgentCore): task identity/status,
    execution ContextVars, kernel events, event dispatch, and tool permissions.
 7. **Portable runtime batch** (complete in AgentCore): durable run journals,
-   MiniDAG/graph construction, middleware/observers, agent-bus coordination,
-   skills, session history, models, and scoped registries.
-8. Remove product compatibility facades after downstream imports have moved to
+   MiniDAG/graph construction, middleware/observers, agent-bus coordination
+   primitives (shared pools and stop signals), skills, session history, models,
+   and scoped registries.
+8. **Agent-bus scheduling** (next): extract the shared communication models,
+   runtime, spawn guard, bus, and fan-in orchestration behind explicit product
+   hooks. Product tool assembly and workflow-specific policy remain downstream.
+9. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
 
 Each slice must leave product CI green and must not depend on a floating branch.
