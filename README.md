@@ -23,6 +23,10 @@ Version `0.1.x` contains the converged foundation layer:
 - streamed tool-call recovery checks for missing required arguments.
 - LLM binding, response normalization, streaming assembly/watchdogs, retry
   classification, runaway recovery, and physical-call orchestration.
+- model profiles, thinking/history normalization, and multi-format tool-call
+  parsing;
+- parallel tool execution and the complete agent-loop orchestration engine,
+  with product behavior isolated behind typed hooks.
 
 The initial extraction is based on the already-merged integration branches:
 
@@ -32,10 +36,10 @@ The initial extraction is based on the already-merged integration branches:
 Those revisions are provenance, not runtime dependencies. AgentCore tests and
 builds without either product checkout.
 
-The agent loop remains in the products until tool execution, model profiles,
-tool-call parsing, and execution-context storage have converged boundaries.
-The LLM runtime accepts the three remaining product decisions through explicit
-hooks: wall-deadline lookup, provider-chain state, and sticky-session policy.
+The shared loop accepts product decisions through explicit hooks. Products own
+execution-context storage, endpoint registries, metering, deadline policy,
+result spilling and aggregate budgets; they no longer need private copies of
+the orchestration or parsing engines.
 
 ## Repository boundary
 
@@ -115,7 +119,8 @@ edit both products' core copies, that is evidence it belongs here.
    classification, and explicit product hooks are shared.
 3. **LLM runtime** (complete): binding, calls, streaming, response
    normalization, runaway recovery, and the public `llm_client` facade.
-4. **Agent loop:** model/tool parsing, tool execution, and `agent_loop`.
+4. **Agent loop** (complete in AgentCore): model/tool parsing, hook-driven tool
+   execution, and `agent_loop` orchestration.
 5. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
 
