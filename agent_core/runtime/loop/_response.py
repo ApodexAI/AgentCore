@@ -196,6 +196,7 @@ def extract_usage(response: Any) -> UsageMetadata | None:
             "cache_write_tokens": cache_write,
             "cached_tokens": cache_read + cache_write,
             "cache_creation_tokens": cache_write,
+            "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
         }
         # Reasoning/thinking tokens (Anthropic extended thinking / OpenAI
         # reasoning models). They are part of completion_tokens but surfaced
@@ -204,7 +205,6 @@ def extract_usage(response: Any) -> UsageMetadata | None:
         # below must return the SAME key set, or a consumer indexing
         # ``usage["reasoning_tokens"]`` works on one response object and
         # raises KeyError on the other.
-        out_dict["reasoning_tokens"] = int(usage.get("reasoning_tokens", 0) or 0)
         return out_dict
 
     rmd = getattr(response, "response_metadata", None) or {}

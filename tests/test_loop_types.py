@@ -8,6 +8,7 @@ cheapest high-value thing to pin.
 from __future__ import annotations
 
 import asyncio
+from typing import get_type_hints
 
 import pytest
 
@@ -17,6 +18,31 @@ Intervention = lt.Intervention
 ToolCallIntervention = lt.ToolCallIntervention
 ToolResult = lt.ToolResult
 merge_interventions = lt.merge_interventions
+
+
+def test_usage_metadata_contract_marks_normalized_keys_required():
+    assert lt.UsageMetadata.__required_keys__ == frozenset(
+        {
+            "provider",
+            "model",
+            "prompt_tokens",
+            "completion_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cached_tokens",
+            "cache_creation_tokens",
+            "reasoning_tokens",
+        }
+    )
+    assert lt.UsageMetadata.__optional_keys__ == frozenset(
+        {"input_tokens", "output_tokens", "estimated"}
+    )
+    assert "UsageMetadata" in lt.__all__
+
+
+def test_attempt_context_reuses_normalized_usage_contract():
+    usage_type = get_type_hints(lt.LLMAttemptContext)["usage"]
+    assert usage_type == lt.UsageMetadata | None
 
 
 def _tool_result(name: str = "t", result: str = "r"):

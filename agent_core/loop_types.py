@@ -18,21 +18,30 @@ logger = logging.getLogger(__name__)
 WALL_DEADLINE_MONOTONIC_KEY = "wall_deadline_monotonic"
 
 
-class UsageMetadata(TypedDict, total=False):
-    """Normalized observer-facing usage and model attribution."""
+class _OptionalUsageMetadata(TypedDict, total=False):
+    """Host-specific usage aliases and provenance."""
+
+    input_tokens: int
+    output_tokens: int
+    estimated: bool
+
+
+class UsageMetadata(_OptionalUsageMetadata):
+    """Normalized observer-facing usage and model attribution.
+
+    The normalized fields are required so observers can index them directly.
+    Host-specific aliases inherited above remain optional.
+    """
 
     provider: str
     model: str
     prompt_tokens: int
     completion_tokens: int
-    input_tokens: int
-    output_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
     cached_tokens: int
     cache_creation_tokens: int
     reasoning_tokens: int
-    estimated: bool
 
 
 def deadline_remaining_s(metadata: Mapping[str, Any] | None) -> float | None:
@@ -226,7 +235,7 @@ class LLMAttemptContext:
     recovery_action: str = ""
     duration_ms: int = 0
     ttft_ms: int | None = None
-    usage: dict[str, Any] | None = None
+    usage: UsageMetadata | None = None
     finish_reason: str = ""
     visible_chars: int = 0
     reasoning_chars: int = 0
@@ -648,6 +657,7 @@ __all__ = [
     "ToolCallIntervention",
     "ToolResult",
     "TurnContext",
+    "UsageMetadata",
     "deadline_remaining_s",
     "drain_background_observers",
     "merge_interventions",
