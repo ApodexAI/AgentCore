@@ -31,6 +31,7 @@ __all__ = [
     "compact_messages",
     "compress_tool_results",
     "estimate_tokens",
+    "tool_names_by_call_id",
 ]
 
 # ---------------------------------------------------------------------------
@@ -89,7 +90,7 @@ SPILL_MANIFEST_HEADER = (
 )
 
 
-def _tool_names_by_call_id(messages: list[Message]) -> dict[str, str]:
+def tool_names_by_call_id(messages: list[Message]) -> dict[str, str]:
     """Map ``tool_call_id`` → tool name from AIMessage ``tool_calls``.
 
     A ``ToolMessage`` carries no tool name, so any name-keyed policy has to
@@ -110,6 +111,10 @@ def _tool_names_by_call_id(messages: list[Message]) -> dict[str, str]:
             if isinstance(tid, str) and isinstance(name, str) and tid and name:
                 out[tid] = name
     return out
+
+
+# Compatibility for product facades that predate the public spelling.
+_tool_names_by_call_id = tool_names_by_call_id
 
 
 def _condense(content: str, max_chars: int) -> str:
@@ -169,7 +174,7 @@ def compress_tool_results(
     if protect_max_chars is not None and protect_max_chars < 200:
         raise ValueError("protect_max_chars must be at least 200")
 
-    id_to_name = _tool_names_by_call_id(messages) if protect_tool_names else {}
+    id_to_name = tool_names_by_call_id(messages) if protect_tool_names else {}
     compacted: list[Message] = []
     for message in messages:
         clone = message.copy()
@@ -464,7 +469,7 @@ class KeepLastNToolResultsCompactor:
             return messages
 
         id_to_name = (
-            _tool_names_by_call_id(messages) if self._protect or self._spill is not None else {}
+            tool_names_by_call_id(messages) if self._protect or self._spill is not None else {}
         )
 
         out: list[Message] = []

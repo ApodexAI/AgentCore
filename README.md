@@ -17,6 +17,8 @@ Version `0.1.x` contains the converged foundation layer:
 - compaction policy and deterministic compactor;
 - context-budget estimation and non-blocking tokenizer access;
 - message trimming;
+- bounded LLM summaries, projected-token triggers, and tiered compaction;
+- session-isolated, content-addressed spill storage for recoverable tool output;
 - provider-neutral LLM response, stream, and client contracts;
 - loop configuration, lifecycle contexts, observer protocol, intervention
   merging, and observer dispatch helpers.
@@ -37,9 +39,9 @@ Those revisions are provenance, not runtime dependencies. AgentCore tests and
 builds without either product checkout.
 
 The shared loop accepts product decisions through explicit hooks. Products own
-execution-context storage, endpoint registries, metering, deadline policy,
-result spilling and aggregate budgets; they no longer need private copies of
-the orchestration or parsing engines.
+execution-context storage, endpoint registries, metering, deadline policy, and
+sandbox mount policy; they no longer need private copies of the orchestration,
+parsing, context-management, or spill-storage engines.
 
 ## Repository boundary
 
@@ -51,8 +53,9 @@ Code belongs in AgentCore when it:
 - accepts product behavior through typed inputs or explicit hooks;
 - has tests that run without either product repository installed.
 
-Provider clients, environment/config loading, session affinity, persistence,
-workflow assembly, and product-specific observers remain in their product.
+Provider clients, environment/config loading, session affinity, checkpoint
+persistence, workflow assembly, sandbox mounting, and product-specific
+observers remain in their product.
 
 ## Development
 
@@ -113,15 +116,17 @@ edit both products' core copies, that is evidence it belongs here.
 
 ## Migration plan
 
-1. **Foundation** (this version): messages, token estimation, compaction,
-   context budget, trimming.
+1. **Foundation** (complete): messages, token estimation, deterministic
+   compaction, context budget, trimming.
 2. **Runtime contracts** (complete): LLM protocols, loop types, errors, retry
    classification, and explicit product hooks are shared.
 3. **LLM runtime** (complete): binding, calls, streaming, response
    normalization, runaway recovery, and the public `llm_client` facade.
 4. **Agent loop** (complete in AgentCore): model/tool parsing, hook-driven tool
    execution, and `agent_loop` orchestration.
-5. Remove product compatibility facades after downstream imports have moved to
+5. **Context management Phase 2** (complete in AgentCore): calibrated trigger,
+   bounded LLM summary, tier selection, observability, and spill storage.
+6. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
 
 Each slice must leave product CI green and must not depend on a floating branch.
