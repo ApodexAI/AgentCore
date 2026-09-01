@@ -5,7 +5,8 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
-from typing import Any, cast
+from collections.abc import Callable
+from typing import Any, Protocol, cast
 
 from agent_core.models.pipeline_spec import (
     CompressionConfig,
@@ -26,6 +27,15 @@ from agent_core.runtime.dag.minidag import MiniDAG, MiniDAGRunner, extract_reduc
 logger = logging.getLogger(__name__)
 
 
+class NodeContextFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        node_def: NodeDefinition,
+        task_id_getter: Callable[[], str],
+    ) -> object: ...
+
+
 class DynamicGraphBuilder:
     """Builds a MiniDAG from a declarative PipelineSpec.
 
@@ -33,6 +43,13 @@ class DynamicGraphBuilder:
     the service registry, all node functions are wrapped with before/after/error
     hooks at graph construction time (not at stream-processing time).
     """
+
+    def __init__(self, *, node_context_factory: NodeContextFactory | None = None) -> None:
+        if node_context_factory is None:
+            from agent_core.models.node_context import DefaultNodeContext
+
+            node_context_factory = DefaultNodeContext
+        self._node_context_factory = node_context_factory
 
     def build(self, spec: PipelineSpec, state_type: type | None = None) -> MiniDAG:
         """Build (but do not compile) a MiniDAG from PipelineSpec.
@@ -51,7 +68,9 @@ class DynamicGraphBuilder:
         for node_def in spec.resolved_nodes:
             node_fn = self._resolve_node_function_from_def(node_def)
             # Wrap with NodeContext injection (before context filter)
-            node_fn = _wrap_with_node_context(node_def, node_fn)
+            node_fn = _wrap_with_node_context(
+                node_def, node_fn, self._node_context_factory
+            )
             # Wrap with context filter
             node_fn = _wrap_with_context_filter(node_def, node_fn)
             # Wrap with field truncation
@@ -157,7 +176,9 @@ def _needs_context(fn: Any) -> bool:
 
 
 def _wrap_with_node_context(
-    node_def: NodeDefinition, fn: Any,
+    node_def: NodeDefinition,
+    fn: Any,
+    node_context_factory: NodeContextFactory,
 ) -> Any:
     """Wrap node function to inject DefaultNodeContext as second arg.
 
@@ -168,10 +189,8 @@ def _wrap_with_node_context(
     if not _needs_context(fn):
         return fn  # legacy (state) signature — no injection
 
-    from agent_core.models.node_context import DefaultNodeContext
-
     async def wrapped(state: dict[str, Any]) -> dict[str, Any]:
-        ctx = DefaultNodeContext(
+        ctx = node_context_factory(
             node_def=node_def,
             task_id_getter=lambda: state.get("task_id", ""),
         )
