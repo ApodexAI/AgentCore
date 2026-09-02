@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Protocol
 from typing import Any as _GraphType  # MiniDAGRunner via duck typing
 
@@ -40,6 +40,9 @@ class ProcessManager(Protocol):
     async def abort_task(self, task_id: TaskId, reason: str) -> Any: ...
 
     async def set_error(self, task_id: TaskId, error: str) -> Any: ...
+
+
+WallTimeResolver = Callable[[int | None, str | None], int | None]
 
 
 class TaskWallTimeExceeded(RuntimeError):
@@ -121,6 +124,7 @@ class Scheduler:
         graph_builder: Any | None = None,
         pipeline_registry: Any | None = None,
         checkpointer: Any | None = None,
+        wall_time_resolver: WallTimeResolver = resolve_wall_time_s,
     ) -> None:
         self._default_graph = graph
         self._pm = process_manager
@@ -128,6 +132,7 @@ class Scheduler:
         self._graph_builder = graph_builder
         self._pipeline_registry = pipeline_registry
         self._checkpointer = checkpointer
+        self._wall_time_resolver = wall_time_resolver
         self._compiled_cache: dict[str, _GraphType] = {}
 
     def _get_graph(self, pipeline_id: str | None = None) -> _GraphType:
@@ -223,7 +228,7 @@ class Scheduler:
             },
         }
 
-        wall_time = resolve_wall_time_s(wall_time_s, pipeline_id=pipeline_id)
+        wall_time = self._wall_time_resolver(wall_time_s, pipeline_id)
 
         try:
             async for chunk in self._astream_with_wall_time(
