@@ -303,8 +303,97 @@ async def test_stream_events_carry_leg_labels_and_degrade_pair() -> None:
         ("request", "fallback"),
     ]
     assert all(payload.get("streaming") for _name, payload in events), events
-    for name in ("abandon_stream_retry", "degrade"):
-        payload = next(p for n, p in events if n == name)
-        assert payload["degrade_from"] == "primary"
-        assert payload["degrade_to"] == "fallback"
-        assert payload["reason"]
+
+    # ``abandon_stream_retry`` is retry-shaped: it says why the primary was not
+    # retried. The ``degrade`` that follows is the one carrying the model pair,
+    # so a host mapping both to degrade records would write two per degradation.
+    abandon = next(p for n, p in events if n == "abandon_stream_retry")
+    assert abandon["reason"] == "primary_stream_partial"
+    assert "degrade_from" not in abandon
+    degrade = next(p for n, p in events if n == "degrade")
+    assert degrade["degrade_from"] == "primary"
+    assert degrade["degrade_to"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_degrades_are_visible_in_logs_without_any_hook(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logging is the always-wired channel: no ``event_hook``, still visible.
+
+    An operator has to be able to see that traffic moved to another model for
+    the cooldown window, and a telemetry sink may not be registered at all.
+    """
+    llm = CooldownFallbackLLM(
+        # The message has to match the retry policy for a retry to happen.
+        ScriptedLLM("primary-model", [TimeoutError("timed out")]),
+        ScriptedLLM("fallback-model", [LLMResponse(content="ok")]),
+        max_retries=2,
+        cooldown_seconds=30,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+    )
+    with caplog.at_level("DEBUG", logger="agent_core.providers.fallback"):
+        await llm.chat([user_msg("x")])
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("retrying in 0.5s" in line and "TimeoutError" in line for line in warnings)
+    assert any(
+        "degrading primary-model -> fallback-model (primary_exhausted)" in line
+        and "cooldown 30s" in line
+        for line in warnings
+    )
+    # The primary's own error stays at debug: the lines above carry the signal.
+    assert [r.levelname for r in caplog.records].count("ERROR") == 0
+    assert any("primary leg failed: timed out" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_failing_fallback_leg_logs_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = CooldownFallbackLLM(
+        ScriptedLLM("primary-model", [TimeoutError("boom")]),
+        ScriptedLLM("fallback-model", [RuntimeError("fallback down")]),
+        max_retries=1,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+    )
+    with (
+        caplog.at_level("ERROR", logger="agent_core.providers.fallback"),
+        pytest.raises(TimeoutError),
+    ):
+        await llm.chat([user_msg("x")])
+
+    assert any(
+        "fallback leg also failed: fallback down" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_model_name_follows_a_swapped_primary() -> None:
+    """``model_name`` reads through; ``model`` cannot (see its comment)."""
+    primary = ScriptedLLM("first", [])
+    llm = CooldownFallbackLLM(primary, ScriptedLLM("fallback", []))
+    assert llm.model == "first"
+    assert llm.model_name == "fallback(first)"
+
+    primary.model = "rotated"
+    assert llm.model_name == "fallback(rotated)"
+    assert llm.model == "first"  # the settable protocol slot stays a snapshot
+
+
+def test_model_label_is_always_a_string() -> None:
+    """A duck-typed client may hold a non-str model; telemetry needs a str."""
+    class EnumishModel:
+        def __str__(self) -> str:
+            return "enum-model"
+
+    class OddClient:
+        model = EnumishModel()
+
+    llm = CooldownFallbackLLM(OddClient(), ScriptedLLM("fallback", []))
+    assert llm.model == "enum-model"
+    assert isinstance(llm.model, str)

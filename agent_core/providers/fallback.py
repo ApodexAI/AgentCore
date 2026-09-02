@@ -66,6 +66,7 @@ from agent_core.messages import Message
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "LEGACY_RETRYABLE_KEYWORDS",
     "CooldownFallbackLLM",
     "FallbackEntry",
     "FallbackTrigger",
@@ -76,7 +77,10 @@ __all__ = [
 
 type FallbackEventHook = Callable[[str, dict[str, Any]], Awaitable[None]]
 
-_LEGACY_RETRYABLE_KEYWORDS = frozenset({
+# The single retryable-keyword table. ``components.middleware.llm.base``
+# re-binds its own ``_RETRYABLE_KEYWORDS`` to this rather than keeping a second
+# copy — two tables for one policy drift.
+LEGACY_RETRYABLE_KEYWORDS = frozenset({
     "timeout", "timed out", "429", "500", "502", "503", "504", "529",
     "overloaded", "rate limit", "rate_limit", "server error",
     "connection reset", "connection error", "econnreset", "gateway timeout",
@@ -87,7 +91,7 @@ _LEGACY_RETRYABLE_KEYWORDS = frozenset({
 def legacy_retryable(error: Exception) -> bool:
     """Match the historical two-model fallback wrapper's retry policy."""
     return isinstance(error, AttributeError) or any(
-        keyword in str(error).lower() for keyword in _LEGACY_RETRYABLE_KEYWORDS
+        keyword in str(error).lower() for keyword in LEGACY_RETRYABLE_KEYWORDS
     )
 
 
@@ -138,8 +142,13 @@ class FallbackEntry:
 
 
 def _model_id(model: Any) -> str:
-    """Best-effort short label for a model. Used for telemetry."""
-    return (
+    """Best-effort short label for a model. Used for telemetry.
+
+    ``model_name`` / ``model`` come off arbitrary duck-typed clients, so the
+    result is coerced: an enum, a pydantic field or a ``Mock`` must not flow
+    into ``self.model`` and every telemetry payload as a non-string.
+    """
+    return str(
         getattr(model, "model_name", None)
         or getattr(model, "model", None)
         or type(model).__name__
@@ -221,11 +230,22 @@ class CooldownFallbackLLM:
     - ``error`` — that leg's call raised.
     - ``retry`` — the primary failed and will be retried after ``delay_s``.
     - ``abandon_stream_retry`` — the primary stream failed after deltas had
-      already reached the consumer, so it degrades instead of replaying.
+      already reached the consumer, so it degrades instead of replaying. A
+      retry-shaped event: the ``degrade`` that follows describes the move.
     - ``degrade`` — traffic moves to the fallback leg (``leg="fallback"``);
       always carries ``reason``, ``degrade_from`` and ``degrade_to``.
 
     Stream-path events additionally carry ``streaming=True``.
+
+    Logging
+    -------
+    Every event is also logged, independently of ``event_hook`` — a degrade
+    moves traffic to a different model for ``cooldown_seconds`` and an operator
+    has to be able to see that in logs whether or not a telemetry sink is
+    wired. Retries, abandoned stream retries and degrades log at ``warning``; a
+    failing fallback leg logs at ``error``; a primary-leg error logs at
+    ``debug``, since the ``retry`` or ``degrade`` line that follows it carries
+    the operational signal. Hosts should not re-log off the hook.
     """
 
     def __init__(
@@ -255,11 +275,56 @@ class CooldownFallbackLLM:
         self._replay_partial_stream = replay_partial_stream
         self._cooldown_until = 0.0
 
+    # ``model_name`` is derived, ``model`` is a snapshot, and the split is
+    # forced: ``LLMClient`` declares ``model`` as a settable attribute (the
+    # concrete clients subclass the Protocol and assign it in ``__init__``, so
+    # it is a real descriptor slot), and a property there stops the class
+    # satisfying that. ``model_name`` carries no such constraint, so it reads
+    # through to the current primary — that is the label to use when a primary
+    # may be lazily initialised or swapped by middleware after construction.
     @property
     def model_name(self) -> str:
         return f"fallback({_model_id(self.primary)})"
 
+    def _log_event(self, name: str, payload: dict[str, Any]) -> None:
+        """Operational log line for one event. See the class docstring."""
+        if name == "error":
+            if payload.get("leg") == "fallback":
+                logger.error(
+                    "CooldownFallbackLLM: fallback leg also failed: %s",
+                    payload.get("error"),
+                )
+            else:
+                logger.debug(
+                    "CooldownFallbackLLM: primary leg failed: %s",
+                    payload.get("error"),
+                )
+        elif name == "retry":
+            logger.warning(
+                "CooldownFallbackLLM: primary attempt %s/%s failed (%s), "
+                "retrying in %.1fs",
+                payload.get("attempt"),
+                self.max_retries,
+                payload.get("error_type"),
+                float(payload.get("delay_s") or 0.0),
+            )
+        elif name == "abandon_stream_retry":
+            logger.warning(
+                "CooldownFallbackLLM: primary stream failed on attempt %s "
+                "after emitting deltas; degrading instead of replaying them",
+                payload.get("attempt"),
+            )
+        elif name == "degrade":
+            logger.warning(
+                "CooldownFallbackLLM: degrading %s -> %s (%s), cooldown %ss",
+                payload.get("degrade_from"),
+                payload.get("degrade_to"),
+                payload.get("reason"),
+                payload.get("cooldown_seconds", self.cooldown_seconds),
+            )
+
     async def _emit(self, name: str, **payload: Any) -> None:
+        self._log_event(name, payload)
         try:
             await self._event_hook(name, payload)
         except Exception:
@@ -331,7 +396,11 @@ class CooldownFallbackLLM:
                     break
                 delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
                 await self._emit(
-                    "retry", leg="primary", attempt=attempt + 1, delay_s=delay,
+                    "retry",
+                    leg="primary",
+                    attempt=attempt + 1,
+                    delay_s=delay,
+                    error_type=type(error).__name__,
                 )
                 await self._sleep(delay)
 
@@ -343,6 +412,7 @@ class CooldownFallbackLLM:
             degrade_from=_model_id(self.primary),
             degrade_to=_model_id(self.fallback),
             cooldown_seconds=self.cooldown_seconds,
+            error=str(last_error) if last_error else "",
         )
         await self._emit("request", leg="fallback", mode="degraded")
         try:
@@ -418,8 +488,6 @@ class CooldownFallbackLLM:
                         "abandon_stream_retry",
                         leg="primary",
                         reason="primary_stream_partial",
-                        degrade_from=_model_id(self.primary),
-                        degrade_to=_model_id(self.fallback),
                         attempt=attempt + 1,
                         streaming=True,
                         yielded=True,
@@ -435,6 +503,7 @@ class CooldownFallbackLLM:
                     delay_s=delay,
                     streaming=True,
                     yielded=yielded,
+                    error_type=type(error).__name__,
                 )
                 await self._sleep(delay)
 
