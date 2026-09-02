@@ -188,7 +188,7 @@ class FileSystemSkillLoader:
         """
         if self._extensions_config.has_changed():
             logger.info("Extensions config changed on disk — reloading skill state")
-            self._extensions_config = ExtensionsConfig.from_file()
+            self._extensions_config = self._reload_extensions_config()
             # Re-apply enabled state to already-discovered skills
             for skill in self._skills.values():
                 skill.enabled = self._extensions_config.is_skill_enabled(skill.skill_id)
@@ -197,7 +197,14 @@ class FileSystemSkillLoader:
     # ── Mutations ─────────────────────────────────────────────────────
 
     def toggle_skill(self, skill_id: str, enabled: bool) -> bool:
-        """Enable or disable a skill. Returns True if skill exists."""
+        """Enable or disable a skill. Returns True if skill exists.
+
+        Discovers lazily like every other accessor: without this, toggling on
+        a freshly built loader read an empty ``_skills`` and reported False for
+        a skill that exists on disk — a silent no-op.
+        """
+        if not self._discovered:
+            self.discover()
         skill = self._skills.get(skill_id)
         if skill is None:
             return False
@@ -208,5 +215,27 @@ class FileSystemSkillLoader:
         """Force re-discovery of skills."""
         self._skills.clear()
         self._discovered = False
-        self._extensions_config = ExtensionsConfig.from_file()
+        self._extensions_config = self._reload_extensions_config()
         self.discover()
+
+    def _reload_extensions_config(self) -> ExtensionsConfig:
+        """Re-read the config from the file it came from.
+
+        Calling ``from_file()`` with no argument restarts the cwd/env search.
+        For a loader built with a config loaded from an explicit path outside
+        those locations, that search finds nothing and returns empty defaults —
+        and because ``is_skill_enabled`` defaults to True for anything unlisted,
+        an operator disabling a skill got every skill re-enabled instead. The
+        empty config also carries no ``_file_path``, so ``has_changed`` returned
+        False from then on and the state could never recover.
+        """
+        source = self._extensions_config.source_path
+        reloaded = ExtensionsConfig.from_file(source)
+        if source is not None and reloaded.source_path is None:
+            logger.warning(
+                "Extensions config %s could not be re-read; keeping the "
+                "previously loaded skill state",
+                source,
+            )
+            return self._extensions_config
+        return reloaded

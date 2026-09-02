@@ -83,6 +83,16 @@ class ExtensionsConfig(BaseModel):
             logger.warning("Failed to load extensions config %s: %s", resolved, e)
             return cls()
 
+    @property
+    def source_path(self) -> Path | None:
+        """File this config was loaded from; ``None`` for in-memory defaults.
+
+        A reloader must pass this back to :meth:`from_file` — calling it with
+        no argument restarts the cwd/env search, which silently returns empty
+        defaults for a config that was loaded from an explicit path.
+        """
+        return self._file_path
+
     def has_changed(self) -> bool:
         """Return True if the backing file has been modified since load."""
         if self._file_path is None or not self._file_path.is_file():
