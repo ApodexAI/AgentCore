@@ -63,7 +63,16 @@ class ExtensionsConfig(BaseModel):
     @classmethod
     def from_file(cls, config_path: str | Path | None = None) -> ExtensionsConfig:
         """Load config from JSON file with environment variable resolution."""
-        resolved = Path(config_path) if config_path else _find_config_file()
+        if config_path:
+            resolved = Path(config_path)
+            # Keep the source stable across later ``chdir`` calls.  Do not use
+            # ``resolve()`` here: retaining a configured symlink path lets an
+            # operator atomically repoint that symlink and have reload observe
+            # the new target.
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+        else:
+            resolved = _find_config_file()
 
         if resolved is None or not resolved.is_file():
             logger.debug("No extensions config found — using empty defaults")

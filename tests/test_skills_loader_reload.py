@@ -89,6 +89,30 @@ def test_reload_reads_the_same_file(skill_dir, config_file):
     assert {s.skill_id for s in loader.get_enabled_skills()} == {"code-review"}
 
 
+def test_relative_source_path_survives_cwd_change(
+    skill_dir, config_file, monkeypatch,
+):
+    """Reload must keep tracking the originally opened relative path."""
+    monkeypatch.chdir(config_file.parent)
+    config = ExtensionsConfig.from_file(config_file.name)
+    assert config.source_path == config_file
+    loader = FileSystemSkillLoader(
+        skill_dirs=[skill_dir],
+        extensions_config=config,
+    )
+
+    other = config_file.parent / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    _write(config_file, {"debug": False})
+
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"code-review"}
+
+    _write(config_file, {"code-review": False})
+    loader.reload()
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"debug"}
+
+
 def test_auto_reload_keeps_working_after_the_first_change(skill_dir, config_file):
     """The old failure mode wedged ``has_changed`` off permanently."""
     loader = _loader(skill_dir, config_file)
