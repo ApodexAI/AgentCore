@@ -108,6 +108,9 @@ logger = logging.getLogger(__name__)
 PauseCheckFn = Callable[[], Awaitable[bool]]
 PauseCheckFactory = Callable[[str], PauseCheckFn | None]
 _default_pause_check_factory: PauseCheckFactory | None = None
+EventSinkResolver = Callable[[], EventSink | None]
+_default_event_sink_resolver: EventSinkResolver | None = None
+_default_session_activity = True
 
 
 def configure_default_pause_check_factory(
@@ -116,6 +119,20 @@ def configure_default_pause_check_factory(
     """Configure the host pause integration used by zero-argument buses."""
     global _default_pause_check_factory
     _default_pause_check_factory = factory
+
+
+def configure_default_event_sink_resolver(
+    resolver: EventSinkResolver | None,
+) -> None:
+    """Configure host lookup for a product-specific EventSink protocol key."""
+    global _default_event_sink_resolver
+    _default_event_sink_resolver = resolver
+
+
+def configure_default_session_activity(enabled: bool) -> None:
+    """Enable or disable the portable live session activity observer."""
+    global _default_session_activity
+    _default_session_activity = bool(enabled)
 
 
 def _with_wall_clock_guard(
@@ -167,7 +184,10 @@ def _legacy_pause_check_factory(task_id: str) -> PauseCheckFn | None:
     """Product-neutral default: no process-manager pause integration."""
     if _default_pause_check_factory is None:
         return None
-    return _default_pause_check_factory(task_id)
+    try:
+        return _default_pause_check_factory(task_id)
+    except (ImportError, RuntimeError):
+        return None
 
 
 def _safe_session_filename(session_id: str) -> str:
@@ -325,6 +345,7 @@ class AgentBus:
         agent_registry: AgentRegistry | None = None,
         resource_manager: Any = None,
         session_history_dir: Path | None = None,
+        session_activity: bool | None = None,
     ) -> None:
         """Construct an AgentBus.
 
@@ -385,6 +406,11 @@ class AgentBus:
         self._agent_registry_injected: AgentRegistry | None = agent_registry
         self._resource_manager_injected: Any = resource_manager
         self._session_history_dir: Path | None = session_history_dir
+        self._session_activity = (
+            _default_session_activity
+            if session_activity is None
+            else bool(session_activity)
+        )
 
     def _event_sink(self) -> Any:
         """Resolve the active event sink.
@@ -399,6 +425,13 @@ class AgentBus:
         event_sink = registry.get_optional(EventSink)
         if event_sink is not None:
             return event_sink
+        if _default_event_sink_resolver is not None:
+            try:
+                event_sink = _default_event_sink_resolver()
+            except (ImportError, RuntimeError):
+                event_sink = None
+            if event_sink is not None:
+                return event_sink
         return registry.get_optional_by_type_name("EventStore")
 
     def _agent_registry(self, *, required: bool) -> Any:
@@ -1273,7 +1306,8 @@ class AgentBus:
                                 type(_obs).__name__, _exc,
                             )
 
-                loop_observers.append(_SessionActivityObserver(session))
+                if self._session_activity:
+                    loop_observers.append(_SessionActivityObserver(session))
                 loop_observers = _with_wall_clock_guard(loop_observers, guard)
 
                 coro = run_agent_loop(
