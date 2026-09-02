@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from agent_core.llm import LLMResponse
@@ -117,6 +118,29 @@ def _pick_int(*candidates: Any) -> int:
         if n:
             return n
     return 0
+
+
+def usage_input_tokens(usage: Mapping[str, Any] | None) -> int:
+    """Prompt-side token count from any usage mapping the loop may carry.
+
+    ``extract_usage`` normalises to ``prompt_tokens`` / ``completion_tokens``,
+    but ``TurnContext.usage`` is deliberately an open mapping (see
+    ``UsageMetadata``): hosts hand in raw provider payloads and test doubles
+    that use the ``input_tokens`` / ``output_tokens`` aliases instead. A
+    consumer that reads only one spelling silently sees 0 — which is how the
+    context-size guard and the budget observer each ended up inert against
+    normalised usage. Read both, here, once.
+    """
+    if usage is None:
+        return 0
+    return int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+
+
+def usage_output_tokens(usage: Mapping[str, Any] | None) -> int:
+    """Completion-side counterpart of :func:`usage_input_tokens`."""
+    if usage is None:
+        return 0
+    return int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
 
 
 def extract_usage(response: Any) -> UsageMetadata | None:

@@ -28,6 +28,8 @@ from agent_core.runtime.loop.llm_client import (
     extract_model_name,
     extract_usage,
     is_truncated_with_text,
+    usage_input_tokens,
+    usage_output_tokens,
 )
 from agent_core.runtime.loop.message_trimmer import (
     MessageTrimmer,
@@ -101,4 +103,6 @@ __all__ = [
     "extract_usage",
     "is_truncated_with_text",
     "run_agent_loop",
+    "usage_input_tokens",
+    "usage_output_tokens",
 ]

@@ -5,6 +5,7 @@ when the token budget is exhausted.
 from __future__ import annotations
 
 from agent_core.loop_types import Intervention, LoopConfig, TurnContext
+from agent_core.runtime.loop import usage_input_tokens, usage_output_tokens
 
 
 class BudgetObserver:
@@ -26,10 +27,21 @@ class BudgetObserver:
         self._warned = False
 
     async def on_llm_response(self, ctx: TurnContext) -> None:
-        """Accumulate token counts from the LLM response usage dict."""
+        """Accumulate token counts from the LLM response usage dict.
+
+        Reads both spellings through the shared accessors: the loop
+        normalises usage to ``prompt_tokens`` / ``completion_tokens``
+        (``extract_usage``), while hosts and test doubles may hand in the
+        ``input_tokens`` / ``output_tokens`` aliases. Reading only the
+        aliases left ``tokens_used`` at 0 against normalised usage, so
+        neither the ``budget_exhausted`` intervention nor the warning at
+        ``warn_ratio`` could ever fire in production.
+        """
         if ctx.usage is None:
             return
-        self.tokens_used += ctx.usage.get("input_tokens", 0) + ctx.usage.get("output_tokens", 0)
+        self.tokens_used += (
+            usage_input_tokens(ctx.usage) + usage_output_tokens(ctx.usage)
+        )
         ctx.metadata["budget_tokens_used"] = self.tokens_used
         ctx.metadata["budget_tokens_limit"] = self.max_tokens
 

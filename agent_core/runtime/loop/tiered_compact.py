@@ -13,6 +13,7 @@ from agent_core.loop_types import (
     TurnContext,
 )
 from agent_core.messages import Message, is_tool_msg, text_of, user_msg
+from agent_core.runtime.loop._response import usage_input_tokens
 from agent_core.runtime.loop.compact import (
     INPUT_ESTIMATE_KEY,
     KeepLastNToolResultsCompactor,
@@ -109,7 +110,7 @@ class InputTokenGauge(BaseObserver):
         u = ctx.usage or {}
         # Normalised usage uses ``prompt_tokens``; accept raw Anthropic
         # ``input_tokens`` as a fallback.
-        self.tokens = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
+        self.tokens = usage_input_tokens(u)
         # Both sides of the scale must describe the SAME request. Estimating
         # ``ctx.messages`` here cannot: the loop appends this turn's assistant
         # reply before building the context, and the per-call system addendum
