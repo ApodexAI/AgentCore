@@ -13,6 +13,7 @@ type ClientFactory = Callable[..., Any]
 type ProviderTypeResolver = Callable[[str], str]
 type SessionHeadersResolver = Callable[[str, Mapping[str, Any]], Mapping[str, str]]
 type ClientDecorator = Callable[[Any, str, str], Any]
+type APIKeyResolver = Callable[[Mapping[str, Any], str], str]
 
 _DUMMY_KEY_WARNED: set[tuple[str, str]] = set()
 
@@ -85,12 +86,14 @@ class AuxLLMFactory:
         provider_type: ProviderTypeResolver,
         session_headers: SessionHeadersResolver | None = None,
         decorate: ClientDecorator | None = None,
+        api_key_resolver: APIKeyResolver = _resolve_api_key,
     ) -> None:
         self._openai_factory = openai_factory
         self._anthropic_factory = anthropic_factory
         self._provider_type = provider_type
         self._session_headers = session_headers
         self._decorate = decorate
+        self._api_key_resolver = api_key_resolver
 
     def build(self, section: Mapping[str, Any]) -> Any:
         provider = str(
@@ -124,7 +127,7 @@ class AuxLLMFactory:
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": section["model"],
-            "api_key": _resolve_api_key(section, provider),
+            "api_key": self._api_key_resolver(section, provider),
             "temperature": section.get("temperature", 0.0),
             "timeout": float(section.get("llm_timeout_s", 120)),
             "thinking": _anthropic_thinking(section),
@@ -148,7 +151,7 @@ class AuxLLMFactory:
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": section["model"],
-            "api_key": _resolve_api_key(section, provider),
+            "api_key": self._api_key_resolver(section, provider),
             "base_url": section.get("base_url") or None,
             "temperature": section.get("temperature", 0.0),
             "timeout": float(section.get("llm_timeout_s", 120)),
