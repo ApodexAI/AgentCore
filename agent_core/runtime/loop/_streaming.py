@@ -243,6 +243,13 @@ async def _stream_llm_response(
     # wrapper — folded into ``response_metadata`` below so
     # streamed calls carry billing attribution like the non-streaming path.
     final_provider = ""
+    # Verbatim provider content blocks, when the provider sends them (Anthropic
+    # extended thinking). Signed ``thinking`` / opaque ``redacted_thinking``
+    # blocks cannot be reconstructed from the flattened text channels, so when
+    # present these become the assembled ``content`` — matching what the
+    # non-streaming path returns and what ``thinking_format="content_block"``
+    # needs to replay the signed reasoning state on the next turn.
+    final_reasoning_blocks: list[dict[str, Any]] = []
     think_splitter = _ThinkTagSplitter()
     accepts_tool_call_chunks = _accepts_tool_call_arg_chunks(on_delta)
     reasoning_timeout_s = max(float(reasoning_only_timeout_s or 0), 0.0)
@@ -307,8 +314,14 @@ async def _stream_llm_response(
             logger.warning(
                 "dropped %d streamed tool_call(s) with no function name", dropped,
             )
+        # A provider that sent a verbatim block list wins over the flattened
+        # string: the blocks carry the thinking signatures, and the text blocks
+        # inside them hold the same visible text ``accumulated`` collected. The
+        # lstrip/think-tag normalisation above is deliberately NOT applied to
+        # them — replay requires the bytes Anthropic signed, unmodified.
+        assembled_content: Any = final_reasoning_blocks or visible_content
         return LLMResponse(
-            content=visible_content,
+            content=assembled_content,
             tool_calls=complete_tool_calls,
             reasoning_content=thinking_accum,
             usage=final_usage,
@@ -342,6 +355,8 @@ async def _stream_llm_response(
                         final_model = delta.model
                     if getattr(delta, "provider", ""):
                         final_provider = delta.provider
+                    if getattr(delta, "reasoning_blocks", None):
+                        final_reasoning_blocks = delta.reasoning_blocks
                     # Inline ``<think>...</think>`` tags (Qwen-style) are
                     # split out so ``delta`` carries answer-only text and
                     # ``thinking_delta`` collects both inline + typed

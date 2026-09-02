@@ -11,14 +11,15 @@ bootstrap time.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from agent_core.models.pipeline_spec import PipelineSpec
 
 logger = logging.getLogger(__name__)
 
 
-TopologyFactory = Callable[[dict, dict], PipelineSpec]
+TopologyFactory = Callable[[Mapping[str, Any], Mapping[str, str]], PipelineSpec]
 
 
 class TopologyRegistry:
@@ -44,8 +45,8 @@ class TopologyRegistry:
     def build(
         self,
         name: str,
-        options: dict | None = None,
-        role_tiers: dict | None = None,
+        options: Mapping[str, Any] | None = None,
+        role_tiers: Mapping[str, str] | None = None,
     ) -> PipelineSpec:
         try:
             factory = self._factories[name]

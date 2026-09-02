@@ -46,6 +46,21 @@ class StreamDelta:
     # consumer read an empty vendor, which split one model's usage across
     # a ``provider=""`` bucket and a named bucket.
     provider: str = ""
+    # VERBATIM provider content blocks for the assembled turn, carried only by
+    # providers whose replay contract needs the structured block list rather
+    # than flattened text — currently Anthropic extended thinking, where each
+    # ``thinking`` block's cryptographic ``signature`` (and any opaque
+    # ``redacted_thinking`` payload) MUST be echoed back unmodified on the next
+    # turn or the model cannot continue the signed reasoning state.
+    #
+    # ``content``/``reasoning_content`` above are the flattened text channels;
+    # they cannot represent a signature, so without this field the streaming
+    # path silently produced reasoning that ``thinking_format="content_block"``
+    # could not replay. Providers that need no block list leave it empty and
+    # the stream assembler keeps using the flattened string.
+    reasoning_blocks: list[dict[str, Any]] = field(
+        default_factory=list[dict[str, Any]],
+    )
 
 
 @runtime_checkable
