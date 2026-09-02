@@ -41,8 +41,12 @@ Version `0.1.x` contains the converged foundation layer:
   stream-repetition detection;
 - portable loop observers for budget/context/wall-clock guards, finalization,
   repetition detection, SSE events, task boards, and bounded trajectories;
-- shared agent-bus stop signals/pools, filesystem skill loaders, session
-  history, renewable wall-time leases, and language helpers.
+- complete agent-bus communication, spawn control, reusable sessions,
+  result recovery, fan-in policy, shared pools and stop signals;
+- portable tools, task/finalization budgets, role-scoped resource management,
+  and backend-injected DAG scheduling;
+- filesystem skill loaders, session history, renewable wall-time leases, and
+  language helpers.
 
 The initial extraction is based on the already-merged integration branches:
 
@@ -68,9 +72,10 @@ Code belongs in AgentCore when it:
 - accepts product behavior through typed inputs or explicit hooks;
 - has tests that run without either product repository installed.
 
-Provider clients, session affinity, user/session retention policy, checkpoint
-association, workflow node implementations, sandbox mounting/authorization,
-UI history, and product-specific observers remain in their product.
+Provider clients, session affinity, durable process/event-store implementations,
+user/session retention policy, checkpoint association, workflow node
+implementations, sandbox mounting/authorization, UI history, and
+product-specific observers remain in their product.
 
 ## Development
 
@@ -147,10 +152,15 @@ edit both products' core copies, that is evidence it belongs here.
    MiniDAG/graph construction, middleware/observers, agent-bus coordination
    primitives (shared pools and stop signals), skills, session history, models,
    and scoped registries.
-8. **Agent-bus scheduling** (next): extract the shared communication models,
-   runtime, spawn guard, bus, and fan-in orchestration behind explicit product
-   hooks. Product tool assembly and workflow-specific policy remain downstream.
-9. Remove product compatibility facades after downstream imports have moved to
+8. **Agent-bus scheduling** (complete in AgentCore): communication models,
+   durable result-message recovery, runtime, spawn guard, reusable sessions,
+   bus/fan-in orchestration, resource management, task budgets, and the
+   backend-injected DAG scheduler. Product tool assembly, persistence backends,
+   and workflow policy remain downstream.
+9. **Provider substrate** (next): converge the shared provider transports,
+   fallback engine, prompt cache, usage metering, and non-blocking streaming
+   behind product configuration and session-affinity adapters.
+10. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
 
 Each slice must leave product CI green and must not depend on a floating branch.
