@@ -63,7 +63,16 @@ class ExtensionsConfig(BaseModel):
     @classmethod
     def from_file(cls, config_path: str | Path | None = None) -> ExtensionsConfig:
         """Load config from JSON file with environment variable resolution."""
-        resolved = Path(config_path) if config_path else _find_config_file()
+        if config_path:
+            resolved = Path(config_path)
+            # Keep the source stable across later ``chdir`` calls.  Do not use
+            # ``resolve()`` here: retaining a configured symlink path lets an
+            # operator atomically repoint that symlink and have reload observe
+            # the new target.
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+        else:
+            resolved = _find_config_file()
 
         if resolved is None or not resolved.is_file():
             logger.debug("No extensions config found — using empty defaults")
@@ -82,6 +91,16 @@ class ExtensionsConfig(BaseModel):
         except Exception as e:
             logger.warning("Failed to load extensions config %s: %s", resolved, e)
             return cls()
+
+    @property
+    def source_path(self) -> Path | None:
+        """File this config was loaded from; ``None`` for in-memory defaults.
+
+        A reloader must pass this back to :meth:`from_file` — calling it with
+        no argument restarts the cwd/env search, which silently returns empty
+        defaults for a config that was loaded from an explicit path.
+        """
+        return self._file_path
 
     def has_changed(self) -> bool:
         """Return True if the backing file has been modified since load."""

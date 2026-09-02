@@ -151,6 +151,18 @@ class LeakedToolCallRetryObserver(BaseObserver):
             ctx.metadata.pop(_METADATA_TEMP_KEY, None)
             return None
 
+        # This turn ran with no tools bound at all — ``LastTurnForcer`` strips
+        # them for the landing turn. Nothing could be parsed, so
+        # ``blocked_tool_calls`` is empty and the guard above does not cover
+        # it, yet a prose answer that merely mentions ``finalize_answer(...)``
+        # trips ``_looks_like_leak``. Replaying would hand tools back on the
+        # one turn that was supposed to have none, because
+        # ``_llm_strip_tools`` is one-shot and already consumed.
+        if ctx.metadata.get("_llm_tools_stripped"):
+            ctx.metadata.pop(_METADATA_COUNT_KEY, None)
+            ctx.metadata.pop(_METADATA_TEMP_KEY, None)
+            return None
+
         # A structured tool call was parsed — nothing to retry. Also reset
         # the escalation counter so a future leak starts at 0.3 again.
         if ctx.tool_calls:

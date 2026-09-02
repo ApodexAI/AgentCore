@@ -111,7 +111,15 @@ class SummarizationMiddleware(LLMMiddleware):
         # return HTTP 400 "No tool call found for function call output
         # with call_id ...".
         split_idx = len(rest) - keep_recent
-        while split_idx < len(rest) - 1 and rest[split_idx].get("role") == "tool":
+        # ``len(rest)``, not ``len(rest) - 1``: stopping one short left the
+        # window starting on a tool message whenever the tail was all tool
+        # results — e.g. keep_recent=3 over
+        # ``[assistant(tool_calls), tool, tool, tool]`` kept ``[tool]``, the
+        # exact orphan this loop exists to prevent. Running off the end is
+        # the safe outcome: everything gets summarised and the kept window is
+        # empty, rather than shipping a tool result whose ``tool_calls`` was
+        # summarised away.
+        while split_idx < len(rest) and rest[split_idx].get("role") == "tool":
             split_idx += 1
         to_summarize = rest[:split_idx]
         keep = rest[split_idx:]

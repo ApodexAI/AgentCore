@@ -10,6 +10,7 @@ from agent_core.loop_types import (
     LoopConfig,
     TurnContext,
 )
+from agent_core.runtime.loop import usage_input_tokens
 from agent_core.runtime.loop.compact import (
     COMPACTION_SEQ_KEY,
     FORCE_COMPACTION_KEY,
@@ -51,10 +52,7 @@ class ContextSizeGuard(BaseObserver):
     async def on_llm_response(self, ctx: TurnContext) -> Intervention | None:
         if self._tripped or ctx.usage is None:
             return None
-        # Normalised usage (infra/usage.py) exposes ``prompt_tokens``; raw
-        # Anthropic payloads use ``input_tokens``. Read prompt_tokens first —
-        # reading only ``input_tokens`` meant this guard saw 0 and never tripped.
-        used = int(ctx.usage.get("prompt_tokens") or ctx.usage.get("input_tokens") or 0)
+        used = usage_input_tokens(ctx.usage)
         if used <= self._limit:
             self._requested_at_seq = None
             return None

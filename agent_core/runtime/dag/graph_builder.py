@@ -77,12 +77,20 @@ class DynamicGraphBuilder:
         # Use resolved_nodes (works with both nodes and phases via bridge)
         for node_def in spec.resolved_nodes:
             node_fn = self._resolve_node_function_from_def(node_def)
-            # Wrap with NodeContext injection (before context filter)
-            node_fn = _wrap_with_node_context(
-                node_def, node_fn, self._node_context_factory
-            )
-            # Wrap with context filter
+            # Decided from the original signature: every wrapper below takes
+            # ``(state, ...)`` and would fool the arity probe.
+            needs_ctx = _needs_context(node_fn)
+            # Context filter goes innermost so the NodeContext built outside it
+            # still sees the *unfiltered* state. ``task_id_getter`` reads
+            # ``state["task_id"]``, which a ``ContextPolicy.include_fields``
+            # list normally omits — wrapping the other way round gave those
+            # nodes ``ctx.task_id == ""`` and attributed every task-scoped
+            # lookup and telemetry emission to the empty task id.
             node_fn = _wrap_with_context_filter(node_def, node_fn)
+            node_fn = _wrap_with_node_context(
+                node_def, node_fn, self._node_context_factory,
+                needs_context=needs_ctx,
+            )
             # Wrap with field truncation
             if node_def.compression and node_def.compression.max_field_tokens:
                 node_fn = _wrap_with_field_truncation(node_def, node_fn)
@@ -189,6 +197,8 @@ def _wrap_with_node_context(
     node_def: NodeDefinition,
     fn: Any,
     node_context_factory: NodeContextFactory,
+    *,
+    needs_context: bool | None = None,
 ) -> Any:
     """Wrap node function to inject the node context as second arg.
 
@@ -198,8 +208,13 @@ def _wrap_with_node_context(
     If the function has a single-param ``(state)`` signature (legacy),
     it passes through unchanged — backward compatible with solver specs
     that predate the NodeContext facade (e.g. solvers/gaia).
+
+    ``needs_context`` lets the caller decide from the *original* node
+    signature. :meth:`DynamicGraphBuilder.build` must pass it, because it
+    applies this wrapper on top of the context filter, whose own
+    ``(state, *extra)`` signature says nothing about what the node wants.
     """
-    if not _needs_context(fn):
+    if not (needs_context if needs_context is not None else _needs_context(fn)):
         return fn  # legacy (state) signature — no injection
 
     async def wrapped(state: dict[str, Any]) -> dict[str, Any]:
@@ -266,9 +281,11 @@ def _wrap_with_context_filter(
     if policy.filter_fn is None and policy.include_fields is None:
         return node_fn  # full state, skip wrapping
 
-    async def wrapped(state: dict[str, Any]) -> dict[str, Any]:
+    async def wrapped(
+        state: dict[str, Any], *extra: Any,
+    ) -> dict[str, Any]:
         filtered = apply_context_filter(policy, state)
-        return await node_fn(filtered)
+        return await node_fn(filtered, *extra)
 
     wrapped.__name__ = getattr(
         node_fn, "__name__", f"node_{node_def.node_id}",
@@ -356,6 +373,16 @@ def _wrap_with_middleware_nd(
             for attempt in range(1 + max_retries):
                 try:
                     result = await node_fn(state)
+                    # ``MiniDAGRunner`` treats a ``None`` delta as "no state
+                    # change" (``if delta is None: delta = {}``), so a node is
+                    # allowed to return it. Normalise here or the middleware
+                    # hook below is handed None and ``result.get`` raises — a
+                    # node that worked with no middleware registered would
+                    # start failing the moment a chain was added, and the
+                    # surrounding ``except`` would misreport the contract
+                    # violation as a middleware error.
+                    if result is None:
+                        result = {}
                     result = await middleware_chain.run_after_phase(
                         ctx, result,
                     )
@@ -377,10 +404,15 @@ def _wrap_with_middleware_nd(
                     err_result = await middleware_chain.run_on_error(
                         ctx, e,
                     )
-                    if err_result is None and attempt < max_retries:
+                    # Retry on any failure while attempts remain. Gating this
+                    # on ``err_result is None`` made retrying depend on a
+                    # middleware *suppressing* the error, so with the default
+                    # ``ExecutionMiddleware.on_error`` (which returns the
+                    # error) a node declaring ``metadata["max_retries"]`` was
+                    # never retried at all.
+                    if attempt < max_retries:
                         logger.warning(
-                            "Middleware suppressed error in '%s', "
-                            "retrying (%d/%d): %s",
+                            "Node '%s' failed, retrying (%d/%d): %s",
                             node_def.node_id,
                             attempt + 1,
                             max_retries,
@@ -388,10 +420,15 @@ def _wrap_with_middleware_nd(
                         )
                         continue
                     if err_result is None:
+                        # Middleware returned None = "handled, do not raise".
+                        # The DAG then advances on a synthetic delta, so log
+                        # the swallowed exception itself — otherwise a genuine
+                        # node crash leaves no trace anywhere.
                         logger.warning(
                             "Middleware suppressed error in '%s' "
-                            "(no more retries)",
+                            "(retries exhausted); advancing the DAG",
                             node_def.node_id,
+                            exc_info=e,
                         )
                         return {
                             "current_phase": node_def.node_id,

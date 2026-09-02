@@ -542,6 +542,12 @@ async def _prepare_llm_request(
 ) -> tuple[Any, list[Message], bool, str]:
     temp_override = metadata.pop("_llm_temp_override", None)
     strip_tools = metadata.pop("_llm_strip_tools", False)
+    # ``_llm_strip_tools`` is one-shot and consumed right here, so an observer
+    # running later in the same turn cannot tell whether tools were bound.
+    # Record it for the turn: an observer that replays the turn
+    # (``continue_to_next_turn``) would otherwise re-bind tools on the landing
+    # turn that was deliberately given none.
+    metadata["_llm_tools_stripped"] = strip_tools
     llm_base = llm_with_session if strip_tools else llm_with_tools
     llm_for_turn = (
         bind_temperature(llm_base, temp_override)

@@ -346,8 +346,16 @@ class TrajectoryFileObserver(BaseObserver):
         if not force:
             self._pending_flushes += 1
             now = time.monotonic()
+            # "0 disables the respective bound" (module header). With every
+            # bound disabled there is nothing left to coalesce, so every event
+            # flushes — treating a disabled bound as "never due" instead meant
+            # ``SWARM_TRAJECTORY_COALESCE_N=0`` froze the JSON snapshot after
+            # the first flush, and a process killed before ``on_loop_end``
+            # left only the ``start`` state on disk.
+            coalescing = _COALESCE_N > 0 or _COALESCE_MS > 0
             due = (
-                self._last_flush_at == 0.0
+                not coalescing
+                or self._last_flush_at == 0.0
                 or (
                     _COALESCE_N > 0
                     and self._pending_flushes >= _COALESCE_N

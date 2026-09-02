@@ -30,6 +30,8 @@ from agent_core.runtime.loop._response import (
     extract_leaked_reasoning,
     extract_model_name,
     extract_usage,
+    usage_input_tokens,
+    usage_output_tokens,
 )
 from agent_core.runtime.loop._runaway import (
     RUNAWAY_STATE_KEY,
@@ -62,4 +64,6 @@ __all__ = [
     "extract_model_name",
     "extract_usage",
     "is_truncated_with_text",
+    "usage_input_tokens",
+    "usage_output_tokens",
 ]
