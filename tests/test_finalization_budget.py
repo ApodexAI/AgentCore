@@ -58,6 +58,68 @@ def test_shortest_positive_ceiling_wins(monkeypatch):
     assert wall.hard_total_s == 3600
 
 
+def test_both_keys_keep_the_total_ceiling_enforced(monkeypatch):
+    """A research budget must not hide the total-task ceiling beside it.
+
+    Selecting by key *presence* made ``wall_deadline_s`` unreadable whenever
+    ``research_wall_time_s`` existed, so ``hard_total_s`` came back 0 —
+    ``check_wall_feasibility`` then passed unconditionally and callers handed
+    ``deadline_monotonic_s=None`` to ``remaining_phase_budget_s``, leaving the
+    ceiling silently unenforced.
+    """
+    monkeypatch.delenv("MIROHARNESS_TASK_WALL_TIME_S", raising=False)
+    monkeypatch.delenv("RESEARCH_WALL_TIME", raising=False)
+
+    wall = resolve_research_wall(
+        {"research_wall_time_s": 600, "wall_deadline_s": 900},
+        reserve_s=180, label_prefix="t",
+    )
+
+    assert wall.hard_total_s == 900
+    # Research keeps its own (shorter) budget; the ceiling only caps it.
+    assert wall.research_deadline_s == 600
+
+
+def test_total_ceiling_can_shorten_a_longer_research_budget(monkeypatch):
+    monkeypatch.delenv("MIROHARNESS_TASK_WALL_TIME_S", raising=False)
+    monkeypatch.delenv("RESEARCH_WALL_TIME", raising=False)
+
+    wall = resolve_research_wall(
+        {"research_wall_time_s": 9000, "wall_deadline_s": 900},
+        reserve_s=180, label_prefix="t",
+    )
+
+    assert wall.hard_total_s == 900
+    assert wall.research_deadline_s == soft_wall_deadline_s(900, 180)
+
+
+@pytest.mark.parametrize("raw", [None, "", "0", "-1", "not-a-number"])
+def test_unusable_research_value_still_honours_wall_deadline_s(monkeypatch, raw):
+    """A YAML ``research_wall_time_s:`` with no value discarded both numbers."""
+    monkeypatch.delenv("MIROHARNESS_TASK_WALL_TIME_S", raising=False)
+    monkeypatch.delenv("RESEARCH_WALL_TIME", raising=False)
+
+    wall = resolve_research_wall(
+        {"research_wall_time_s": raw, "wall_deadline_s": 3600},
+        reserve_s=600, label_prefix="t",
+    )
+
+    assert wall.hard_total_s == 3600
+    assert wall.research_deadline_s == 3000
+
+
+def test_research_env_override_does_not_hide_the_profile_ceiling(monkeypatch):
+    monkeypatch.delenv("MIROHARNESS_TASK_WALL_TIME_S", raising=False)
+    monkeypatch.setenv("RESEARCH_WALL_TIME", "300")
+
+    wall = resolve_research_wall(
+        {"wall_deadline_s": 900}, reserve_s=180, label_prefix="t",
+    )
+
+    assert wall.hard_total_s == 900
+    assert wall.research_deadline_s == 300
+
+
 def test_no_ceiling_anywhere(monkeypatch):
     monkeypatch.delenv("MIROHARNESS_TASK_WALL_TIME_S", raising=False)
     wall = resolve_research_wall({}, reserve_s=600, label_prefix="t")

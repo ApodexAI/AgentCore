@@ -4,7 +4,12 @@ Also serves as the back-compat entry point for ``agent_core.components.agent_bus
 (the former flat-file module). Re-exports the public API from submodules.
 """
 
-from agent_core.components.agent_bus.agent_comm import AgentComm, DeliveryMode
+from agent_core.components.agent_bus.agent_comm import (
+    AgentComm,
+    DeliveryMode,
+    EventStoreContractError,
+    event_ordinal,
+)
 from agent_core.components.agent_bus.bus import (
     AgentBus,
     configure_default_event_sink_resolver,
@@ -65,6 +70,7 @@ __all__ = [
     "CompletionPolicy",
     "DeliveryMode",
     "DepthLimitExceeded",
+    "EventStoreContractError",
     "FanInBatch",
     "JobEntry",
     "PendingSessionTask",
@@ -87,6 +93,7 @@ __all__ = [
     "configure_default_event_sink_resolver",
     "configure_default_pause_check_factory",
     "configure_default_session_activity",
+    "event_ordinal",
     "format_report_block",
     "format_status_line",
     "format_status_report_block",

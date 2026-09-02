@@ -562,18 +562,24 @@ class AgentBus:
         agent_registry = self._agent_registry(required=True)
         dispatch_depth = current_depth + 1
 
+        # Resolved before the guard reserves anything: an unregistered role
+        # makes ``get_prompt_for`` raise, and a reservation taken first would
+        # never come back — the RAII release lives in ``_run_and_finalize``,
+        # which does not exist until the asyncio task below is created. A
+        # leaked reservation is permanent, so it decays ``remaining_tokens``
+        # and the concurrency count for the life of the bus.
+        system_prompt = (
+            item.system_prompt
+            or agent_registry.get_prompt_for(item.role_id)
+        )
+        runtime = runtime_spec or SubAgentRuntimeSpec()
+
         # Layer 5+3: SpawnGuard pre-check (depth + budget — non-blocking)
         # Layer 4 (concurrency) is deferred to _run_and_finalize
         if guard:
             await guard.pre_check(
                 job_id, dispatch_depth, estimated_tokens,
             )
-
-        system_prompt = (
-            item.system_prompt
-            or agent_registry.get_prompt_for(item.role_id)
-        )
-        runtime = runtime_spec or SubAgentRuntimeSpec()
 
         async def _run() -> SubAgentResult:
             # Declared outside try/except so exception handlers can
@@ -719,16 +725,27 @@ class AgentBus:
                 if guard:
                     guard.release(job_id)
 
-        task = asyncio.create_task(_run_and_finalize(), name=job_id)
+        # Register the entry before spawning: ``_run_and_finalize`` looks
+        # itself up in ``self._jobs``, and the reservation has no RAII owner
+        # until that task exists — so anything that fails in between has to
+        # hand the reservation back explicitly.
         entry = JobEntry(
             job_id=job_id,
             parent_task_id=parent_task_id,
             item=item,
-            task=task,
+            task=None,
             status="submitted",
             submitted_at=time.monotonic(),
         )
         self._jobs[job_id] = entry
+        try:
+            task = asyncio.create_task(_run_and_finalize(), name=job_id)
+        except BaseException:
+            self._jobs.pop(job_id, None)
+            if guard:
+                guard.release(job_id)
+            raise
+        entry.task = task
 
         event_store = self._event_sink()
         if event_store:
@@ -1138,15 +1155,6 @@ class AgentBus:
         dispatch_depth = 1
 
         job_id = self._next_job_id(session.task_id)
-
-        # Layer 5+3: SpawnGuard pre-check at submit time (not at dispatch)
-        # so queued tasks still raise BudgetExhausted / SpawnDepthExceeded
-        # synchronously at the API boundary — preserves the legacy
-        # behaviour that callers see budget errors immediately rather
-        # than only via ``collect_reports`` after the queue drains.
-        if guard is not None:
-            await guard.pre_check(job_id, dispatch_depth, estimated_tokens)
-
         pending = PendingSessionTask(
             job_id=job_id,
             task_prompt=task_prompt,
@@ -1157,6 +1165,42 @@ class AgentBus:
             spawn_context=dict(spawn_context) if spawn_context else None,
             task_metadata=dict(task_metadata or {}),
         )
+
+        # Layer 5+3: SpawnGuard pre-check at submit time (not at dispatch)
+        # so queued tasks still raise BudgetExhausted / SpawnDepthExceeded
+        # synchronously at the API boundary — preserves the legacy
+        # behaviour that callers see budget errors immediately rather
+        # than only via ``collect_reports`` after the queue drains.
+        if guard is not None:
+            await guard.pre_check(job_id, dispatch_depth, estimated_tokens)
+
+        # Past the pre-check the reservation has no RAII owner yet: it passes
+        # to ``session.pending_tasks`` (released when the queue drains and the
+        # task runs) or to ``_dispatch_session_task`` (which releases on its
+        # own failures). Anything that raises in between must hand it back
+        # here, or it leaks for the life of the bus — permanently shrinking
+        # ``remaining_tokens`` and the concurrency count.
+        try:
+            return await self._queue_or_dispatch_session_task(session, pending)
+        except BaseException:
+            if guard is not None:
+                guard.release(job_id)
+            raise
+
+    async def _queue_or_dispatch_session_task(
+        self,
+        session: SubAgentSession,
+        pending: PendingSessionTask,
+    ) -> str:
+        """Park ``pending`` behind the running task, or dispatch it now.
+
+        Split out of :meth:`submit_task_to_session` so one wrapper there can
+        release the guard reservation on any failure along this path.
+        """
+        job_id = pending.job_id
+        session_id = session.session_id
+        task_prompt = pending.task_prompt
+        task_metadata = pending.task_metadata
 
         # Busy = a current task is in submitted/running state. ``queued``
         # current_job_id can't happen (we only set current_job_id at
@@ -1211,7 +1255,28 @@ class AgentBus:
         ``session_task_submitted`` SSE event. Called from the free
         branch of ``submit_task_to_session`` for fresh tasks and from
         ``_drain_session_queue`` when the previous task finalises.
+
+        Releases the guard reservation on failure. Until ``_run_and_finalize``
+        exists as an asyncio task, no ``finally`` owns that reservation — and
+        this method can raise well before then (``trimmer.trim`` on a
+        pathological history, the ``SubTask`` build, a cancelled dispatch).
+        ``_drain_session_queue`` swallows dispatch failures by design, so
+        without this the queued task's reservation would leak silently.
         """
+        try:
+            await self._dispatch_session_task_inner(session, pending)
+        except BaseException:
+            guard = self._spawn_guard
+            if guard is not None:
+                guard.release(pending.job_id)
+            raise
+
+    async def _dispatch_session_task_inner(
+        self,
+        session: SubAgentSession,
+        pending: PendingSessionTask,
+    ) -> None:
+        """Body of :meth:`_dispatch_session_task`; see its docstring."""
         guard = self._spawn_guard
         job_id = pending.job_id
         task_prompt = pending.task_prompt
@@ -1861,7 +1926,10 @@ class AgentBus:
         # Lazy import: ``agent_comm`` is a sibling module and this keeps the
         # bus importable without it, matching how ``runtime.py`` reaches for
         # the same class.
-        from agent_core.components.agent_bus.agent_comm import AgentComm
+        from agent_core.components.agent_bus.agent_comm import (
+            AgentComm,
+            EventStoreContractError,
+        )
 
         comm = registry.get_optional(AgentComm)
         if comm is None:
@@ -1878,6 +1946,17 @@ class AgentBus:
                     task_id=task_id,
                     message_type=SUBTASK_RESULT_MESSAGE_TYPE,
                 )
+            except EventStoreContractError:
+                # Not a transient read failure: every future read fails the
+                # same way, so durable recovery is off until the store is
+                # fixed. Debug level would hide that permanently.
+                logger.error(
+                    "durable result recovery is unavailable for %s/%s: the "
+                    "configured event store does not stamp a total-order "
+                    "ordinal on appended events",
+                    task_id, agent_id, exc_info=True,
+                )
+                continue
             except Exception:
                 logger.debug(
                     "message reconciliation failed for %s/%s",

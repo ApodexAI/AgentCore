@@ -31,6 +31,14 @@ class KernelEvent(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: EventId = Field(default=EventId(""))
+    # Store-assigned total-order ordinal, stamped by ``append`` when the event
+    # is retained. ``None`` means "not persisted, or the store does not expose
+    # an ordinal" — durable cursors (``AgentComm.consume``) require it, so see
+    # ``agent_core.components.agent_bus.agent_comm.event_ordinal`` for how it
+    # is read and what the accepted fallback is. Deliberately separate from
+    # ``id``: ``EventId`` is an opaque string, and an opaque id cannot order a
+    # cursor.
+    seq: int | None = Field(default=None)
     task_id: TaskId
     session_id: SessionId | None = None
     prompt_id: PromptId | None = None

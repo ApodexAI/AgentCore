@@ -129,63 +129,67 @@ def resolve_research_wall(
 ) -> ResearchWall:
     """Resolve the research deadline from profile budget and platform wall.
 
-    ``research_wall_time_s`` is already a research-only budget and is not
-    shortened. A valid ``RESEARCH_WALL_TIME`` replaces that profile budget.
-    The legacy ``wall_deadline_s`` and the operational task-wall env value are
-    total-task ceilings, so finalize grace is subtracted before comparing them —
-    and they are also what :attr:`ResearchWall.hard_total_s` reports.
+    Three inputs, resolved *independently* — a profile may legitimately carry
+    more than one, and each answers a different question:
+
+    ``research_wall_time_s``
+        already a research-only budget, so it is not shortened by the
+        finalize reserve and is **not** a hard ceiling (the reporter runs
+        outside it deliberately). A valid ``RESEARCH_WALL_TIME`` replaces it.
+
+    ``wall_deadline_s`` / the task-wall env value
+        total-task ceilings. Finalize grace is subtracted before they compete
+        for ``research_deadline_s``, and they are what
+        :attr:`ResearchWall.hard_total_s` reports.
+
+    Selection is by *value validity*, never by key presence: a profile that
+    sets ``research_wall_time_s`` to an empty or non-numeric value still has
+    its ``wall_deadline_s`` ceiling honoured, and a profile that sets both
+    keeps the ceiling enforced instead of letting the research budget hide it.
     """
-    research_budget = "research_wall_time_s" in agent_cfg
-    if research_budget:
-        profile_raw = agent_cfg.get("research_wall_time_s")
-    elif "wall_deadline_s" in agent_cfg:
-        profile_raw = agent_cfg.get("wall_deadline_s")
-    else:
-        profile_raw = None
-    profile_s = positive_seconds(
-        profile_raw,
-        label=f"{label_prefix} research wall deadline",
+    research_s = positive_seconds(
+        agent_cfg.get("research_wall_time_s"),
+        label=f"{label_prefix} research_wall_time_s",
     )
-    research_env_raw = os.environ.get(RESEARCH_WALL_TIME_ENV)
+    profile_total_s = positive_seconds(
+        agent_cfg.get("wall_deadline_s"),
+        label=f"{label_prefix} wall_deadline_s",
+    )
     research_env_s = positive_seconds(
-        research_env_raw,
+        os.environ.get(RESEARCH_WALL_TIME_ENV),
         label=RESEARCH_WALL_TIME_ENV,
     )
     if research_env_s is not None:
         # This env is an explicit phase-budget override, not another ceiling:
         # it may intentionally lengthen as well as shorten the YAML default.
-        profile_s = research_env_s
-        research_budget = True
+        research_s = research_env_s
     resolved_env = env_var
     if env_var == TASK_WALL_TIME_ENV and not os.environ.get(env_var):
         resolved_env = next(
             (name for name in LEGACY_TASK_WALL_TIME_ENVS if os.environ.get(name)),
             env_var,
         )
-    env_s = positive_seconds(os.environ.get(resolved_env), label=resolved_env)
+    env_total_s = positive_seconds(os.environ.get(resolved_env), label=resolved_env)
 
-    profile_deadline_s = profile_s
-    if profile_deadline_s is not None and not research_budget:
-        profile_deadline_s = soft_wall_deadline_s(profile_deadline_s, reserve_s)
-    env_deadline_s = (
-        soft_wall_deadline_s(env_s, reserve_s) if env_s is not None else None
-    )
+    # Only total-task values are hard ceilings; a research-only budget is not
+    # one, because the reporter is deliberately outside it.
+    total_candidates = [
+        value for value in (profile_total_s, env_total_s) if value is not None
+    ]
     candidates = [
         value
-        for value in (profile_deadline_s, env_deadline_s)
-        if value is not None
-    ]
-
-    # Only total-task values are hard ceilings; a research-only profile budget
-    # is not one, because the reporter is deliberately outside it.
-    hard_candidates = [
-        value
-        for value in (None if research_budget else profile_s, env_s)
+        for value in (
+            research_s,
+            *(
+                soft_wall_deadline_s(total_s, reserve_s)
+                for total_s in total_candidates
+            ),
+        )
         if value is not None
     ]
     return ResearchWall(
         research_deadline_s=min(candidates) if candidates else 0.0,
-        hard_total_s=min(hard_candidates) if hard_candidates else 0.0,
+        hard_total_s=min(total_candidates) if total_candidates else 0.0,
     )
 
 
