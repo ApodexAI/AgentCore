@@ -189,6 +189,14 @@ class Scheduler:
         except Exception as e:
             logger.warning("Failed to auto-register agents: %s", e)
 
+    def execute_dynamic_spec(self, spec: Any) -> None:
+        """Register a dynamically generated pipeline specification."""
+        if (
+            self._pipeline_registry
+            and not self._pipeline_registry.has(spec.pipeline_id)
+        ):
+            self._pipeline_registry.register(spec)
+
     async def execute(
         self,
         task_id: TaskId,
@@ -384,6 +392,45 @@ class Scheduler:
             if aclose is not None:
                 await aclose()
 
+    async def get_resume_config(
+        self,
+        task_id: TaskId,
+        *,
+        pipeline_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return the effective checkpoint configuration and state for resume.
+
+        If the latest checkpoint contains an error write, its parent is used so
+        the failed node is retried instead of being treated as terminal.
+        """
+        task = await self._pm.get_task(task_id)
+        resume_config = {"configurable": {"thread_id": task.thread_id}}
+
+        if not self._checkpointer:
+            return resume_config, {}
+
+        latest = await self._checkpointer.aget_tuple(resume_config)
+        if not latest:
+            return resume_config, {}
+
+        effective_config = resume_config
+        pending_writes = latest.pending_writes or []
+        has_error_write = any(
+            len(item) >= 2 and item[1] == "__error__"
+            for item in pending_writes
+        )
+        if has_error_write and latest.parent_config:
+            effective_config = latest.parent_config
+
+        graph = None
+        try:
+            graph = self._get_graph(pipeline_id)
+        except Exception:
+            graph = None
+
+        state = await self._get_state_for_config(graph, effective_config)
+        return effective_config, state
+
     async def get_state(self, task_id: TaskId) -> dict[str, Any]:
         """Get the current state snapshot for a task.
 
@@ -506,3 +553,28 @@ class Scheduler:
             return False
         context = getattr(task, "context", {}) or {}
         return context.get("active_execution_token") != execution_token
+
+    async def get_history(self, task_id: TaskId) -> list[dict[str, Any]]:
+        """Return checkpoint history in a product-neutral representation."""
+        task = await self._pm.get_task(task_id)
+        graph = self._get_graph(getattr(task, "pipeline_id", None))
+        config = {"configurable": {"thread_id": task.thread_id}}
+        history: list[dict[str, Any]] = []
+        async for snapshot in graph.aget_state_history(config):
+            snapshot_values = getattr(snapshot, "values", {}) or {}
+            snapshot_next = getattr(snapshot, "next", ()) or ()
+            snapshot_tasks = getattr(snapshot, "tasks", ()) or ()
+            history.append(
+                {
+                    "values": snapshot_values,
+                    "next": list(snapshot_next),
+                    "tasks": [
+                        {
+                            "name": getattr(item, "name", ""),
+                            "id": getattr(item, "id", ""),
+                        }
+                        for item in snapshot_tasks
+                    ],
+                }
+            )
+        return history

@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from agent_core.components.agent_bus.fan_in import INCOMPLETE_STOP_REASONS
 from agent_core.scheduling.scheduler import (
     Scheduler,
     TaskWallTimeExceeded,
@@ -82,6 +83,17 @@ class _HangingGraph:
         await asyncio.sleep(60)
 
 
+class _PipelineRegistry:
+    def __init__(self) -> None:
+        self.specs: list[Any] = []
+
+    def has(self, pipeline_id: str) -> bool:
+        return any(spec.pipeline_id == pipeline_id for spec in self.specs)
+
+    def register(self, spec: Any) -> None:
+        self.specs.append(spec)
+
+
 def test_wall_time_resolution_supports_portable_and_legacy_env(monkeypatch):
     monkeypatch.setenv("MIROHARNESS_TASK_WALL_TIME_S", "120")
     assert resolve_wall_time_s(None) == 120
@@ -99,6 +111,32 @@ def test_workflow_defaults_are_product_injected(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     clear_workflow_defaults()
+
+
+def test_scheduler_registers_dynamic_specs_once():
+    registry = _PipelineRegistry()
+    scheduler = Scheduler(
+        _ReportGraph(),
+        _ProcessManager(),
+        _EventSink(),
+        pipeline_registry=registry,
+    )
+    spec = SimpleNamespace(pipeline_id="dynamic")
+    scheduler.execute_dynamic_spec(spec)
+    scheduler.execute_dynamic_spec(spec)
+    assert registry.specs == [spec]
+
+
+@pytest.mark.asyncio
+async def test_resume_config_without_checkpointer_uses_task_thread():
+    scheduler = Scheduler(_ReportGraph(), _ProcessManager(), _EventSink())
+    config, state = await scheduler.get_resume_config(TaskId("t"))
+    assert config == {"configurable": {"thread_id": "thread"}}
+    assert state == {}
+
+
+def test_agent_team_thrash_is_an_incomplete_stop_reason():
+    assert "thrash_no_progress" in INCOMPLETE_STOP_REASONS
     register_workflow_defaults(
         ("research", "research-report"),
         {"TASK_WALL_TIME_S": 900, "TASK_WALL_TIME_MODE": "soft_research"},

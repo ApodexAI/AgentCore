@@ -59,6 +59,7 @@ INCOMPLETE_STOP_REASONS: frozenset[str] = frozenset({
     # rather than merely answer-less.
     "response_truncated",
     "exception",
+    "thrash_no_progress",
 })
 
 _INCOMPLETE_NOTES: dict[str, str] = {
@@ -88,6 +89,10 @@ _INCOMPLETE_NOTES: dict[str, str] = {
     ),
     "exception": (
         "agent terminated with an unhandled exception; report is partial"
+    ),
+    "thrash_no_progress": (
+        "coordinator was spinning on sub-agent create/assign without new "
+        "information; stopped and synthesised from collected reports"
     ),
 }
 
