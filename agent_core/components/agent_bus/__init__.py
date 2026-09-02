@@ -5,7 +5,10 @@ Also serves as the back-compat entry point for ``agent_core.components.agent_bus
 """
 
 from agent_core.components.agent_bus.agent_comm import AgentComm, DeliveryMode
-from agent_core.components.agent_bus.bus import AgentBus
+from agent_core.components.agent_bus.bus import (
+    AgentBus,
+    configure_default_pause_check_factory,
+)
 from agent_core.components.agent_bus.fan_in import (
     COMPLETE_STOP_REASONS,
     INCOMPLETE_STOP_REASONS,
@@ -79,6 +82,7 @@ __all__ = [
     "build_session_loop_config",
     "classify_completion",
     "close_session_boundary_aborted",
+    "configure_default_pause_check_factory",
     "format_report_block",
     "format_status_line",
     "format_status_report_block",

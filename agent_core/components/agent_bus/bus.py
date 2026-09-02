@@ -107,6 +107,15 @@ logger = logging.getLogger(__name__)
 
 PauseCheckFn = Callable[[], Awaitable[bool]]
 PauseCheckFactory = Callable[[str], PauseCheckFn | None]
+_default_pause_check_factory: PauseCheckFactory | None = None
+
+
+def configure_default_pause_check_factory(
+    factory: PauseCheckFactory | None,
+) -> None:
+    """Configure the host pause integration used by zero-argument buses."""
+    global _default_pause_check_factory
+    _default_pause_check_factory = factory
 
 
 def _with_wall_clock_guard(
@@ -156,8 +165,9 @@ def _strip_job_suffix(task_id: str) -> str:
 
 def _legacy_pause_check_factory(task_id: str) -> PauseCheckFn | None:
     """Product-neutral default: no process-manager pause integration."""
-    del task_id
-    return None
+    if _default_pause_check_factory is None:
+        return None
+    return _default_pause_check_factory(task_id)
 
 
 def _safe_session_filename(session_id: str) -> str:
@@ -415,8 +425,16 @@ class AgentBus:
             return self._resource_manager_injected
         from agent_core.runtime.resources.manager import ResourceManager
         if required:
-            return registry.get(ResourceManager)
-        return registry.get_optional(ResourceManager)
+            direct = registry.get_optional(ResourceManager)
+            if direct is not None:
+                return direct
+            legacy = registry.get_optional_by_type_name("ResourceManager")
+            if legacy is None:
+                return registry.get(ResourceManager)
+            return legacy
+        return registry.get_optional(ResourceManager) or registry.get_optional_by_type_name(
+            "ResourceManager"
+        )
 
     def _task_pause_check_or_none(self, task_id: str | None) -> PauseCheckFn | None:
         """Resolve a per-task pause check closure.
