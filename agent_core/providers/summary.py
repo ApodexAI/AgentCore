@@ -87,7 +87,10 @@ def build_summary_payload(model: str, prompt: str) -> dict[str, Any]:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 1.0,
     }
-    if any(key in lowered for key in ("qwen", "apodex", "sglang", "397b")):
+    if any(
+        key in lowered
+        for key in ("qwen", "apodex", "mirothinker", "sglang", "397b")
+    ):
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     return payload
 
