@@ -14,7 +14,9 @@ from agent_core.components.agent_bus.bus import (
     AgentBus,
     configure_default_event_sink_resolver,
     configure_default_pause_check_factory,
+    configure_default_runtime_hooks,
     configure_default_session_activity,
+    configure_default_tool_call_parser,
 )
 from agent_core.components.agent_bus.fan_in import (
     COMPLETE_STOP_REASONS,
@@ -92,7 +94,9 @@ __all__ = [
     "close_session_boundary_aborted",
     "configure_default_event_sink_resolver",
     "configure_default_pause_check_factory",
+    "configure_default_runtime_hooks",
     "configure_default_session_activity",
+    "configure_default_tool_call_parser",
     "event_ordinal",
     "format_report_block",
     "format_status_line",

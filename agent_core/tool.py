@@ -54,8 +54,6 @@ _PRIMITIVE_TYPES: dict[Any, str] = {
 
 def _schema_for_type(t: Any) -> dict[str, Any]:
     """Build a JSON-schema fragment for a Python type hint."""
-    if t is Any:
-        return {}
     if t in _PRIMITIVE_TYPES:
         return {"type": _PRIMITIVE_TYPES[t]}
 
@@ -72,7 +70,13 @@ def _schema_for_type(t: Any) -> dict[str, Any]:
 
     origin = get_origin(t)
     if origin is None:
-        # Unannotated / unknown — accept anything.
+        # Unannotated / unknown, ``Any`` included. Deliberately a concrete
+        # ``string`` rather than the permissive ``{}`` a bare ``Any`` would
+        # suggest: strict function-schema validators (Gemini-compatible
+        # gateways among them) reject a property with no ``type`` outright, so
+        # emitting ``{}`` turns an under-annotated tool into a hard 400 on
+        # those providers. A tool that means "object" should say
+        # ``dict[str, Any]`` and get ``{"type": "object"}``.
         return {"type": "string"}
 
     if origin in (list, set, tuple):
