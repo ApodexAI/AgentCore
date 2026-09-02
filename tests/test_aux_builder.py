@@ -79,3 +79,59 @@ def test_native_anthropic_rejects_non_claude_model() -> None:
     )
     with pytest.raises(ValueError, match="requires a Claude model"):
         factory.build({"provider": "anthropic", "model": "qwen"})
+
+
+def test_explicit_enable_thinking_false_is_emitted() -> None:
+    """Qwen3/SGLang default thinking on: disabling it must send the key."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+    factory = AuxLLMFactory(
+        openai_factory=_capture("openai", calls),
+        anthropic_factory=_capture("anthropic", calls),
+        provider_type=lambda _provider: "openai_compat",
+    )
+    client = factory.build({
+        "provider": "gateway",
+        "model": "qwen3",
+        "api_key": "key",
+        "enable_thinking": False,
+        # A budget without an enable flag must not leak through.
+        "thinking_budget": 512,
+    })
+    template = client["extra_body"]["chat_template_kwargs"]
+    assert template == {"enable_thinking": False}
+
+
+def test_absent_enable_thinking_leaves_the_key_unset() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    factory = AuxLLMFactory(
+        openai_factory=_capture("openai", calls),
+        anthropic_factory=_capture("anthropic", calls),
+        provider_type=lambda _provider: "openai_compat",
+    )
+    client = factory.build({
+        "provider": "gateway",
+        "model": "qwen3",
+        "api_key": "key",
+        "thinking_budget": 512,
+    })
+    template = client["extra_body"]["chat_template_kwargs"]
+    assert "enable_thinking" not in template
+    assert template["thinking_budget"] == 512
+
+
+def test_numeric_string_thinking_budget_is_coerced() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    factory = AuxLLMFactory(
+        openai_factory=_capture("openai", calls),
+        anthropic_factory=_capture("anthropic", calls),
+        provider_type=lambda _provider: "openai_compat",
+    )
+    client = factory.build({
+        "provider": "gateway",
+        "model": "qwen3",
+        "api_key": "key",
+        "enable_thinking": True,
+        "thinking": {"budget_tokens": "1024"},
+    })
+    template = client["extra_body"]["chat_template_kwargs"]
+    assert template["thinking_budget"] == 1024

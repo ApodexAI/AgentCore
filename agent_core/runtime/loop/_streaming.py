@@ -171,6 +171,14 @@ class _ThinkTagSplitter:
         return (remainder, "")
 
 
+def _has_text_block(blocks: list[dict[str, Any]]) -> bool:
+    """True when a streamed block list carries usable visible text."""
+    return any(
+        block.get("type") == "text" and str(block.get("text") or "").strip()
+        for block in blocks
+    )
+
+
 async def _stream_llm_response(
     llm: Any,
     messages: list[Message],
@@ -320,6 +328,28 @@ async def _stream_llm_response(
         # lstrip/think-tag normalisation above is deliberately NOT applied to
         # them — replay requires the bytes Anthropic signed, unmodified.
         assembled_content: Any = final_reasoning_blocks or visible_content
+        # ...unless the blocks turn out NOT to hold that text. A text block is
+        # only recorded when a ``content_block_start`` of type ``text`` is seen
+        # (see ``AnthropicClient.stream``); a ``text_delta`` for an index that
+        # never opened reaches ``accumulated`` but no block. A gateway that
+        # omits or renames that event while thinking blocks arrive normally
+        # would then hand back thinking-only blocks and silently drop the
+        # model's answer. Append it as a text block instead: thinking
+        # signatures stay byte-exact, and text blocks carry no signature.
+        if (
+            final_reasoning_blocks
+            and visible_content.strip()
+            and not _has_text_block(final_reasoning_blocks)
+        ):
+            logger.warning(
+                "streamed block list carried no text block but %d chars of "
+                "visible content arrived; appending it to preserve the answer",
+                len(visible_content),
+            )
+            assembled_content = [
+                *final_reasoning_blocks,
+                {"type": "text", "text": visible_content},
+            ]
         return LLMResponse(
             content=assembled_content,
             tool_calls=complete_tool_calls,

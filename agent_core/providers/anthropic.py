@@ -29,6 +29,7 @@ from typing import Any
 
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
+from agent_core.providers.finish_reason import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +298,9 @@ class AnthropicClient(LLMClient):
                 cache_write,
                 reasoning_tokens,
             ),
-            finish_reason=stop_reason,
+            # ``max_tokens`` must reach the runaway/truncation checks as
+            # ``length``; other stop reasons pass through untouched.
+            finish_reason=normalize_finish_reason(stop_reason),
             model=model,
             reasoning_blocks=ordered if _has_thinking(ordered) else [],
         )
@@ -711,7 +714,7 @@ def _to_llm_response(raw: Any) -> LLMResponse:
         content=content,
         tool_calls=tool_calls,
         reasoning_content="\n".join(thinking_parts),
-        finish_reason=getattr(raw, "stop_reason", "") or "",
+        finish_reason=normalize_finish_reason(getattr(raw, "stop_reason", "")),
         model=getattr(raw, "model", "") or "",
         usage=usage_dict,
         response_metadata={"id": getattr(raw, "id", "")},

@@ -56,7 +56,9 @@ async def test_cooldown_fallback_retries_then_skips_primary() -> None:
     assert (await llm.chat([user_msg("two")])).content == "ok"
     assert primary.calls == 1
     assert fallback.calls == 2
-    assert sleeps == [0.5]
+    # max_retries=1 means a single attempt: no backoff sleep, since no retry
+    # follows it. See test_no_backoff_sleep_after_the_final_attempt.
+    assert sleeps == []
 
 
 @pytest.mark.asyncio
@@ -87,3 +89,111 @@ def test_legacy_retryable_contract() -> None:
     assert legacy_retryable(TimeoutError("timed out"))
     assert legacy_retryable(AttributeError("model_dump"))
     assert not legacy_retryable(ValueError("invalid json"))
+
+
+@pytest.mark.asyncio
+async def test_no_backoff_sleep_after_the_final_attempt() -> None:
+    """The last attempt must not sleep — no retry follows it."""
+    primary = ScriptedLLM("primary", [TimeoutError("timeout")])
+    fallback = ScriptedLLM("fallback", [LLMResponse(content="ok")])
+    sleeps: list[float] = []
+    events: list[str] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def hook(name: str, _payload: dict[str, object]) -> None:
+        events.append(name)
+
+    llm = CooldownFallbackLLM(
+        primary,
+        fallback,
+        max_retries=1,
+        cooldown_seconds=60,
+        clock=lambda: 0.0,
+        sleep=sleep,
+        jitter=lambda: 0.0,
+        event_hook=hook,
+    )
+    assert (await llm.chat([user_msg("one")])).content == "ok"
+    assert sleeps == []
+    assert "retry" not in events
+
+    # Two attempts sleep exactly once, between them.
+    primary2 = ScriptedLLM(
+        "primary",
+        [TimeoutError("timeout"), TimeoutError("timeout")],
+    )
+    sleeps.clear()
+    llm2 = CooldownFallbackLLM(
+        primary2,
+        ScriptedLLM("fallback", [LLMResponse(content="ok")]),
+        max_retries=2,
+        clock=lambda: 0.0,
+        sleep=sleep,
+        jitter=lambda: 0.0,
+    )
+    assert (await llm2.chat([user_msg("two")])).content == "ok"
+    assert sleeps == [0.5]
+    assert primary2.calls == 2
+
+
+class PartialStream:
+    model = "primary"
+
+    def __init__(self) -> None:
+        self.starts = 0
+
+    async def stream(
+        self,
+        _messages: list[Message],
+        **_kwargs: object,
+    ) -> AsyncIterator[StreamDelta]:
+        self.starts += 1
+        yield StreamDelta(content="part1 ")
+        yield StreamDelta(content="part2 ")
+        raise TimeoutError("timeout mid-stream")
+
+
+class OkStream:
+    model = "fallback"
+
+    async def stream(
+        self,
+        _messages: list[Message],
+        **_kwargs: object,
+    ) -> AsyncIterator[StreamDelta]:
+        yield StreamDelta(content="FALLBACK")
+
+
+@pytest.mark.asyncio
+async def test_stream_does_not_replay_already_yielded_deltas() -> None:
+    primary = PartialStream()
+    llm = CooldownFallbackLLM(
+        primary,
+        OkStream(),
+        max_retries=3,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+    )
+    seen = [delta.content async for delta in llm.stream([user_msg("x")])]
+    assert seen == ["part1 ", "part2 ", "FALLBACK"]
+    assert primary.starts == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_is_opt_in() -> None:
+    primary = PartialStream()
+    llm = CooldownFallbackLLM(
+        primary,
+        OkStream(),
+        max_retries=2,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+        replay_partial_stream=True,
+    )
+    seen = [delta.content async for delta in llm.stream([user_msg("x")])]
+    assert seen == ["part1 ", "part2 ", "part1 ", "part2 ", "FALLBACK"]
+    assert primary.starts == 2

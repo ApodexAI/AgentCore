@@ -88,3 +88,24 @@ def test_llm_recorder_failure_is_suppressed() -> None:
         raise RuntimeError("accounting unavailable")
 
     ExternalAPIMeter(llm_recorder=fail).record_llm_usage(model="m")
+
+
+def test_wire_counters_serialize_as_integers() -> None:
+    """A billing/JSON payload should not carry ``requests: 3.0``."""
+    meter = ExternalAPIMeter()
+    meter.record_api_request("serper", requests=3, cache_hits=1)
+    meter.set_gauge("sandbox", "peak_mb", 512)
+    snapshot = meter.snapshot()
+    serper = snapshot["external_apis"]["serper"]
+    assert serper["requests"] == 3
+    assert all(
+        isinstance(serper[field], int)
+        for field in ("requests", "cache_hits", "retries", "errors")
+    )
+    # Gauge-only providers keep the same integral base shape.
+    sandbox = snapshot["external_apis"]["sandbox"]
+    assert isinstance(sandbox["requests"], int)
+    assert sandbox["peak_mb"] == 512.0
+    # Duration-style extras stay fractional.
+    meter.record_api_request("serper", latency_s=1.234)
+    assert meter.snapshot()["external_apis"]["serper"]["latency_s"] == 1.23

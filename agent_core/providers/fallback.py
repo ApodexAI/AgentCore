@@ -70,6 +70,7 @@ __all__ = [
     "FallbackEntry",
     "FallbackTrigger",
     "LLMFallbackChain",
+    "legacy_retryable",
     "with_provider_stamp",
 ]
 
@@ -200,6 +201,11 @@ class CooldownFallbackLLM:
     This preserves the legacy two-model fallback behavior used by both host
     products. Product tracing is an optional async event hook, keeping the
     retry state machine independent of execution scopes and trace backends.
+
+    ``stream`` stops retrying the primary once any delta has reached the
+    consumer, because a retry would emit those deltas twice. Set
+    ``replay_partial_stream=True`` to restore the historical duplicating
+    behavior; prefer :class:`LLMFallbackChain` for rewind-safe semantics.
     """
 
     def __init__(
@@ -214,6 +220,7 @@ class CooldownFallbackLLM:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = random.random,
+        replay_partial_stream: bool = False,
     ) -> None:
         self.primary = primary
         self.fallback = fallback
@@ -225,6 +232,7 @@ class CooldownFallbackLLM:
         self._clock = clock
         self._sleep = sleep
         self._jitter = jitter
+        self._replay_partial_stream = replay_partial_stream
         self._cooldown_until = 0.0
 
     @property
@@ -295,6 +303,10 @@ class CooldownFallbackLLM:
                 )
                 if not self._retryable(error):
                     break
+                if attempt + 1 >= self.max_retries:
+                    # Last attempt: sleeping here only delays the degrade and
+                    # emits a ``retry`` event that no retry follows.
+                    break
                 delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
                 await self._emit("retry", attempt=attempt + 1, delay_s=delay)
                 await self._sleep(delay)
@@ -361,10 +373,19 @@ class CooldownFallbackLLM:
                     streaming=True,
                     error=str(error),
                 )
-                # The historical wrapper retried even after yielding. Preserve
-                # that behavior here; callers choosing rewind-safe semantics
-                # should use LLMFallbackChain instead.
                 if not self._retryable(error):
+                    break
+                if yielded and not self._replay_partial_stream:
+                    # Deltas already reached the consumer; retrying the primary
+                    # would duplicate them. Degrade to the fallback leg instead.
+                    await self._emit(
+                        "abandon_stream_retry",
+                        attempt=attempt + 1,
+                        streaming=True,
+                        yielded=True,
+                    )
+                    break
+                if attempt + 1 >= self.max_retries:
                     break
                 delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
                 await self._emit(

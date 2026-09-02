@@ -48,6 +48,22 @@ DEFAULT_TYPE_COERCIONS: dict[str, dict[str, type[Any]]] = {
     "grep_search": {"context_lines": int, "max_results": int},
 }
 
+# Argument names whose value is literal file/document content. Leading indent
+# and trailing newlines are semantically significant for exact-match editors,
+# so these are never whitespace-stripped. Keys are matched across every tool
+# because host tool catalogs reuse the same names.
+LITERAL_CONTENT_KEYS: frozenset[str] = frozenset({
+    "content",
+    "file_text",
+    "new_str",
+    "new_string",
+    "old_str",
+    "old_string",
+    "patch",
+    "replacement",
+    "text",
+})
+
 
 def repair_truncated_json(raw: str) -> str | None:
     """Close simple truncated strings/brackets and return valid JSON text."""
@@ -128,9 +144,21 @@ class ToolCallRepairMiddleware(ExecutionMiddleware):
         key_aliases: Mapping[str, Mapping[str, str]] | None = None,
         type_coercions: Mapping[str, Mapping[str, type[Any]]] | None = None,
         tool_repair: ToolRepair = _default_tool_repair,
+        literal_content_keys: frozenset[str] | None = None,
     ) -> None:
-        self._key_aliases = key_aliases or DEFAULT_KEY_ALIASES
-        self._type_coercions = type_coercions or DEFAULT_TYPE_COERCIONS
+        # ``is None`` rather than falsiness: an empty mapping is a host
+        # explicitly disabling the default table, not a request for it.
+        self._key_aliases = (
+            DEFAULT_KEY_ALIASES if key_aliases is None else key_aliases
+        )
+        self._type_coercions = (
+            DEFAULT_TYPE_COERCIONS if type_coercions is None else type_coercions
+        )
+        self._literal_content_keys = (
+            LITERAL_CONTENT_KEYS
+            if literal_content_keys is None
+            else literal_content_keys
+        )
         self._tool_repair = tool_repair
         self._stats = {
             "key_renames": 0,
@@ -158,6 +186,8 @@ class ToolCallRepairMiddleware(ExecutionMiddleware):
                 except (TypeError, ValueError):
                     pass
         for key, value in args.items():
+            if key in self._literal_content_keys:
+                continue
             if isinstance(value, str) and value != value.strip():
                 args[key] = value.strip()
                 self._stats["whitespace_strips"] += 1
@@ -168,6 +198,7 @@ class ToolCallRepairMiddleware(ExecutionMiddleware):
 __all__ = [
     "DEFAULT_KEY_ALIASES",
     "DEFAULT_TYPE_COERCIONS",
+    "LITERAL_CONTENT_KEYS",
     "ToolCallRepairMiddleware",
     "repair_truncated_json",
 ]

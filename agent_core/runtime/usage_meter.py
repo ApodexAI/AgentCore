@@ -22,6 +22,18 @@ _BASE_FIELDS: tuple[str, ...] = (
 )
 
 
+def _empty_slot() -> dict[str, Any]:
+    """A provider view for gauge/span-only providers: counts stay integral."""
+    return dict.fromkeys(_BASE_FIELDS, 0)
+
+
+def _render(field: str, value: float) -> Any:
+    """Report the four wire counters as ints; durations keep 2 decimals."""
+    if field in _BASE_FIELDS:
+        return int(value)
+    return round(value, 2)
+
+
 class ExternalAPIMeter:
     """Accumulate external request, tool-call, gauge, and span measurements."""
 
@@ -98,27 +110,18 @@ class ExternalAPIMeter:
         with self._lock:
             now = time.monotonic()
             apis: dict[str, dict[str, Any]] = {
-                provider: {
-                    key: round(value, 2) if isinstance(value, float) else value
-                    for key, value in slot.items()
-                }
+                provider: {key: _render(key, value) for key, value in slot.items()}
                 for provider, slot in self._providers.items()
             }
             for (provider, _key), (started, field) in self._open_spans.items():
-                view = apis.setdefault(
-                    provider,
-                    dict.fromkeys(_BASE_FIELDS, 0.0),
-                )
+                view = apis.setdefault(provider, _empty_slot())
                 view[field] = round(
                     float(view.get(field, 0.0)) + now - started,
                     2,
                 )
                 view["spans_open"] = int(view.get("spans_open", 0)) + 1
             for (provider, field), value in self._gauges.items():
-                view = apis.setdefault(
-                    provider,
-                    dict.fromkeys(_BASE_FIELDS, 0.0),
-                )
+                view = apis.setdefault(provider, _empty_slot())
                 view[field] = round(value, 2)
             return {
                 "external_apis": apis,

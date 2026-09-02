@@ -5,7 +5,7 @@ from __future__ import annotations
 # pyright: basic
 import logging
 from collections.abc import Callable, Mapping
-from typing import Any, cast
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,15 @@ def _resolve_api_key(section: Mapping[str, Any], provider: str) -> str:
             model or "<unknown>",
         )
     return "dummy"
+
+
+def _as_int(value: object) -> int:
+    """Coerce a profile-supplied budget, tolerating numeric strings."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    return int(float(str(value).strip().replace("_", "")))
 
 
 def _thinking_budget(section: Mapping[str, Any]) -> object | None:
@@ -164,12 +173,18 @@ class AuxLLMFactory:
         extra_body = dict(extra_body_value) if isinstance(extra_body_value, Mapping) else {}
         template_value = extra_body.get("chat_template_kwargs")
         template = dict(template_value) if isinstance(template_value, Mapping) else {}
-        if section.get("enable_thinking"):
-            template["enable_thinking"] = True
-            template.setdefault("preserve_thinking", False)
-        budget = _thinking_budget(section)
-        if budget is not None:
-            template["thinking_budget"] = int(cast("Any", budget))
+        # Distinguish "absent" from an explicit false: models such as Qwen3 and
+        # SGLang default thinking on, so a profile disabling it must emit the
+        # key rather than fall through silently.
+        enable_thinking = section.get("enable_thinking")
+        if enable_thinking is not None:
+            template["enable_thinking"] = bool(enable_thinking)
+            if enable_thinking:
+                template.setdefault("preserve_thinking", False)
+        if enable_thinking is None or enable_thinking:
+            budget = _thinking_budget(section)
+            if budget is not None:
+                template["thinking_budget"] = _as_int(budget)
         if template:
             extra_body["chat_template_kwargs"] = template
         if extra_body:

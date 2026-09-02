@@ -33,12 +33,22 @@ DEFAULT_DUPLICATE_THRESHOLDS: dict[str, int] = {
 
 
 def _args_fingerprint(tool_name: str, args: Mapping[str, Any]) -> str:
-    raw = json.dumps({"t": tool_name, "a": args}, sort_keys=True)
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+    # ``default=str`` keeps a non-JSON argument (set, dataclass, Path) from
+    # turning a guardrail check into an unhandled TypeError mid tool call.
+    raw = json.dumps({"t": tool_name, "a": args}, sort_keys=True, default=str)
+    # Fingerprinting only; ``usedforsecurity=False`` keeps this importable on
+    # FIPS-enabled builds where plain md5 is unavailable.
+    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 class GuardrailsMiddleware(ExecutionMiddleware):
-    """Block pathological repetition while allowing hosts to tune tool policy."""
+    """Block pathological repetition while allowing hosts to tune tool policy.
+
+    This middleware only *marks* a call via :meth:`ToolCallContext.block`.
+    The host dispatcher must honour ``ctx.is_blocked`` after the middleware
+    chain and feed ``ctx.block_reason`` back to the model instead of executing
+    the tool; otherwise the guardrail is inert.
+    """
 
     def __init__(
         self,
@@ -106,11 +116,10 @@ class GuardrailsMiddleware(ExecutionMiddleware):
         )
         if consecutive >= threshold:
             self._stats["duplicate_blocks"] += 1
-            ctx.metadata["blocked"] = True
-            ctx.metadata["block_reason"] = (
+            ctx.block(
                 f"Blocked: {tool_name} called {consecutive + 1} times "
                 "consecutively with identical arguments. Try different "
-                "parameters or a different approach."
+                "parameters or a different approach.",
             )
             return ctx
         recent.append(fingerprint)
@@ -131,11 +140,10 @@ class GuardrailsMiddleware(ExecutionMiddleware):
         hint_count = self._loop_hint_counts.get(task_id, 0)
         if hint_count >= self._max_loop_hints and fingerprint in list(recent)[:-1]:
             self._stats["loop_escalation_blocks"] += 1
-            ctx.metadata["blocked"] = True
-            ctx.metadata["block_reason"] = (
+            ctx.block(
                 "Blocked: repeated tool call pattern detected after "
                 f"{hint_count} loop warnings. Try a completely different "
-                "approach or conclude with available evidence."
+                "approach or conclude with available evidence.",
             )
         return ctx
 
@@ -144,6 +152,25 @@ class GuardrailsMiddleware(ExecutionMiddleware):
         self._search_counts.pop(task_id, None)
         self._search_warned.discard(task_id)
         self._loop_hint_counts.pop(task_id, None)
+
+
+DEFAULT_MAX_TOKENS = 500_000
+
+
+def _as_int(value: object, default: int) -> int:
+    """Coerce untyped product config, falling back instead of raising."""
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip().replace("_", "")))
+        except ValueError:
+            return default
+    return default
 
 
 def check_budget_exhausted(
@@ -171,9 +198,13 @@ def check_budget_exhausted(
         else budget
     )
     if token_usage:
-        maximum_value: object = allocated.get("max_tokens", 500_000)
-        maximum = int(maximum_value) if isinstance(maximum_value, int | str) else 500_000
-        used = token_usage.get("total", 0)
+        maximum = _as_int(allocated.get("max_tokens"), DEFAULT_MAX_TOKENS)
+        # Providers and ``UsageMetadata`` emit ``total_tokens``; ``total`` is
+        # accepted for host mappings that use the shorter name.
+        used = _as_int(
+            token_usage.get("total_tokens", token_usage.get("total")),
+            0,
+        )
         if used >= maximum:
             return (
                 f"Token budget exhausted ({used:,}/{maximum:,}). "
@@ -184,6 +215,7 @@ def check_budget_exhausted(
 
 __all__ = [
     "DEFAULT_DUPLICATE_THRESHOLDS",
+    "DEFAULT_MAX_TOKENS",
     "GuardrailsMiddleware",
     "check_budget_exhausted",
 ]

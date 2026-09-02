@@ -23,6 +23,19 @@ class SummaryCandidate(TypedDict):
 
 
 type UsageRecorder = Callable[..., None]
+type RetryPredicate = Callable[[Exception], bool]
+
+# 4xx statuses that never succeed on retry. 408/409/425/429 are excluded
+# because those are explicitly transient.
+PERMANENT_STATUS_CODES: frozenset[int] = frozenset({
+    400, 401, 402, 403, 404, 405, 406, 410, 413, 414, 415, 422, 501,
+})
+
+
+def default_summary_retryable(error: Exception) -> bool:
+    """Retry transport faults and 5xx, but not permanent request errors."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return not (isinstance(status, int) and status in PERMANENT_STATUS_CODES)
 
 EXTRACT_INFO_PROMPT = """You are given a piece of content and the requirement of information to extract. Your task is to extract the information specifically requested. Be precise and focus exclusively on the requested information.
 
@@ -113,6 +126,7 @@ class SummaryLLMEngine:
         fallback_limit: int = 20_000,
         usage_recorder: UsageRecorder | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        retryable: RetryPredicate = default_summary_retryable,
     ) -> None:
         self.max_retries = max_retries
         self.truncate_step = truncate_step
@@ -120,6 +134,7 @@ class SummaryLLMEngine:
         self.fallback_limit = fallback_limit
         self.usage_recorder = usage_recorder
         self.sleep = sleep
+        self.retryable = retryable
 
     async def summarize(
         self,
@@ -178,7 +193,10 @@ class SummaryLLMEngine:
                     or "longer than the model's context length" in body
                 ):
                     remove = self.truncate_step * (attempt + 1)
-                    if remove >= len(current_content):
+                    # ``remove`` indexes into the original ``content``, so the
+                    # exhaustion test must measure ``content`` too; comparing
+                    # against the already-shortened text bails a step early.
+                    if remove >= len(content):
                         return ""
                     current_content = content[:-remove] + "[...truncated]"
                     payload["messages"][0]["content"] = EXTRACT_INFO_PROMPT.format(
@@ -204,6 +222,12 @@ class SummaryLLMEngine:
                 return ""
             except Exception as error:
                 logger.warning("Summary LLM attempt %d failed: %s", attempt + 1, error)
+                if not self.retryable(error):
+                    logger.warning(
+                        "Summary candidate %d failed permanently; not retrying",
+                        candidate_index + 1,
+                    )
+                    return ""
                 if attempt + 1 < self.max_retries:
                     await self.sleep(float(attempt + 1))
         return ""
@@ -227,9 +251,11 @@ class SummaryLLMEngine:
 
 __all__ = [
     "EXTRACT_INFO_PROMPT",
+    "PERMANENT_STATUS_CODES",
     "SummaryCandidate",
     "SummaryLLMEngine",
     "build_summary_payload",
+    "default_summary_retryable",
     "describe_summary_candidates",
     "normalize_summary_endpoint",
     "truncate_summary_fallback",
