@@ -11,9 +11,16 @@ all host products:
   non-blocking diagnostic streams.
 
 Hosts continue to own provider catalogs, credentials, endpoint selection,
-deployment-specific headers, billing meters, traces, and UI-facing provider
+deployment-specific headers, billing policy/sinks, traces, and UI-facing provider
 metadata. Session affinity is supplied to `OpenAIClient` through a
 `SessionQueryResolver`; AgentCore never interprets a host header by itself.
+
+AgentCore additionally owns the product-neutral mechanics for profile-defined
+auxiliary clients, raw-HTTP summary execution, cooldown fallback, and task-local
+usage accumulation. Hosts inject provider-type lookup, concrete constructors,
+session headers, decorators, candidate configuration, and billing/trace sinks.
+The shared meter records quantities only; it does not assign prices or decide
+which events are billable.
 
 The SDK response boundary is intentionally dynamic. Third-party OpenAI and
 Anthropic response classes vary by SDK and compatible gateway, so those files
