@@ -1650,25 +1650,34 @@ class AgentBus:
         # reconciliation read stays a cursor consume rather than a log scan.
         self._note_result_recipient(session.task_id, pending.spawn_context)
 
-        await _emit_session_task_submitted(
-            session, job_id, task_prompt,
-            event_sink=self._event_sink(),
-        )
+        try:
+            await _emit_session_task_submitted(
+                session, job_id, task_prompt,
+                event_sink=self._event_sink(),
+            )
 
-        # Dispatch is fire-and-return: a host tool such as ``assign_task``
-        # hands back a job id and its invocation scope closes. Nothing above
-        # is guaranteed to suspend — ``_emit_session_task_submitted`` returns
-        # without awaiting when no sink is installed, and a sink whose
-        # ``append`` never awaits does not yield either — so without this the
-        # task can still be unstarted when the caller moves on. Until
-        # ``_run_and_finalize`` begins, neither the ``finally`` that returns
-        # the guard reservation nor the handler that turns a cancellation into
-        # a real ``SubAgentResult`` exists yet, so a cancel landing in that
-        # window kills the job outright and the caller gets the synthetic
-        # "cancelled before publishing a report" instead of the partial result
-        # the sub-agent actually had. One yield establishes the task; every
-        # cancel after it lands inside the job wrapper.
-        await asyncio.sleep(0)
+            # Dispatch is fire-and-return: a host tool such as ``assign_task``
+            # hands back a job id and its invocation scope closes. Nothing
+            # above is guaranteed to suspend — the event helper returns
+            # without awaiting when no sink is installed, and a sink whose
+            # ``append`` never awaits does not yield either — so explicitly
+            # give the child task one turn before returning its id.
+            await asyncio.sleep(0)
+        except BaseException:
+            # Ownership has already transferred to ``task``. If dispatch is
+            # cancelled or event publication fails now, the caller never gets
+            # the job id, so leaving the child alive would create an
+            # unreachable sub-agent. It would also let the outer failure path
+            # release a SpawnGuard reservation while the child still runs.
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            if entry.status not in ("completed", "failed", "aborted"):
+                _close_session_boundary_aborted(session)
+                self._mark_job_aborted(job_id, entry)
+            if session.current_job_id == job_id:
+                session.current_job_id = None
+            raise
 
     async def _eager_trim_and_offload(self, session: SubAgentSession) -> None:
         """Compress completed boundaries immediately after a task finishes.

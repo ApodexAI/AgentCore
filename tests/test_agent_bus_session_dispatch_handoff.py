@@ -24,7 +24,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_core.components.agent_bus import AgentBus
+from agent_core.components.agent_bus.spawn_guard import SpawnGuard
 from agent_core.models.agent_definition import AgentDefinition
+from agent_core.models.task_budget import TaskBudget
 from agent_core.runtime.registries import services as registry
 from agent_core.runtime.registries.agents import AgentRegistry
 from agent_core.runtime.resources.manager import ResourceManager
@@ -87,6 +89,52 @@ async def test_dispatch_leaves_the_job_running_not_merely_submitted(monkeypatch)
 
     assert bus.get_job_status(job_id) == "running"
     assert entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_does_not_leave_an_unreachable_running_job(
+    monkeypatch,
+):
+    """Cancellation after task creation must tear the child back down.
+
+    The explicit dispatch yield is a cancellation point after the child has
+    been registered but before its id is returned. If the submitting task is
+    cancelled there, the child must not keep running without a caller-visible
+    handle or consume a guard slot whose reservation was already released.
+    """
+    submit_holder: dict[str, asyncio.Task[str]] = {}
+
+    async def loop(**kwargs):
+        submit_holder["task"].cancel()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(
+        "agent_core.components.agent_bus.bus.run_agent_loop", loop,
+    )
+    _register_researcher()
+    bus = AgentBus()
+    guard = SpawnGuard(TaskBudget(
+        max_parallel=2, max_depth=4, max_tokens=30_000,
+    ))
+    bus.set_spawn_guard(guard)
+    session_id = await _session(bus)
+
+    submit_task = asyncio.create_task(
+        bus.submit_task_to_session(
+            session_id, "q", estimated_tokens=10_000,
+        ),
+    )
+    submit_holder["task"] = submit_task
+
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    entry = next(iter(bus._jobs.values()))
+    assert entry.status == "aborted"
+    assert entry.task is not None and entry.task.done()
+    assert bus.get_session(session_id).current_job_id is None
+    assert guard.active_count == 0
+    assert guard.tokens_reserved == 0
 
 
 @pytest.mark.asyncio
