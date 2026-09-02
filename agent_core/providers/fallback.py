@@ -206,6 +206,26 @@ class CooldownFallbackLLM:
     consumer, because a retry would emit those deltas twice. Set
     ``replay_partial_stream=True`` to restore the historical duplicating
     behavior; prefer :class:`LLMFallbackChain` for rewind-safe semantics.
+
+    Event hook contract
+    -------------------
+    Every event payload carries ``leg`` — ``"primary"`` or ``"fallback"`` —
+    naming the client the event is *about*, so a tracing adapter never has to
+    infer it. ``retry`` and ``abandon_stream_retry`` are primary-leg events:
+    they describe what happened to the primary, not the leg that serves next.
+
+    Events emitted:
+
+    - ``request`` — a leg is about to be called. ``attempt`` on the primary
+      leg; ``mode`` (``"cooldown"`` / ``"degraded"``) on the fallback leg.
+    - ``error`` — that leg's call raised.
+    - ``retry`` — the primary failed and will be retried after ``delay_s``.
+    - ``abandon_stream_retry`` — the primary stream failed after deltas had
+      already reached the consumer, so it degrades instead of replaying.
+    - ``degrade`` — traffic moves to the fallback leg (``leg="fallback"``);
+      always carries ``reason``, ``degrade_from`` and ``degrade_to``.
+
+    Stream-path events additionally carry ``streaming=True``.
     """
 
     def __init__(
@@ -282,10 +302,12 @@ class CooldownFallbackLLM:
         if self._clock() < self._cooldown_until:
             await self._emit(
                 "degrade",
+                leg="fallback",
                 reason="primary_cooldown",
                 degrade_from=_model_id(self.primary),
                 degrade_to=_model_id(self.fallback),
             )
+            await self._emit("request", leg="fallback", mode="cooldown")
             return await self.fallback.chat(messages, **kwargs)
 
         last_error: Exception | None = None
@@ -308,17 +330,21 @@ class CooldownFallbackLLM:
                     # emits a ``retry`` event that no retry follows.
                     break
                 delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
-                await self._emit("retry", attempt=attempt + 1, delay_s=delay)
+                await self._emit(
+                    "retry", leg="primary", attempt=attempt + 1, delay_s=delay,
+                )
                 await self._sleep(delay)
 
         self._cooldown_until = self._clock() + self.cooldown_seconds
         await self._emit(
             "degrade",
+            leg="fallback",
             reason="primary_exhausted",
             degrade_from=_model_id(self.primary),
             degrade_to=_model_id(self.fallback),
             cooldown_seconds=self.cooldown_seconds,
         )
+        await self._emit("request", leg="fallback", mode="degraded")
         try:
             return await self.fallback.chat(messages, **kwargs)
         except Exception as fallback_error:
@@ -345,7 +371,17 @@ class CooldownFallbackLLM:
             timeout=timeout,
         )
         if self._clock() < self._cooldown_until:
-            await self._emit("degrade", reason="primary_stream_cooldown")
+            await self._emit(
+                "degrade",
+                leg="fallback",
+                reason="primary_stream_cooldown",
+                degrade_from=_model_id(self.primary),
+                degrade_to=_model_id(self.fallback),
+                streaming=True,
+            )
+            await self._emit(
+                "request", leg="fallback", mode="cooldown", streaming=True,
+            )
             async for delta in self.fallback.stream(messages, **kwargs):
                 yield delta
             return
@@ -380,6 +416,10 @@ class CooldownFallbackLLM:
                     # would duplicate them. Degrade to the fallback leg instead.
                     await self._emit(
                         "abandon_stream_retry",
+                        leg="primary",
+                        reason="primary_stream_partial",
+                        degrade_from=_model_id(self.primary),
+                        degrade_to=_model_id(self.fallback),
                         attempt=attempt + 1,
                         streaming=True,
                         yielded=True,
@@ -390,6 +430,7 @@ class CooldownFallbackLLM:
                 delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
                 await self._emit(
                     "retry",
+                    leg="primary",
                     attempt=attempt + 1,
                     delay_s=delay,
                     streaming=True,
@@ -398,7 +439,18 @@ class CooldownFallbackLLM:
                 await self._sleep(delay)
 
         self._cooldown_until = self._clock() + self.cooldown_seconds
-        await self._emit("degrade", reason="primary_stream_exhausted")
+        await self._emit(
+            "degrade",
+            leg="fallback",
+            reason="primary_stream_exhausted",
+            degrade_from=_model_id(self.primary),
+            degrade_to=_model_id(self.fallback),
+            cooldown_seconds=self.cooldown_seconds,
+            streaming=True,
+        )
+        await self._emit(
+            "request", leg="fallback", mode="degraded", streaming=True,
+        )
         try:
             async for delta in self.fallback.stream(messages, **kwargs):
                 yield delta

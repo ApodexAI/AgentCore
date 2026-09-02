@@ -197,3 +197,114 @@ async def test_stream_replay_is_opt_in() -> None:
     seen = [delta.content async for delta in llm.stream([user_msg("x")])]
     assert seen == ["part1 ", "part2 ", "part1 ", "part2 ", "FALLBACK"]
     assert primary.starts == 2
+
+
+@pytest.mark.asyncio
+async def test_every_event_names_the_leg_it_is_about() -> None:
+    """``leg`` is always present, and ``retry`` belongs to the primary.
+
+    A tracing adapter labels each record by ``leg``; leaving it off any event
+    forced the adapter to guess, which mislabelled primary retries as fallback
+    traffic.
+    """
+    primary = ScriptedLLM(
+        "primary-model",
+        [TimeoutError("timeout"), TimeoutError("timeout")],
+    )
+    fallback = ScriptedLLM("fallback-model", [LLMResponse(content="ok")])
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def hook(name: str, payload: dict[str, object]) -> None:
+        events.append((name, payload))
+
+    llm = CooldownFallbackLLM(
+        primary,
+        fallback,
+        max_retries=2,
+        cooldown_seconds=60,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+        event_hook=hook,
+    )
+    assert (await llm.chat([user_msg("x")])).content == "ok"
+
+    assert all("leg" in payload for _name, payload in events), events
+    assert [(name, payload["leg"]) for name, payload in events] == [
+        ("request", "primary"),
+        ("error", "primary"),
+        ("retry", "primary"),
+        ("request", "primary"),
+        ("error", "primary"),
+        ("degrade", "fallback"),
+        ("request", "fallback"),
+    ]
+    degrade = next(payload for name, payload in events if name == "degrade")
+    assert degrade["degrade_from"] == "primary-model"
+    assert degrade["degrade_to"] == "fallback-model"
+
+
+@pytest.mark.asyncio
+async def test_fallback_leg_call_is_traceable_in_cooldown() -> None:
+    """The cooldown shortcut still announces the fallback request it makes."""
+    fallback = ScriptedLLM("fallback-model", [LLMResponse(content="ok")])
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def hook(name: str, payload: dict[str, object]) -> None:
+        events.append((name, payload))
+
+    llm = CooldownFallbackLLM(
+        ScriptedLLM("primary-model", [TimeoutError("timeout")]),
+        fallback,
+        max_retries=1,
+        cooldown_seconds=60,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+        event_hook=hook,
+    )
+    await llm.chat([user_msg("one")])  # enters cooldown
+    events.clear()
+    await llm.chat([user_msg("two")])  # served from cooldown
+
+    assert [(name, payload.get("mode")) for name, payload in events] == [
+        ("degrade", None),
+        ("request", "cooldown"),
+    ]
+    assert fallback.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_events_carry_leg_labels_and_degrade_pair() -> None:
+    """Stream-path events reach the same contract as the ``chat`` path."""
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def hook(name: str, payload: dict[str, object]) -> None:
+        events.append((name, payload))
+
+    llm = CooldownFallbackLLM(
+        PartialStream(),
+        OkStream(),
+        max_retries=3,
+        cooldown_seconds=60,
+        clock=lambda: 0.0,
+        sleep=lambda _d: _completed(),
+        jitter=lambda: 0.0,
+        event_hook=hook,
+    )
+    seen = [delta.content async for delta in llm.stream([user_msg("x")])]
+    assert seen == ["part1 ", "part2 ", "FALLBACK"]
+
+    assert [(name, payload["leg"]) for name, payload in events] == [
+        ("request", "primary"),
+        ("error", "primary"),
+        ("abandon_stream_retry", "primary"),
+        ("degrade", "fallback"),
+        ("request", "fallback"),
+    ]
+    assert all(payload.get("streaming") for _name, payload in events), events
+    for name in ("abandon_stream_retry", "degrade"):
+        payload = next(p for n, p in events if n == name)
+        assert payload["degrade_from"] == "primary"
+        assert payload["degrade_to"] == "fallback"
+        assert payload["reason"]
