@@ -347,6 +347,47 @@ def test_openai_session_header_mirrors_into_default_query():
     assert _session_query({"other": "v"}) == {}
 
 
+def test_cached_openai_client_drops_previous_scope_affinity():
+    scope = "task-1"
+
+    def current_scope() -> str:
+        return scope
+
+    c = OpenAIClient(
+        "m",
+        api_key="x",
+        default_headers={"x-upstream-session-id": "task-1"},
+        session_query_resolver=_session_query,
+        session_scope_resolver=current_scope,
+    )
+    # Task-derived affinity is evaluated by AgentCore instead of being frozen
+    # into the SDK client, so a cached client can safely cross task boundaries.
+    assert not c._client._custom_query
+    assert c._session_query(None) == {"x-upstream-session-id": "task-1"}
+
+    scope = "task-2"
+    assert c._session_query(None) == {}
+    assert c._session_query({"x-upstream-session-id": "task-2"}) == {
+        "x-upstream-session-id": "task-2",
+    }
+
+
+def test_static_openai_affinity_survives_scope_changes():
+    c = OpenAIClient(
+        "m",
+        api_key="x",
+        default_headers={"x-upstream-session-id": "static-route"},
+        session_query_resolver=_session_query,
+        session_scope_resolver=lambda: "",
+    )
+    assert dict(c._client._custom_query) == {
+        "x-upstream-session-id": "static-route",
+    }
+    assert c._session_query(None) == {
+        "x-upstream-session-id": "static-route",
+    }
+
+
 @pytest.mark.asyncio
 async def test_openai_chat_omits_extra_query_without_session_header():
     """extra_headers without a session id must not grow an extra_query."""

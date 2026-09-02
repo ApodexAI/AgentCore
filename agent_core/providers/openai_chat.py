@@ -26,6 +26,7 @@ from agent_core.runtime.llm_request_overrides import (
 )
 
 type SessionQueryResolver = Callable[[dict[str, str] | None], dict[str, str]]
+type SessionScopeResolver = Callable[[], str]
 
 
 def _no_session_query(_headers: dict[str, str] | None) -> dict[str, str]:
@@ -33,12 +34,19 @@ def _no_session_query(_headers: dict[str, str] | None) -> dict[str, str]:
 
 
 _session_query_resolver: SessionQueryResolver = _no_session_query
+_session_scope_resolver: SessionScopeResolver | None = None
 
 
 def configure_session_query_resolver(resolver: SessionQueryResolver | None) -> None:
     """Configure the host affinity adapter used by subsequently built clients."""
     global _session_query_resolver
     _session_query_resolver = resolver or _no_session_query
+
+
+def configure_session_scope_resolver(resolver: SessionScopeResolver | None) -> None:
+    """Configure the host task scope used to reject stale cached affinity."""
+    global _session_scope_resolver
+    _session_scope_resolver = resolver
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +151,7 @@ class OpenAIClient(LLMClient):
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         session_query_resolver: SessionQueryResolver | None = None,
+        session_scope_resolver: SessionScopeResolver | None = None,
         sdk_default_query: bool = True,
     ) -> None:
         self.model = model
@@ -151,6 +160,14 @@ class OpenAIClient(LLMClient):
         self.default_timeout = timeout
         self.extra_body = extra_body or {}
         self._session_query_resolver = session_query_resolver or _session_query_resolver
+        self._session_scope_resolver = (
+            session_scope_resolver or _session_scope_resolver
+        )
+        self._default_session_scope = (
+            self._session_scope_resolver()
+            if self._session_scope_resolver is not None
+            else ""
+        )
         self._default_session_query = self._session_query_resolver(default_headers)
         # Some OpenAI-compatible gateways reject ``stream_options`` with a 400.
         # We probe optimistically and flip this off on first rejection so the
@@ -167,7 +184,14 @@ class OpenAIClient(LLMClient):
             base_url=base_url or None,
             timeout=timeout,
             default_headers=default_headers,
-            default_query=self._default_session_query or None if sdk_default_query else None,
+            # A task-derived query cannot live in the SDK defaults: cached
+            # clients may outlive the task that constructed them. Static
+            # affinity (no construction scope) remains safe to install here.
+            default_query=(
+                self._default_session_query or None
+                if sdk_default_query and not self._default_session_scope
+                else None
+            ),
             max_retries=0,           # retries are owned by the runtime loop
         )
 
@@ -211,7 +235,22 @@ class OpenAIClient(LLMClient):
 
     def _session_query(self, extra_headers: dict[str, str] | None) -> dict[str, str]:
         """Resolve per-call affinity, falling back to construction-time affinity."""
-        return self._session_query_resolver(extra_headers) or self._default_session_query
+        per_call = self._session_query_resolver(extra_headers)
+        if per_call:
+            return per_call
+        fallback = self._default_session_query
+        if (
+            fallback
+            and self._default_session_scope
+            and self._session_scope_resolver is not None
+            and self._session_scope_resolver() != self._default_session_scope
+        ):
+            logger.debug(
+                "Dropping stale session-affinity query built for scope %r",
+                self._default_session_scope,
+            )
+            return {}
+        return fallback
 
     def _demote_reasoning_effort(self, exc: Exception) -> bool:
         """Sticky one-way downgrade after a rejected ``reasoning_effort``.
