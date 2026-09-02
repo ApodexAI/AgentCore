@@ -1488,7 +1488,7 @@ class AgentBus:
                 session.pending_results.append(result)
                 await _emit_session_task_completed(
                     session, job_id, result,
-                    event_sink=self._event_sink_injected,
+                    event_sink=self._event_sink(),
                     spawn_context=pending.spawn_context,
                 )
                 return result
@@ -1567,7 +1567,7 @@ class AgentBus:
 
         await _emit_session_task_submitted(
             session, job_id, task_prompt,
-            event_sink=self._event_sink_injected,
+            event_sink=self._event_sink(),
         )
 
     async def _eager_trim_and_offload(self, session: SubAgentSession) -> None:
@@ -2224,5 +2224,5 @@ class AgentBus:
     async def rehydrate_active_jobs(self) -> int:
         """Mark jobs whose asyncio.Task was lost across a restart as orphaned."""
         return await _rehydrate_orphaned_jobs(
-            self._jobs, event_sink=self._event_sink_injected,
+            self._jobs, event_sink=self._event_sink(),
         )
