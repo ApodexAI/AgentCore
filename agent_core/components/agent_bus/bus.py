@@ -903,25 +903,45 @@ class AgentBus:
         running tasks (asyncio cancel) and queued tasks (purge + status
         flip) are handled — neither survives the round boundary.
 
-        Returns the number of jobs cancelled.
+        Queued jobs are cleared first, in a separate pass. Cancelling a
+        running job runs its ``finally``, which drains that session's queue —
+        so a single interleaved pass would dispatch the very tasks this call
+        is tearing down, let them reach the LLM, and cancel them again a few
+        iterations later.
+
+        Returns the number of jobs this call cancelled.
         """
         cancelled = 0
-        for jid, entry in list(self._jobs.items()):
-            if entry.parent_task_id != parent_task_id:
-                continue
-            if entry.status in ("completed", "failed", "aborted"):
-                continue
+        mine = [
+            (jid, entry) for jid, entry in self._jobs.items()
+            if entry.parent_task_id == parent_task_id
+            and entry.status not in ("completed", "failed", "aborted")
+        ]
+
+        for jid, entry in mine:
             if entry.status == "queued" or entry.task is None:
                 self._purge_queued_job(jid)
                 self._mark_job_aborted(jid, entry)
                 cancelled += 1
+
+        for jid, entry in mine:
+            if entry.status in ("completed", "failed", "aborted"):
                 continue
-            entry.task.cancel()
+            task = entry.task
+            if task is None:
+                continue
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await entry.task
+                await task
+            # Counted either way. A job that had actually started absorbs its
+            # own cancellation — ``_run_and_finalize`` reaches the handler that
+            # flips the status itself — and only one that never got that far
+            # still needs the stand-in below. Both were cancelled by this call,
+            # so gating the count on which of the two happened reported 0 for a
+            # round that really did tear down every running sub-agent.
             if entry.status not in ("completed", "failed", "aborted"):
                 self._mark_job_aborted(jid, entry)
-                cancelled += 1
+            cancelled += 1
         if cancelled:
             logger.info(
                 "Cancelled %d orphaned sub-agent jobs for %s",
@@ -1634,6 +1654,21 @@ class AgentBus:
             session, job_id, task_prompt,
             event_sink=self._event_sink(),
         )
+
+        # Dispatch is fire-and-return: a host tool such as ``assign_task``
+        # hands back a job id and its invocation scope closes. Nothing above
+        # is guaranteed to suspend — ``_emit_session_task_submitted`` returns
+        # without awaiting when no sink is installed, and a sink whose
+        # ``append`` never awaits does not yield either — so without this the
+        # task can still be unstarted when the caller moves on. Until
+        # ``_run_and_finalize`` begins, neither the ``finally`` that returns
+        # the guard reservation nor the handler that turns a cancellation into
+        # a real ``SubAgentResult`` exists yet, so a cancel landing in that
+        # window kills the job outright and the caller gets the synthetic
+        # "cancelled before publishing a report" instead of the partial result
+        # the sub-agent actually had. One yield establishes the task; every
+        # cancel after it lands inside the job wrapper.
+        await asyncio.sleep(0)
 
     async def _eager_trim_and_offload(self, session: SubAgentSession) -> None:
         """Compress completed boundaries immediately after a task finishes.
