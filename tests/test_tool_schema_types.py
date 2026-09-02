@@ -66,3 +66,45 @@ def test_dict_annotation_is_how_a_tool_asks_for_an_object() -> None:
         return ""
 
     assert _properties(probe)["items"]["items"] == {"type": "object"}
+
+
+# ── PEP 695 aliases, the spelling used to name a union ────────────────────────
+
+
+def test_a_pep695_alias_resolves_to_what_it_aliases() -> None:
+    """``type Alias = ...`` must not degrade to ``string``.
+
+    A ``TypeAliasType`` is not a primitive, has no origin, and is not a Pydantic
+    model, so before it was unwrapped it fell through to the ``Any`` floor. The
+    result was a parameter documented as a union and SERVED as a string, with
+    nothing in the source or the schema to show the annotation had been dropped.
+    """
+    type JsonValue = dict[str, Any] | list[str] | str | float | bool
+
+    async def fn(value):  # annotation injected below
+        return ""
+    fn.__annotations__ = {"value": JsonValue, "return": str}
+    t = tool(fn)
+
+    arms = _properties(t)["value"]["anyOf"]
+    assert {arm.get("type") for arm in arms} == {
+        "object", "array", "string", "number", "boolean",
+    }
+
+
+def test_a_pep695_alias_survives_being_an_items_type() -> None:
+    """The case that motivated this: ``list[Alias]``, where the alias describes
+    what one element may be. Losing it here types every element ``string``."""
+    type Cell = str | float | bool
+
+    async def fn(rows):  # annotation injected below
+        return ""
+    fn.__annotations__ = {"rows": list[Cell], "return": str}
+    t = tool(fn)
+
+    schema = _properties(t)["rows"]
+    assert schema["type"] == "array"
+    assert {arm.get("type") for arm in schema["items"]["anyOf"]} == {
+        "string", "number", "boolean",
+    }
+    assert not _walk(schema, "rows")

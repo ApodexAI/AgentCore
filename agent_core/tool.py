@@ -54,6 +54,17 @@ _PRIMITIVE_TYPES: dict[Any, str] = {
 
 def _schema_for_type(t: Any) -> dict[str, Any]:
     """Build a JSON-schema fragment for a Python type hint."""
+    # PEP 695 (``type Alias = ...``) produces a TypeAliasType, which is not a
+    # primitive, has no ``get_origin``, and is not a Pydantic model — so without
+    # this it reaches the final fallback and becomes ``{"type": "string"}``. That
+    # is the WORST failure mode available here: a tool author who names a union
+    # to describe a parameter precisely gets a schema claiming the parameter is
+    # a string, silently, with the annotation looking correct in the source.
+    # This module documents ``Any -> string`` as a deliberate floor for
+    # under-annotated parameters; an alias is the opposite of under-annotated.
+    if isinstance(t, typing.TypeAliasType):
+        return _schema_for_type(t.__value__)
+
     if t in _PRIMITIVE_TYPES:
         return {"type": _PRIMITIVE_TYPES[t]}
 

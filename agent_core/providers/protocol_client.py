@@ -27,7 +27,11 @@ from agent_core.llm import LLMClient
 # Single source of truth for the valid ``llm.protocol`` values. Duplicating the
 # set here would let the two drift, which is how a protocol becomes buildable
 # but has no ``thinking_format`` (or vice versa).
-from agent_core.runtime.loop.model_profile import WireProtocol, is_wire_protocol
+from agent_core.runtime.loop.model_profile import (
+    ThinkingFormat,
+    WireProtocol,
+    is_wire_protocol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ logger = logging.getLogger(__name__)
 _MIN_THINKING_BUDGET = 1024
 
 
-def protocol_of(cfg: dict[str, Any]) -> str:
+def protocol_of(cfg: dict[str, Any]) -> WireProtocol:
     """Normalised ``llm.protocol`` (default ``chat_completions``).
 
     An unusable value — wrong type, or a string that names no known protocol —
@@ -84,9 +88,16 @@ def provider_label(cfg: dict[str, Any]) -> str:
     return "openai"
 
 
-def thinking_format_for_protocol(protocol: str) -> str | None:
+def thinking_format_for_protocol(protocol: str) -> ThinkingFormat | None:
     """``content_block`` for the reasoning protocols, else ``None`` (caller
-    falls back to explicit YAML / model-id inference)."""
+    falls back to explicit YAML / model-id inference).
+
+    Both this and :func:`protocol_of` return the NARROW alias, not a bare
+    ``str``: their outputs feed ``ModelProfile.thinking_format`` /
+    ``ModelProfile.protocol``, which are ``Literal`` unions, so widening to
+    ``str`` makes a value this module just validated unassignable at the very
+    field it was validated for. This file is checked at ``basic`` level, so
+    nothing here catches that — a strict host does."""
     return (
         "content_block"
         if protocol in ("anthropic", "responses", "bedrock")
