@@ -3,11 +3,49 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from agent_core.llm import LLMClient
+
+
+@runtime_checkable
+class EventSink(Protocol):
+    """Append-only event destination used by portable runtime components."""
+
+    async def append(
+        self,
+        task_id: Any = "",
+        event_type: Any = None,
+        payload: dict[str, Any] | None = None,
+        agent_role: str = "system",
+    ) -> Any: ...
+
+    def replay(self, task_id: str) -> AsyncIterator[Any]: ...
+
+
+@runtime_checkable
+class EventReader(Protocol):
+    """Cursored event reads required by durable inter-agent messaging."""
+
+    async def get_events(
+        self,
+        task_id: Any,
+        event_type: Any = None,
+        after_id: int = 0,
+        limit: int | None = None,
+    ) -> list[Any]: ...
+
+    async def get_events_for_agent(
+        self,
+        to_agent: str,
+        after_id: int = 0,
+        limit: int = 50,
+        *,
+        task_id: str | Any | None = None,
+        message_type: str | None = None,
+    ) -> list[Any]: ...
 
 
 @runtime_checkable
@@ -108,6 +146,11 @@ class PhaseMiddlewareChain(Protocol):
 
 
 @runtime_checkable
+class LLMWrapper(Protocol):
+    def wrap_llm(self, llm: LLMClient, *, role_id: str) -> LLMClient: ...
+
+
+@runtime_checkable
 class SubAgentProfileRegistry(Protocol):
     def register_sub_agent_profiles(
         self, node_id: str, profiles: Mapping[str, Any]
@@ -148,8 +191,11 @@ class SkillLoader(Protocol):
 
 
 __all__ = [
+    "EventReader",
+    "EventSink",
     "ExecutionMiddleware",
     "LLMResourceProvider",
+    "LLMWrapper",
     "PhaseContext",
     "PhaseMiddlewareChain",
     "Skill",
