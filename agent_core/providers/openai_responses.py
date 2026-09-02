@@ -195,10 +195,22 @@ def _to_responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _to_responses_input(messages: list[Message]) -> list[dict[str, Any]]:
     """Convert Chat-Completions ``Message``s into a Responses ``input`` list.
 
-    Assistant turns saved verbatim (``content`` is a block list of
-    ``reasoning`` / ``text`` items) re-emit the reasoning items FIRST — incl.
-    ``encrypted_content`` — so the model continues the prior reasoning state,
-    then the assistant text, then any ``function_call`` items. Tool results
+    An assistant turn saved verbatim (``content`` is the block list
+    ``_parse_responses_output`` produced) is replayed in the PROVIDER'S OWN
+    ITEM ORDER — reasoning, text, and ``function_call`` items interleaved
+    exactly as they came back. The Responses API binds a ``reasoning`` item to
+    the output item that FOLLOWS it, so a turn that produced
+    ``reasoning → call_a → reasoning → call_b`` must not be replayed as
+    ``reasoning, reasoning, call_a, call_b``: that hands the model a different
+    reasoning-to-call pairing than the one it generated under.
+
+    Adjacent ``text`` blocks are still joined into a single ``message`` item —
+    that is a concatenation within one position, not a reordering.
+
+    A turn whose content is a plain string (or a block list carrying no
+    ``function_call`` items — history written before the parser recorded them)
+    falls back to appending the calls from ``Message.tool_calls`` after the
+    text, which is the best order recoverable from that shape. Tool results
     become ``function_call_output`` items keyed by ``call_id``.
     """
     items: list[dict[str, Any]] = []
@@ -213,13 +225,26 @@ def _to_responses_input(messages: list[Message]) -> list[dict[str, Any]]:
             continue
         if role == "assistant":
             raw = m.get("content")
-            text_parts: list[str] = []
+            pending_text: list[str] = []
+            saw_function_call = False
+
+            def _flush_text(buf: list[str] = pending_text) -> None:
+                body = "\n".join(p for p in buf if p)
+                buf.clear()
+                if body:
+                    items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": body}],
+                    })
+
             if isinstance(raw, list):
                 for block in raw:
                     if not isinstance(block, dict):
                         continue
                     bt = block.get("type")
                     if bt == "reasoning":
+                        _flush_text()
                         item: dict[str, Any] = {"type": "reasoning"}
                         if block.get("id"):
                             item["id"] = block["id"]
@@ -228,27 +253,60 @@ def _to_responses_input(messages: list[Message]) -> list[dict[str, Any]]:
                             item["encrypted_content"] = block["encrypted_content"]
                         items.append(item)
                     elif bt == "text":
-                        text_parts.append(block.get("text", "") or "")
+                        pending_text.append(block.get("text", "") or "")
+                    elif bt == "function_call":
+                        call = _to_responses_function_call(block)
+                        if call is not None:
+                            _flush_text()
+                            items.append(call)
+                            saw_function_call = True
             else:
-                text_parts.append(text_of(raw or ""))
-            body = "\n".join(p for p in text_parts if p)
-            if body:
-                items.append({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": body}],
-                })
-            for tc in m.get("tool_calls", []) or []:
-                items.append({
-                    "type": "function_call",
-                    "call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "arguments": tc["function"].get("arguments") or "{}",
-                })
+                pending_text.append(text_of(raw or ""))
+            _flush_text()
+            if not saw_function_call:
+                for tc in m.get("tool_calls", []) or []:
+                    call = _to_responses_function_call(tc)
+                    if call is not None:
+                        items.append(call)
             continue
         # system / user
         items.append({"role": role or "user", "content": text_of(m.get("content", ""))})
     return items
+
+
+def _to_responses_function_call(src: Any) -> dict[str, Any] | None:
+    """Build a Responses ``function_call`` item from a verbatim block or a
+    Chat-Completions ``tool_calls`` entry.
+
+    Accepts both shapes: a recorded block carries ``call_id`` / ``name`` /
+    ``arguments`` flat, while a ``tool_calls`` entry nests them under
+    ``function``. Returns ``None`` for a call missing an id or a name instead of
+    raising — this runs while replaying DURABLE history, so a ``KeyError`` on a
+    truncated call would not fail one request but every request for the rest of
+    the session. ``arguments`` is passed through as the raw string the API
+    expects; it is never parsed here.
+    """
+    if not isinstance(src, dict):
+        return None
+    fn = src.get("function")
+    fn = fn if isinstance(fn, dict) else {}
+    call_id = src.get("call_id") or src.get("id") or ""
+    name = src.get("name") or fn.get("name") or ""
+    if not call_id or not name:
+        logger.warning(
+            "skipping malformed tool_call in Responses conversion "
+            "(call_id=%r, name=%r)", call_id, name,
+        )
+        return None
+    arguments = src.get("arguments")
+    if arguments is None:
+        arguments = fn.get("arguments")
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments or "{}",
+    }
 
 
 def _parse_responses_output(raw: Any) -> LLMResponse:
@@ -290,13 +348,27 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
                     text_parts.append(txt)
                     blocks_out.append({"type": "text", "text": txt})
         elif itype == "function_call":
+            call_id = _get(item, "call_id", "") or _get(item, "id", "") or ""
+            call_name = _get(item, "name", "") or ""
+            call_args = _get(item, "arguments", "") or "{}"
             tool_calls.append({
-                "id": _get(item, "call_id", "") or _get(item, "id", "") or "",
+                "id": call_id,
                 "type": "function",
-                "function": {
-                    "name": _get(item, "name", "") or "",
-                    "arguments": _get(item, "arguments", "") or "{}",
-                },
+                "function": {"name": call_name, "arguments": call_args},
+            })
+            # Also recorded IN PLACE in the verbatim block list. The Responses
+            # API pairs each ``reasoning`` item with the output item that
+            # follows it, so replay has to know where the calls sat relative to
+            # the reasoning — ``tool_calls`` alone loses that, and appending
+            # them after the reasoning items re-pairs a multi-call turn wrongly.
+            # ``model_profile``'s content_block parser ignores block types it
+            # does not know and keeps the list verbatim, so this rides along
+            # without affecting visible text or thinking extraction.
+            blocks_out.append({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": call_name,
+                "arguments": call_args,
             })
 
     # Prefer the top-level ``output_text`` convenience string when the SDK
@@ -342,7 +414,12 @@ def _responses_usage_dict(usage: Any) -> dict[str, int]:
         out["cached_tokens"] = int(cached)
     otd = _get(usage, "output_tokens_details", None)
     reasoning = _get(otd, "reasoning_tokens", None) if otd is not None else None
-    if reasoning:
+    # ``is not None``, not truthiness: an explicit ``reasoning_tokens: 0`` is a
+    # provider ASSERTING it spent no reasoning tokens, which is different from
+    # omitting the field (unknown). Collapsing the two is the ambiguity the
+    # sibling ``cached_tokens`` handling above — and ``openai_chat._usage_dict``
+    # — exist to avoid.
+    if reasoning is not None:
         out["reasoning_tokens"] = int(reasoning)
     return out
 

@@ -359,3 +359,171 @@ def test_turn_context_and_extract_usage_carry_reasoning():
     # The normalized shape is stable even when no reasoning was used.
     resp2 = LLMResponse(model="m", usage={"prompt_tokens": 5, "completion_tokens": 10})
     assert extract_usage(resp2)["reasoning_tokens"] == 0
+
+
+# ── Responses replay: reasoning↔function_call pairing ───────────────────────
+
+
+def test_responses_input_preserves_interleaved_reasoning_and_calls():
+    """The Responses API binds a ``reasoning`` item to the item that FOLLOWS it.
+
+    A turn that produced ``reasoning → call_a → reasoning → call_b`` must not be
+    replayed as ``reasoning, reasoning, call_a, call_b`` — that hands the model
+    a different pairing than the one it generated under.
+    """
+    messages = [
+        user_msg("q"),
+        assistant_msg(
+            [{"type": "reasoning", "id": "rs_1", "summary": [],
+              "encrypted_content": "E1"},
+             {"type": "function_call", "call_id": "call_a", "name": "a",
+              "arguments": '{"i":1}'},
+             {"type": "reasoning", "id": "rs_2", "summary": [],
+              "encrypted_content": "E2"},
+             {"type": "function_call", "call_id": "call_b", "name": "b",
+              "arguments": '{"i":2}'}],
+            tool_calls=[
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "a", "arguments": '{"i":1}'}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "b", "arguments": '{"i":2}'}},
+            ]),
+    ]
+    items = rc._to_responses_input(messages)
+    assert [it.get("type") for it in items[1:]] == [
+        "reasoning", "function_call", "reasoning", "function_call",
+    ]
+    assert items[1]["encrypted_content"] == "E1"
+    assert items[2]["call_id"] == "call_a"
+    assert items[3]["encrypted_content"] == "E2"
+    assert items[4]["call_id"] == "call_b"
+    # Calls come from the block list, so they are not ALSO appended from
+    # ``tool_calls`` — a duplicated call_id is a 400.
+    assert sum(1 for it in items if it.get("type") == "function_call") == 2
+
+
+def test_responses_parser_records_function_calls_in_the_block_list():
+    """Ordering can only be replayed if the parser records call positions."""
+    raw = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="reasoning", id="rs_1", summary=[],
+                            encrypted_content="E1"),
+            SimpleNamespace(type="function_call", call_id="call_a",
+                            name="a", arguments="{}"),
+            SimpleNamespace(type="reasoning", id="rs_2", summary=[],
+                            encrypted_content="E2"),
+            SimpleNamespace(type="function_call", call_id="call_b",
+                            name="b", arguments="{}"),
+        ],
+        usage=None, status="completed", model="gpt-x", id="resp_1",
+    )
+    resp = rc._parse_responses_output(raw)
+    assert [b["type"] for b in resp.content] == [
+        "reasoning", "function_call", "reasoning", "function_call",
+    ]
+    # ``tool_calls`` still carries them for the executor.
+    assert [tc["id"] for tc in resp.tool_calls] == ["call_a", "call_b"]
+
+
+def test_responses_input_falls_back_to_tool_calls_for_legacy_history():
+    """History written before the parser recorded ``function_call`` blocks."""
+    messages = [assistant_msg(
+        [{"type": "text", "text": "calling"}],
+        tool_calls=[{"id": "call_1", "type": "function",
+                     "function": {"name": "f", "arguments": "{}"}}])]
+    items = rc._to_responses_input(messages)
+    assert [it.get("type") for it in items] == ["message", "function_call"]
+    assert items[1]["call_id"] == "call_1"
+
+
+def test_responses_input_drops_calls_missing_id_or_name():
+    """A truncated call must not raise mid-replay of durable history."""
+    messages = [assistant_msg(
+        "text",
+        tool_calls=[
+            {"id": "", "type": "function",
+             "function": {"name": "f", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"arguments": "{}"}},
+            {"id": "c3", "type": "function",
+             "function": {"name": "ok", "arguments": "{}"}},
+        ])]
+    items = rc._to_responses_input(messages)
+    calls = [it for it in items if it.get("type") == "function_call"]
+    assert [c["call_id"] for c in calls] == ["c3"]
+
+
+def test_responses_usage_records_an_explicit_zero_reasoning_count():
+    """``reasoning_tokens: 0`` asserts zero; omitting the field means unknown.
+
+    Truthiness collapsed the two, which is the exact ambiguity the sibling
+    ``cached_tokens`` handling exists to avoid.
+    """
+    zero = rc._responses_usage_dict(SimpleNamespace(
+        input_tokens=1, output_tokens=2,
+        output_tokens_details=SimpleNamespace(reasoning_tokens=0)))
+    assert zero["reasoning_tokens"] == 0
+    absent = rc._responses_usage_dict(SimpleNamespace(
+        input_tokens=1, output_tokens=2, output_tokens_details=None))
+    assert "reasoning_tokens" not in absent
+
+
+# ── protocol_client: budget/max_tokens reconciliation + typo detection ───────
+
+
+def test_enabled_thinking_budget_never_exceeds_max_tokens():
+    """Anthropic needs ``1024 <= budget_tokens < max_tokens``.
+
+    The two are jointly unsatisfiable when ``max_tokens <= 1024``, and the naive
+    clamp emitted ``budget_tokens=1024`` against ``max_tokens=512`` — a budget
+    larger than the response cap, i.e. a 400 on every call.
+    """
+    c = build_protocol_client(
+        {"model": "claude", "protocol": "anthropic", "max_tokens": 512,
+         "thinking_type": "enabled"}, title="T")
+    kw = c._build_kwargs([user_msg("hi")], tools=None, temperature=None,
+                         max_tokens=None, extra_headers=None, timeout=None)
+    assert kw["thinking"]["budget_tokens"] < kw["max_tokens"]
+    assert kw["thinking"]["budget_tokens"] == 1024
+    assert kw["max_tokens"] == 1025
+
+
+def test_enabled_thinking_budget_leaves_a_valid_pair_alone():
+    from agent_core.providers.protocol_client import _enabled_thinking_budget
+
+    assert _enabled_thinking_budget(8192, 32768) == (8192, 32768)
+    # Budget above the cap is clamped down, not raised.
+    assert _enabled_thinking_budget(8192, 4096) == (4095, 4096)
+    # Below Anthropic's 1024 floor is raised to the floor.
+    assert _enabled_thinking_budget(100, 32768) == (1024, 32768)
+
+
+def test_unknown_protocol_warns_instead_of_degrading_silently(caplog):
+    """A YAML typo used to build a Chat Completions client with tag thinking —
+    the request succeeded and the signed reasoning was quietly lost."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert build_protocol_client(
+            {"model": "claude", "protocol": "anthropc"}, title="T") is None
+    assert "unknown llm.protocol" in caplog.text
+    assert "anthropc" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["anthropc", 5, ["anthropic"], True, "unknown"])
+def test_unusable_protocol_values_are_logged(value, caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        assert protocol_of({"protocol": value}) == "chat_completions"
+    assert "unknown llm.protocol" in caplog.text
+
+
+@pytest.mark.parametrize("cfg", [{}, {"protocol": None}, {"protocol": ""},
+                                 {"protocol": "  "}, {"protocol": "anthropic"}])
+def test_absent_or_valid_protocol_is_not_logged(cfg, caplog):
+    """The documented default must not produce warning noise on every build."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        protocol_of(cfg)
+    assert "unknown llm.protocol" not in caplog.text

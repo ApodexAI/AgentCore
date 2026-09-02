@@ -6,7 +6,9 @@ from agent_core.providers.nonblocking_stream import NonBlockingStream, nonblocki
 from agent_core.providers.openai_chat import (
     OpenAIClient,
     SessionQueryResolver,
+    SessionScopeResolver,
     configure_session_query_resolver,
+    configure_session_scope_resolver,
 )
 from agent_core.providers.openai_responses import OpenAIResponsesClient
 from agent_core.providers.prompt_cache import (
@@ -29,8 +31,10 @@ __all__ = [
     "OpenAIClient",
     "OpenAIResponsesClient",
     "SessionQueryResolver",
+    "SessionScopeResolver",
     "build_protocol_client",
     "configure_session_query_resolver",
+    "configure_session_scope_resolver",
     "maybe_wrap_for_prompt_cache",
     "nonblocking_stderr",
     "protocol_of",

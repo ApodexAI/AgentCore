@@ -304,3 +304,84 @@ async def test_streaming_forwards_tool_call_chunks(monkeypatch):
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_streaming_verbatim_reasoning_blocks_become_the_content(monkeypatch):
+    """A provider that sends ``StreamDelta.reasoning_blocks`` wins over the
+    flattened string.
+
+    Anthropic delivers a thinking block's cryptographic ``signature`` on its own
+    ``signature_delta`` event, and ``redacted_thinking`` payloads arrive with no
+    deltas at all — neither can be represented in ``content`` /
+    ``reasoning_content``. Without this channel a streamed extended-thinking
+    turn assembled into reasoning that ``thinking_format="content_block"`` could
+    not replay, silently breaking signed multi-turn continuity (while the
+    non-streaming path replayed it correctly).
+    """
+    real_sleep = asyncio.sleep
+
+    async def _noop(_):
+        await real_sleep(0)
+
+    monkeypatch.setattr("asyncio.sleep", _noop)
+
+    blocks = [
+        {"type": "thinking", "thinking": "step one", "signature": "sig-abc"},
+        {"type": "redacted_thinking", "data": "enc-payload"},
+        {"type": "text", "text": "the answer"},
+    ]
+    llm = _StubStreamingLLM(deltas=[
+        StreamDelta(reasoning_content="step one"),
+        StreamDelta(content="the answer"),
+        StreamDelta(
+            usage={"prompt_tokens": 10, "completion_tokens": 40,
+                   "reasoning_tokens": 30},
+            finish_reason="end_turn",
+            model="claude-x",
+            reasoning_blocks=blocks,
+        ),
+    ])
+
+    async def _on_delta(*_):
+        pass
+
+    result = await call_llm(
+        llm, [user_msg("hi")], timeout=10, max_retries=1, turn=0,
+        on_delta=_on_delta,
+    )
+
+    assert result is not None
+    # Verbatim blocks, signature intact — byte-identical to what the provider
+    # signed. The lstrip / think-tag normalisation is deliberately not applied.
+    assert result.content == blocks
+    # The flattened reasoning channel still carries the readable text.
+    assert result.reasoning_content == "step one"
+    assert result.finish_reason == "end_turn"
+    assert result.usage["reasoning_tokens"] == 30
+
+
+@pytest.mark.asyncio
+async def test_streaming_without_reasoning_blocks_keeps_the_flat_string(monkeypatch):
+    """Providers that send no block list are unaffected."""
+    real_sleep = asyncio.sleep
+
+    async def _noop(_):
+        await real_sleep(0)
+
+    monkeypatch.setattr("asyncio.sleep", _noop)
+
+    llm = _StubStreamingLLM(deltas=[
+        StreamDelta(content="hello "),
+        StreamDelta(content="world"),
+        StreamDelta(finish_reason="stop", model="gpt-x"),
+    ])
+    async def _on_delta(*_):
+        pass
+
+    result = await call_llm(
+        llm, [user_msg("hi")], timeout=10, max_retries=1, turn=0,
+        on_delta=_on_delta,
+    )
+    assert result is not None
+    assert result.content == "hello world"

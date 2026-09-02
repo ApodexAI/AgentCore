@@ -82,8 +82,16 @@ class FallbackEntry:
         model: any :class:`LLMClient` instance.
         triggers: which failure modes count as "fall through to the
             next entry". Empty tuple ``()`` means "never fall through" —
-            useful as a hard barrier on the last entry. ``("any_error",)``
-            means "always fall through".
+            useful as a hard barrier at any position in the chain.
+            ``("any_error",)`` means "always fall through". ``None``
+            (the default) means "unset": inside an
+            :class:`LLMFallbackChain` the chain's ``default_triggers``
+            are substituted; standalone it behaves as ``("any_error",)``.
+
+            ``None`` and ``()`` are deliberately distinct. Sharing one
+            sentinel would make a hard barrier indistinguishable from an
+            unconfigured entry, and chain normalisation would silently
+            overwrite the barrier with ``default_triggers``.
         provider: vendor label (``openai`` / ``anthropic`` / ``qwen`` /
             ``mirothinker``) — stamped onto ``response_metadata`` as
             ``provider_actually_used`` so per-call ``usage`` events can
@@ -91,12 +99,18 @@ class FallbackEntry:
             Empty string when the construction site doesn't know.
     """
     model: Any  # LLMClient
-    triggers: tuple[FallbackTrigger, ...] = ("any_error",)
+    triggers: tuple[FallbackTrigger, ...] | None = None
     provider: str = ""
 
     def matches(self, exc: BaseException) -> bool:
-        """Whether ``exc`` should trigger fall-through past this entry."""
-        return any(_trigger_matches(trigger, exc) for trigger in self.triggers)
+        """Whether ``exc`` should trigger fall-through past this entry.
+
+        An unset (``None``) trigger tuple falls back to ``any_error`` so a
+        standalone entry keeps the permissive default; an explicitly empty
+        tuple matches nothing, which is the hard-barrier contract.
+        """
+        triggers = ("any_error",) if self.triggers is None else self.triggers
+        return any(_trigger_matches(trigger, exc) for trigger in triggers)
 
 
 def _model_id(model: Any) -> str:
@@ -170,8 +184,10 @@ class LLMFallbackChain:
         entries: ordered list of ``FallbackEntry``. The first entry is
             the primary; subsequent entries are tried in order on
             matching failure. Must be non-empty.
-        default_triggers: applied to entries that don't carry an
-            explicit ``triggers`` field. Default is ``("any_error",)``.
+        default_triggers: applied to entries whose ``triggers`` field is
+            left unset (``None``). Default is ``("any_error",)``. Entries
+            that declare an explicit ``()`` keep it — that is the
+            "never fall through" barrier and is not a missing value.
 
     Notes:
         - Streaming (``stream``) only fails over BEFORE the first chunk
@@ -190,9 +206,12 @@ class LLMFallbackChain:
         if not self.entries:
             raise ValueError("LLMFallbackChain requires at least one entry")
         self.model = _model_id(self.entries[0].model)
-        # Normalise default triggers onto entries that left it empty.
+        # Normalise default triggers onto entries that left them unset.
+        # ``None`` means "unset" and inherits ``default_triggers``; an
+        # explicit ``()`` is a hard barrier and MUST survive untouched, so
+        # this tests for ``None`` rather than falsiness.
         for entry in self.entries:
-            if not entry.triggers:
+            if entry.triggers is None:
                 entry.triggers = self.default_triggers
 
     @classmethod
@@ -330,7 +349,8 @@ def with_provider_stamp(llm: Any, provider: str) -> Any:
 
     Returns ``llm`` unchanged when ``provider`` is empty (no-op fast path).
     Otherwise builds a 1-entry ``LLMFallbackChain`` with ``triggers=()``
-    (never falls through), making the wrap semantically transparent:
+    (the hard barrier — never falls through), making the wrap
+    semantically transparent:
 
     - Successful response → ``response_metadata.provider_actually_used``
       gets stamped with ``provider`` (and ``model_actually_used`` /

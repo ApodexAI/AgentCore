@@ -96,7 +96,13 @@ class AnthropicClient(LLMClient):
         system, msgs = _split_system(messages)
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": [_to_anthropic_msg(m) for m in msgs],
+            # ``_to_anthropic_msg`` returns None for a message with nothing
+            # sendable (a contentless assistant turn); those are dropped.
+            "messages": [
+                converted
+                for converted in (_to_anthropic_msg(m) for m in msgs)
+                if converted is not None
+            ],
             "max_tokens": max_tokens or self.default_max_tokens or 4096,
         }
         if system:
@@ -165,8 +171,22 @@ class AnthropicClient(LLMClient):
         output_tokens: int | None = None
         cache_read: int | None = None
         cache_write: int | None = None
+        reasoning_tokens: int | None = None
         model = ""
         stop_reason = ""
+        # Verbatim block list, in the provider's own emission order, rebuilt
+        # from the event stream so the streamed turn replays exactly like the
+        # non-streaming one (``_to_llm_response``). Keyed by the stream's block
+        # ``index`` while open; ``_ordered_blocks`` flattens it at the end.
+        #
+        # This exists for extended thinking: a ``thinking`` block's
+        # ``signature`` arrives as its own ``signature_delta`` event AFTER the
+        # ``thinking_delta`` text, and ``redacted_thinking`` blocks carry their
+        # opaque payload on ``content_block_start`` with no deltas at all.
+        # Neither can be expressed in the flattened ``reasoning_content``
+        # string, so a streamed thinking turn used to yield reasoning that
+        # ``thinking_format="content_block"`` could not replay.
+        blocks: dict[int, dict[str, Any]] = {}
         stream = await self._client.messages.create(**kwargs)
         async for event in stream:
             etype = getattr(event, "type", "")
@@ -184,27 +204,65 @@ class AnthropicClient(LLMClient):
                         cache_write = cw
             elif etype == "content_block_start":
                 cb = getattr(event, "content_block", None)
-                if getattr(cb, "type", "") == "tool_use":
+                idx = getattr(event, "index", 0)
+                cbtype = getattr(cb, "type", "")
+                if cbtype == "tool_use":
                     # Open a tool-call slot: id + name set once; arguments
                     # arrive as ``input_json_delta`` partial-JSON fragments.
+                    # Deliberately NOT recorded in ``blocks``: tool calls ride
+                    # the ``tool_call_deltas`` channel and are re-emitted from
+                    # ``Message.tool_calls`` on replay, exactly as the
+                    # non-streaming ``_to_llm_response`` does.
                     yield StreamDelta(tool_call_deltas=[{
-                        "index": getattr(event, "index", 0),
+                        "index": idx,
                         "id": getattr(cb, "id", "") or "",
                         "name": getattr(cb, "name", "") or "",
                         "arguments": "",
                     }])
+                elif cbtype == "text":
+                    blocks[idx] = {
+                        "type": "text",
+                        "text": getattr(cb, "text", "") or "",
+                    }
+                elif cbtype == "thinking":
+                    blocks[idx] = {
+                        "type": "thinking",
+                        "thinking": getattr(cb, "thinking", "") or "",
+                        "signature": getattr(cb, "signature", "") or "",
+                    }
+                elif cbtype == "redacted_thinking":
+                    # Whole payload lands on the start event — no deltas follow.
+                    blocks[idx] = {
+                        "type": "redacted_thinking",
+                        "data": getattr(cb, "data", "") or "",
+                    }
             elif etype == "content_block_delta":
                 d = getattr(event, "delta", None)
                 dtype = getattr(d, "type", "")
+                idx = getattr(event, "index", 0)
                 if dtype == "text_delta":
-                    yield StreamDelta(content=getattr(d, "text", "") or "")
+                    chunk = getattr(d, "text", "") or ""
+                    blk = blocks.get(idx)
+                    if blk is not None and blk.get("type") == "text":
+                        blk["text"] += chunk
+                    yield StreamDelta(content=chunk)
                 elif dtype == "thinking_delta":
-                    yield StreamDelta(
-                        reasoning_content=getattr(d, "thinking", "") or "",
-                    )
+                    chunk = getattr(d, "thinking", "") or ""
+                    blk = blocks.get(idx)
+                    if blk is not None and blk.get("type") == "thinking":
+                        blk["thinking"] += chunk
+                    yield StreamDelta(reasoning_content=chunk)
+                elif dtype == "signature_delta":
+                    # The signature is a single opaque token, not an
+                    # incremental text stream, but it is appended rather than
+                    # assigned so a provider that ever chunks it still
+                    # reassembles correctly.
+                    blk = blocks.get(idx)
+                    if blk is not None and blk.get("type") == "thinking":
+                        blk["signature"] += getattr(d, "signature", "") or ""
                 elif dtype == "input_json_delta":
                     yield StreamDelta(tool_call_deltas=[{
-                        "index": getattr(event, "index", 0),
+                        "index": idx,
                         "id": None,
                         "name": None,
                         "arguments": getattr(d, "partial_json", "") or "",
@@ -217,17 +275,31 @@ class AnthropicClient(LLMClient):
                     ot = getattr(u, "output_tokens", None)
                     if ot is not None:
                         output_tokens = ot
+                    # ``output_tokens_details.thinking_tokens`` when the payload
+                    # carries it; without this the streamed path reported no
+                    # ``reasoning_tokens`` at all while the non-streaming path
+                    # did, splitting one model's thinking spend across two
+                    # differently-shaped usage dicts.
+                    rt = _anthropic_reasoning_tokens(u)
+                    if rt is not None:
+                        reasoning_tokens = rt
         # Terminal delta: fold the accumulated usage/finish/model onto the
         # assembled ``LLMResponse`` (mirrors OpenAI's empty-choices chunk).
+        # ``reasoning_blocks`` is sent ONLY for a thinking turn — for a plain
+        # text turn the flattened ``content`` string is the faithful shape and
+        # the assembler should keep using it.
+        ordered = _ordered_blocks(blocks)
         yield StreamDelta(
             usage=_anthropic_usage_dict(
                 input_tokens,
                 output_tokens,
                 cache_read,
                 cache_write,
+                reasoning_tokens,
             ),
             finish_reason=stop_reason,
             model=model,
+            reasoning_blocks=ordered if _has_thinking(ordered) else [],
         )
 
 
@@ -261,11 +333,25 @@ def _build_bedrock_client(
     (needs AWS creds); we override it to inject the Bearer header. Everything
     else the Bedrock client gives for free is what we want — the
     ``/v1/messages`` → ``/model/{id}/invoke`` URL rewrite and the
-    ``anthropic_version: bedrock-2023-05-31`` body stamp."""
+    ``anthropic_version: bedrock-2023-05-31`` body stamp.
+
+    Because the override REPLACES SigV4 outright, a missing key cannot fall back
+    to the AWS credential chain the stock method would have consulted — it would
+    send a bare ``Authorization: Bearer`` and get a 401 that looks like a bad
+    key rather than a bypassed auth path. So the key is resolved from
+    ``api_key`` then ``AWS_BEARER_TOKEN_BEDROCK`` (the env var the Bedrock API-key
+    flow documents), and a still-empty value raises instead of building a client
+    that cannot authenticate."""
     import httpx
     from anthropic import AsyncAnthropicBedrock
 
-    bearer = api_key or ""
+    bearer = api_key or os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")
+    if not bearer:
+        raise ValueError(
+            "Bedrock transport needs a Bedrock API key: pass api_key= or set "
+            "AWS_BEARER_TOKEN_BEDROCK. This client overrides SigV4 request "
+            "signing with Bearer auth, so ambient AWS credentials are NOT used.",
+        )
 
     class _BearerBedrock(AsyncAnthropicBedrock):
         async def _prepare_request(self, request: httpx.Request) -> None:
@@ -330,7 +416,7 @@ def _add_prompt_cache(kwargs: dict[str, Any]) -> None:
         content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
 
 
-def _to_anthropic_msg(m: Message) -> dict[str, Any]:
+def _to_anthropic_msg(m: Message) -> dict[str, Any] | None:
     role = m.get("role")
     if role == "tool":
         return {
@@ -377,14 +463,80 @@ def _to_anthropic_msg(m: Message) -> dict[str, Any]:
             if body:
                 blocks.append({"type": "text", "text": body})
         for tc in m.get("tool_calls", []) or []:
-            blocks.append({
-                "type": "tool_use",
-                "id": tc["id"],
-                "name": tc["function"]["name"],
-                "input": json.loads(tc["function"].get("arguments") or "{}"),
-            })
-        return {"role": "assistant", "content": blocks or [{"type": "text", "text": ""}]}
+            block = _to_anthropic_tool_use(tc)
+            if block is not None:
+                blocks.append(block)
+        if not blocks:
+            # Nothing to say and nothing to call. An empty ``text`` block is
+            # NOT a usable placeholder — Anthropic rejects zero-length text
+            # ("text content blocks must be non-empty"), and once such a turn
+            # lands in durable history EVERY later request replaying it fails
+            # in conversion, before a request is even sent. Whitespace-only is
+            # no safer: as the final message it trips the trailing-whitespace
+            # check instead. Reachable in practice from
+            # ``finish_reason="length"`` with empty content, which
+            # ``_to_llm_response`` maps to ``content=""``.
+            #
+            # Dropping the turn is the faithful shape — there was no assistant
+            # output to replay — and it is safe because the Messages API
+            # combines consecutive same-role messages rather than requiring
+            # strict alternation. The caller filters the ``None``.
+            logger.debug(
+                "dropping contentless assistant message from Anthropic request",
+            )
+            return None
+        return {"role": "assistant", "content": blocks}
     return {"role": "user", "content": text_of(m.get("content", ""))}
+
+
+def _to_anthropic_tool_use(tc: Any) -> dict[str, Any] | None:
+    """One OpenAI ``tool_calls`` entry → an Anthropic ``tool_use`` block.
+
+    Returns ``None`` for a call this conversion cannot express, rather than
+    raising. Everything here runs while REPLAYING durable history, so an
+    exception is not a one-request failure: the malformed call is already
+    recorded, and every subsequent turn in the session re-converts it and dies
+    the same way. A partial or truncated tool call must degrade, not wedge the
+    session.
+
+    - Missing ``id`` or function ``name`` → dropped. Anthropic requires both,
+      and a call with no id can have no matching ``tool_result`` to orphan.
+    - Unparseable or non-object ``arguments`` → ``{}``. Anthropic's ``input``
+      must be a JSON object, and on replay the arguments are historical detail
+      (the tool already ran); the block's *identity* is what the following
+      ``tool_result`` needs to validate against. The OpenAI path passes the raw
+      string through, so parity here means surviving the same input.
+    """
+    if not isinstance(tc, dict):
+        logger.warning("skipping non-dict tool_call in Anthropic conversion")
+        return None
+    fn = tc.get("function")
+    fn = fn if isinstance(fn, dict) else {}
+    call_id = tc.get("id") or ""
+    name = fn.get("name") or ""
+    if not call_id or not name:
+        logger.warning(
+            "skipping malformed tool_call in Anthropic conversion "
+            "(id=%r, name=%r)", call_id, name,
+        )
+        return None
+    raw_args = fn.get("arguments") or "{}"
+    try:
+        parsed = json.loads(raw_args)
+    except (TypeError, ValueError):
+        logger.warning(
+            "tool_call %s (%s) has unparseable arguments; replaying with an "
+            "empty input object", call_id, name,
+        )
+        parsed = {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "tool_call %s (%s) arguments parsed to %s, not an object; "
+            "replaying with an empty input object",
+            call_id, name, type(parsed).__name__,
+        )
+        parsed = {}
+    return {"type": "tool_use", "id": call_id, "name": name, "input": parsed}
 
 
 def _to_anthropic_tool(t: dict[str, Any]) -> dict[str, Any]:
@@ -410,7 +562,8 @@ def _anthropic_usage_dict(
     Cache reads and writes are kept separate for billing and also summed into
     the backward-compatible ``cached_tokens`` field. ``reasoning``
     (extended-thinking tokens, part of ``output_tokens``) is surfaced
-    separately when present."""
+    separately when the payload reported it — ``None`` means "not reported" and
+    omits the key, while ``0`` is recorded as a real zero."""
     out: dict[str, int] = {}
     if input_tokens is not None:
         out["prompt_tokens"] = int(input_tokens)
@@ -423,7 +576,7 @@ def _anthropic_usage_dict(
         out["cache_write_tokens"] = write
         out["cached_tokens"] = read + write
         out["cache_creation_tokens"] = write
-    if reasoning:
+    if reasoning is not None:
         out["reasoning_tokens"] = int(reasoning)
     if out.get("prompt_tokens") or out.get("completion_tokens"):
         out["total_tokens"] = (
@@ -450,21 +603,47 @@ def _anthropic_cache_write_tokens(usage: Any) -> int | None:
     return max(0, int(raw or 0)) + max(0, int(extension or 0))
 
 
-def _anthropic_reasoning_tokens(usage: Any) -> int:
+def _anthropic_reasoning_tokens(usage: Any) -> int | None:
     """Best-effort extended-thinking token count off an Anthropic usage object.
 
     Newer usage payloads may expose ``output_tokens_details.thinking_tokens``;
-    absent that the count is folded into ``output_tokens`` and unrecoverable, so
-    we return 0 (the ``reasoning_tokens`` key is then omitted)."""
+    absent that the count is folded into ``output_tokens`` and unrecoverable.
+
+    Returns ``None`` for "the payload didn't say", distinct from ``0`` for "the
+    payload said zero" — the ``reasoning_tokens`` key is omitted only in the
+    former case. Collapsing the two would make a model that genuinely spent no
+    thinking tokens indistinguishable from a gateway that reports nothing, which
+    is the same ambiguity ``openai_chat._usage_dict`` and
+    ``_responses_usage_dict`` avoid with their own ``is not None`` checks."""
     if usage is None:
-        return 0
+        return None
     otd = getattr(usage, "output_tokens_details", None)
     if otd is None:
-        return 0
+        return None
     val = getattr(otd, "thinking_tokens", None)
     if val is None and isinstance(otd, dict):
         val = otd.get("thinking_tokens")
-    return int(val or 0)
+    return None if val is None else int(val)
+
+
+def _ordered_blocks(blocks: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten the streamed block accumulator back into emission order.
+
+    Anthropic numbers content blocks with a monotonically increasing ``index``
+    per message, so sorting by key restores the order the provider produced —
+    which is the order signed thinking must be replayed in."""
+    return [blocks[i] for i in sorted(blocks)]
+
+
+def _has_thinking(blocks: list[dict[str, Any]]) -> bool:
+    """Whether a block list carries reasoning that needs verbatim replay.
+
+    Mirrors ``_to_llm_response``'s ``thinking_parts or has_redacted`` gate: the
+    structured block list is only worth carrying when there is a signature or
+    an opaque redacted payload to preserve."""
+    return any(
+        b.get("type") in ("thinking", "redacted_thinking") for b in blocks
+    )
 
 
 def _to_llm_response(raw: Any) -> LLMResponse:

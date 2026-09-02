@@ -541,4 +541,10 @@ def _tool_call_deltas(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
-__all__ = ["OpenAIClient", "SessionQueryResolver", "configure_session_query_resolver"]
+__all__ = [
+    "OpenAIClient",
+    "SessionQueryResolver",
+    "SessionScopeResolver",
+    "configure_session_query_resolver",
+    "configure_session_scope_resolver",
+]

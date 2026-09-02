@@ -912,3 +912,211 @@ async def test_openai_stream_terminal_usage_carries_reasoning_tokens():
     deltas = [d async for d in c.stream([user_msg("hi")])]
 
     assert deltas[-1].usage["reasoning_tokens"] == 17
+
+
+# ── Anthropic message conversion: malformed / contentless history ──────────
+#
+# Every case below runs while REPLAYING durable history. A raise here is not a
+# one-request failure: the offending message is already recorded, so every
+# later turn in the session re-converts it and dies the same way. These assert
+# the conversion degrades instead.
+
+
+def test_anthropic_tool_use_survives_unparseable_arguments():
+    """Truncated tool-call JSON must not wedge the session.
+
+    The OpenAI path forwards ``arguments`` as an opaque string, so a malformed
+    call is survivable there; ``json.loads`` made it permanently fatal here.
+    """
+    am = ac._to_anthropic_msg(assistant_msg(
+        "",
+        tool_calls=[{"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": '{"a": 1'}}],
+    ))
+    assert am is not None
+    assert am["content"] == [
+        {"type": "tool_use", "id": "c1", "name": "f", "input": {}},
+    ]
+
+
+def test_anthropic_tool_use_rejects_non_object_arguments():
+    """Anthropic's ``input`` must be an object; a bare JSON scalar becomes {}."""
+    am = ac._to_anthropic_msg(assistant_msg(
+        "",
+        tool_calls=[{"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": "[1, 2]"}}],
+    ))
+    assert am is not None
+    assert am["content"][0]["input"] == {}
+
+
+def test_anthropic_tool_use_drops_calls_missing_id_or_name():
+    """Anthropic requires both; emitting ``id=""`` is a guaranteed 400."""
+    am = ac._to_anthropic_msg(assistant_msg(
+        "some text",
+        tool_calls=[
+            {"id": "", "type": "function",
+             "function": {"name": "f", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"arguments": "{}"}},
+            {"id": "c3", "type": "function",
+             "function": {"name": "ok", "arguments": "{}"}},
+        ],
+    ))
+    assert am is not None
+    assert [b.get("id") for b in am["content"] if b["type"] == "tool_use"] == ["c3"]
+
+
+def test_anthropic_contentless_assistant_message_is_dropped():
+    """An assistant turn with no text and no tool calls has nothing sendable.
+
+    The old fallback emitted ``{"type": "text", "text": ""}``, which Anthropic
+    rejects ("text content blocks must be non-empty") — and once in history it
+    failed on every later turn. Reachable from ``finish_reason="length"`` with
+    empty content.
+    """
+    assert ac._to_anthropic_msg(assistant_msg("")) is None
+
+
+async def test_anthropic_build_kwargs_filters_dropped_messages():
+    """The request builder must not leave a ``None`` in ``messages``."""
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("hi"), assistant_msg(""), user_msg("again")],
+        tools=None, temperature=None, max_tokens=None,
+        extra_headers=None, timeout=None,
+    )
+    assert all(m is not None for m in kwargs["messages"])
+    assert [m["role"] for m in kwargs["messages"]] == ["user", "user"]
+
+
+async def test_anthropic_stream_captures_signature_and_redacted_thinking():
+    """Streamed extended thinking must replay exactly like the non-streaming path.
+
+    ``signature`` arrives as its own ``signature_delta`` AFTER the thinking
+    text, and ``redacted_thinking`` carries its payload on
+    ``content_block_start`` with no deltas — neither fits in the flattened
+    ``reasoning_content`` string, so a streamed thinking turn used to produce
+    reasoning that ``thinking_format="content_block"`` could not replay.
+    """
+    async def fake_events():
+        yield SimpleNamespace(type="message_start", message=SimpleNamespace(
+            model="claude-x", usage=SimpleNamespace(input_tokens=10)))
+        yield SimpleNamespace(type="content_block_start", index=0,
+                              content_block=SimpleNamespace(type="thinking"))
+        yield SimpleNamespace(type="content_block_delta", index=0,
+                              delta=SimpleNamespace(type="thinking_delta",
+                                                    thinking="step "))
+        yield SimpleNamespace(type="content_block_delta", index=0,
+                              delta=SimpleNamespace(type="thinking_delta",
+                                                    thinking="one"))
+        yield SimpleNamespace(type="content_block_delta", index=0,
+                              delta=SimpleNamespace(type="signature_delta",
+                                                    signature="sig-abc"))
+        yield SimpleNamespace(type="content_block_start", index=1,
+                              content_block=SimpleNamespace(
+                                  type="redacted_thinking", data="enc-payload"))
+        yield SimpleNamespace(type="content_block_start", index=2,
+                              content_block=SimpleNamespace(type="text"))
+        yield SimpleNamespace(type="content_block_delta", index=2,
+                              delta=SimpleNamespace(type="text_delta",
+                                                    text="the answer"))
+        yield SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(
+                output_tokens=40,
+                output_tokens_details=SimpleNamespace(thinking_tokens=30),
+            ))
+        yield SimpleNamespace(type="message_stop")
+
+    c = ac.AnthropicClient("claude-x", api_key="x",
+                           thinking={"type": "adaptive"})
+    c._client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(return_value=fake_events())))
+    deltas = [d async for d in c.stream([user_msg("hi")])]
+
+    # Flattened channels still work for live rendering.
+    assert "".join(d.reasoning_content for d in deltas) == "step one"
+    assert "".join(d.content for d in deltas) == "the answer"
+
+    terminal = deltas[-1]
+    # Verbatim block list, in the provider's emission order, signature intact.
+    assert terminal.reasoning_blocks == [
+        {"type": "thinking", "thinking": "step one", "signature": "sig-abc"},
+        {"type": "redacted_thinking", "data": "enc-payload"},
+        {"type": "text", "text": "the answer"},
+    ]
+    # Streamed usage now reports thinking tokens like the non-streaming path.
+    assert terminal.usage["reasoning_tokens"] == 30
+
+
+async def test_anthropic_stream_omits_blocks_for_a_plain_text_turn():
+    """No thinking → the flattened string stays the faithful shape."""
+    async def fake_events():
+        yield SimpleNamespace(type="message_start", message=SimpleNamespace(
+            model="claude-x", usage=SimpleNamespace(input_tokens=3)))
+        yield SimpleNamespace(type="content_block_start", index=0,
+                              content_block=SimpleNamespace(type="text"))
+        yield SimpleNamespace(type="content_block_delta", index=0,
+                              delta=SimpleNamespace(type="text_delta", text="hi"))
+        yield SimpleNamespace(type="message_delta",
+                              delta=SimpleNamespace(stop_reason="end_turn"),
+                              usage=SimpleNamespace(output_tokens=2))
+
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    c._client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(return_value=fake_events())))
+    deltas = [d async for d in c.stream([user_msg("hi")])]
+    assert deltas[-1].reasoning_blocks == []
+    # An absent ``output_tokens_details`` leaves the key unset (unknown), while
+    # an explicit 0 would be recorded — the two are deliberately distinct.
+    assert "reasoning_tokens" not in deltas[-1].usage
+
+
+def test_anthropic_usage_records_an_explicit_zero_reasoning_count():
+    usage = SimpleNamespace(
+        input_tokens=5, output_tokens=7,
+        output_tokens_details=SimpleNamespace(thinking_tokens=0),
+    )
+    assert ac._anthropic_reasoning_tokens(usage) == 0
+    assert ac._anthropic_usage_dict(5, 7, None, None, 0)["reasoning_tokens"] == 0
+    assert ac._anthropic_reasoning_tokens(SimpleNamespace()) is None
+    assert "reasoning_tokens" not in ac._anthropic_usage_dict(5, 7, None, None, None)
+
+
+def test_anthropic_bedrock_requires_a_bearer_key(monkeypatch):
+    """The Bearer override replaces SigV4, so ambient AWS creds are NOT used.
+
+    Building without a key used to send ``Authorization: Bearer `` and 401 as if
+    the key were merely wrong.
+    """
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    with pytest.raises(ValueError, match="AWS_BEARER_TOKEN_BEDROCK"):
+        ac._build_bedrock_client(None, None, 30.0, None)
+
+
+def test_anthropic_bedrock_falls_back_to_env_bearer(monkeypatch):
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "env-key")
+    client = ac._build_bedrock_client(
+        None, "https://bedrock-runtime.us-west-2.amazonaws.com", 30.0, None,
+    )
+    assert client is not None
+
+
+def test_session_resolver_hooks_are_reachable_from_the_package_facade():
+    """Hosts configure these global hooks through ``agent_core.providers``.
+
+    ``configure_session_scope_resolver`` / ``SessionScopeResolver`` shipped
+    without being exported, so the documented wiring path could not reach them —
+    only the submodule could.
+    """
+    import agent_core.providers as providers
+
+    for name in (
+        "SessionQueryResolver",
+        "SessionScopeResolver",
+        "configure_session_query_resolver",
+        "configure_session_scope_resolver",
+    ):
+        assert hasattr(providers, name), name
+        assert name in providers.__all__, name

@@ -19,19 +19,50 @@ profile's ``thinking_format`` is ``content_block`` (see
 from __future__ import annotations
 
 # pyright: basic, reportPrivateImportUsage=false
-from typing import Any
+import logging
+from typing import Any, get_args
 
 from agent_core.llm import LLMClient
-from agent_core.runtime.loop.model_profile import is_wire_protocol
+
+# Single source of truth for the valid ``llm.protocol`` values. Duplicating the
+# set here would let the two drift, which is how a protocol becomes buildable
+# but has no ``thinking_format`` (or vice versa).
+from agent_core.runtime.loop.model_profile import WireProtocol, is_wire_protocol
+
+logger = logging.getLogger(__name__)
+
+# Anthropic's floor for ``thinking.budget_tokens`` on the legacy ``enabled``
+# shape. The API also requires ``budget_tokens < max_tokens``, so the two
+# constraints together make any ``max_tokens <= 1024`` unsatisfiable.
+_MIN_THINKING_BUDGET = 1024
 
 
 def protocol_of(cfg: dict[str, Any]) -> str:
-    """Normalised ``llm.protocol`` (default ``chat_completions``)."""
+    """Normalised ``llm.protocol`` (default ``chat_completions``).
+
+    An unusable value — wrong type, or a string that names no known protocol —
+    normalises to ``chat_completions`` and is LOGGED. The value comes from
+    hand-written YAML, and a typo (``anthropc``) otherwise degrades in total
+    silence: :func:`build_protocol_client` returns ``None``,
+    :func:`thinking_format_for_protocol` returns ``None``, and the profile ends
+    up on a Chat Completions client with tag-format thinking. Requests keep
+    succeeding while the signed reasoning is quietly dropped, and nothing points
+    at the profile. An ABSENT or empty value is the documented default and is
+    not logged.
+    """
     raw = cfg.get("protocol")
-    if not isinstance(raw, str):
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
         return "chat_completions"
-    lowered = raw.lower()
-    return lowered if is_wire_protocol(lowered) else "chat_completions"
+    if isinstance(raw, str):
+        lowered = raw.lower()
+        if is_wire_protocol(lowered):
+            return lowered
+    logger.warning(
+        "unknown llm.protocol %r for model %r; falling back to "
+        "chat_completions. Valid values: %s",
+        raw, cfg.get("model", "?"), ", ".join(sorted(get_args(WireProtocol))),
+    )
+    return "chat_completions"
 
 
 def provider_label(cfg: dict[str, Any]) -> str:
@@ -97,7 +128,10 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
       (Sonnet 4.5, Opus 4.5, …), which reject ``adaptive`` with 400. Emits
       ``thinking={"type":"enabled","budget_tokens":N}`` (``N`` from
       ``thinking_budget_tokens``, default 8192, clamped to ``[1024, max_tokens-1]``
-      since Anthropic requires ``budget_tokens < max_tokens``). ``effort`` is
+      since Anthropic requires ``budget_tokens < max_tokens``). When the
+      configured ``max_tokens`` is too small for the 1024 floor, ``max_tokens``
+      is RAISED to ``budget + 1`` rather than emitting an invalid pair — see
+      :func:`_enabled_thinking_budget`. ``effort`` is
       NOT sent (budget_tokens is the control knob here; oldest models 400 on it).
       Deprecated on Opus 4.6 / Sonnet 4.6 per Anthropic.
     """
@@ -106,8 +140,9 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
     max_tokens = int(cfg.get("max_tokens", 32768))
     ttype = str(cfg.get("thinking_type", "adaptive")).strip().lower()
     if ttype == "enabled":
-        budget = int(cfg.get("thinking_budget_tokens", 8192))
-        budget = max(1024, min(budget, max_tokens - 1))
+        budget, max_tokens = _enabled_thinking_budget(
+            int(cfg.get("thinking_budget_tokens", 8192)), max_tokens,
+        )
         thinking: dict[str, Any] = {"type": "enabled", "budget_tokens": budget}
         effort = ""
     else:
@@ -125,6 +160,34 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
         effort=effort,
         bedrock=bedrock,
     )
+
+
+def _enabled_thinking_budget(budget: int, max_tokens: int) -> tuple[int, int]:
+    """Reconcile ``thinking.budget_tokens`` with ``max_tokens``.
+
+    Anthropic imposes two constraints on the legacy ``enabled`` thinking shape:
+    ``budget_tokens >= 1024`` and ``budget_tokens < max_tokens``. They are
+    jointly unsatisfiable whenever ``max_tokens <= 1024``, so a naive
+    ``max(1024, min(budget, max_tokens - 1))`` clamp silently emits a pair the
+    API rejects — ``max_tokens=512`` produced ``budget_tokens=1024``, i.e. a
+    budget LARGER than the response cap, and a 400 on every call.
+
+    The floor wins, because it is the API's own minimum and cannot be
+    negotiated: when ``max_tokens`` cannot accommodate it, ``max_tokens`` is
+    raised to ``budget + 1`` and the adjustment logged. Returns the
+    ``(budget, max_tokens)`` pair to send.
+    """
+    budget = max(_MIN_THINKING_BUDGET, min(budget, max_tokens - 1))
+    if budget >= max_tokens:
+        raised = budget + 1
+        logger.warning(
+            "thinking_type=enabled requires budget_tokens (%d) < max_tokens, "
+            "but max_tokens is %d; raising max_tokens to %d. Set max_tokens "
+            "above %d in the profile to silence this.",
+            budget, max_tokens, raised, _MIN_THINKING_BUDGET,
+        )
+        max_tokens = raised
+    return budget, max_tokens
 
 
 def _build_responses(cfg: dict[str, Any], title: str) -> LLMClient:
@@ -165,6 +228,9 @@ def build_protocol_client(cfg: dict[str, Any], *, title: str) -> LLMClient | Non
     Returns ``None`` for ``chat_completions`` (the caller builds its usual
     ``OpenAIClient``); an :class:`AnthropicClient` / :class:`OpenAIResponsesClient`
     otherwise. ``title`` is the ``X-Title`` header stamped on Responses calls.
+
+    An unrecognised ``protocol`` also lands here as ``chat_completions`` →
+    ``None``; :func:`protocol_of` is what logs it.
     """
     protocol = protocol_of(cfg)
     if protocol == "anthropic":

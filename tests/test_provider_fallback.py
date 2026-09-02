@@ -275,11 +275,51 @@ def test_empty_entries_list_rejected() -> None:
 def test_default_triggers_apply_to_unconfigured_entries() -> None:
     primary = _ScriptedLLM(name="primary", answer="ok")
     chain = LLMFallbackChain(
-        entries=[FallbackEntry(model=primary, triggers=())],
+        entries=[FallbackEntry(model=primary)],
         default_triggers=("timeout", "5xx"),
     )
-    # ``__post_init__`` fills in the default for the empty-triggers entry.
+    # ``__post_init__`` fills in the default for an entry that left triggers
+    # UNSET (``None``) — the only shape that means "not configured".
     assert chain.entries[0].triggers == ("timeout", "5xx")
+
+
+def test_explicit_empty_triggers_survive_normalisation() -> None:
+    """``triggers=()`` is a hard barrier, not a missing value.
+
+    ``__post_init__`` must not substitute ``default_triggers`` for it, or an
+    entry declared as "never fall through" silently falls through on any error.
+    """
+    primary = _ScriptedLLM(name="primary", answer="ok")
+    chain = LLMFallbackChain(
+        entries=[FallbackEntry(model=primary, triggers=()), FallbackEntry(model=primary)],
+        default_triggers=("any_error",),
+    )
+    assert chain.entries[0].triggers == ()
+    assert chain.entries[1].triggers == ("any_error",)
+    assert not chain.entries[0].matches(Exception("boom"))
+
+
+async def test_mid_chain_barrier_stops_failover() -> None:
+    """A middle entry with ``triggers=()`` must end the chain, not be skipped."""
+    tier1 = _ScriptedLLM(name="tier1", raise_exc=RuntimeError("tier1 down"))
+    tier2 = _ScriptedLLM(name="tier2", raise_exc=RuntimeError("tier2 down"))
+    tier3 = _ScriptedLLM(name="tier3", answer="should never be reached")
+    chain = LLMFallbackChain(
+        entries=[
+            FallbackEntry(model=tier1),
+            FallbackEntry(model=tier2, triggers=()),
+            FallbackEntry(model=tier3),
+        ],
+        default_triggers=("any_error",),
+    )
+    with pytest.raises(RuntimeError, match="tier2 down"):
+        await chain.chat([{"role": "user", "content": "hi"}])
+
+
+def test_standalone_entry_defaults_to_any_error() -> None:
+    """An unset entry used outside a chain keeps the permissive default."""
+    primary = _ScriptedLLM(name="primary", answer="ok")
+    assert FallbackEntry(model=primary).matches(Exception("boom"))
 
 
 def test_model_name_lists_all_models() -> None:
