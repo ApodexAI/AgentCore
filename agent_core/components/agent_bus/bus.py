@@ -111,6 +111,10 @@ _default_pause_check_factory: PauseCheckFactory | None = None
 EventSinkResolver = Callable[[], EventSink | None]
 _default_event_sink_resolver: EventSinkResolver | None = None
 _default_session_activity = True
+RuntimeHooksResolver = Callable[[], Any]
+_default_runtime_hooks_resolver: RuntimeHooksResolver | None = None
+ToolCallParserResolver = Callable[[], Any]
+_default_tool_call_parser_resolver: ToolCallParserResolver | None = None
 
 
 def configure_default_pause_check_factory(
@@ -133,6 +137,54 @@ def configure_default_session_activity(enabled: bool) -> None:
     """Enable or disable the portable live session activity observer."""
     global _default_session_activity
     _default_session_activity = bool(enabled)
+
+
+def configure_default_runtime_hooks(
+    resolver: RuntimeHooksResolver | None,
+) -> None:
+    """Configure the ``AgentLoopHooks`` every sub-agent run is given.
+
+    A host almost always wraps the loop engine with its own hooks — per-tool
+    timeout floors, execution scopes for cost and trace attribution, overflow
+    spill files, session affinity. Those live in the host's wrapper, so a bus
+    that called the engine with no hooks would give them to the agents the
+    host launches itself and silently withhold them from every sub-agent it
+    spawns. The asymmetry has no runtime symptom: the loop still runs, just
+    with all-default no-op hooks.
+
+    A resolver rather than a value, so a host below the loop package in its
+    own layer stack can import lazily. ``None`` means the engine's defaults,
+    which is right for a host that does not wrap it.
+    """
+    global _default_runtime_hooks_resolver
+    _default_runtime_hooks_resolver = resolver
+
+
+def configure_default_tool_call_parser(
+    resolver: ToolCallParserResolver | None,
+) -> None:
+    """Configure the tool-call parser every sub-agent run is given.
+
+    Same reasoning as :func:`configure_default_runtime_hooks`: parser policy
+    (how a hallucinated tool name is answered, whether unknown companion calls
+    stay in the batch) is a host decision that has to reach sub-agents too.
+    """
+    global _default_tool_call_parser_resolver
+    _default_tool_call_parser_resolver = resolver
+
+
+def _runtime_hooks() -> Any:
+    """Resolve host hooks at call time; ``None`` selects the engine defaults."""
+    if _default_runtime_hooks_resolver is None:
+        return None
+    return _default_runtime_hooks_resolver()
+
+
+def _tool_call_parser() -> Any:
+    """Resolve the host parser at call time; ``None`` selects the default."""
+    if _default_tool_call_parser_resolver is None:
+        return None
+    return _default_tool_call_parser_resolver()
 
 
 def _with_wall_clock_guard(
@@ -642,6 +694,8 @@ class AgentBus:
                     model_profile=runtime.model_profile,
                     history_policy=runtime.history_policy,
                     pause_check=self._task_pause_check_or_none(parent_task_id),
+                    parser=_tool_call_parser(),
+                    runtime_hooks=_runtime_hooks(),
                 )
                 if runtime.context_setup is not None:
                     coro = _run_within_context(
@@ -1406,6 +1460,8 @@ class AgentBus:
                     model_profile=active_runtime.model_profile,
                     history_policy=active_runtime.history_policy,
                     pause_check=self._task_pause_check_or_none(session.task_id),
+                    parser=_tool_call_parser(),
+                    runtime_hooks=_runtime_hooks(),
                 )
                 if active_runtime.context_setup is not None:
                     coro = _run_within_context(
