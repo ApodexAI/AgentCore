@@ -106,7 +106,13 @@ class LLMProxy:
                 refresh_prompt_id=True,
             )
             metadata["step_id"] = default_step_id
-            scope.metadata.update(metadata)
+            # Only the scope-stable identifier goes back to the scope.
+            # ``step_id`` / ``prompt_id`` identify THIS call, and an
+            # execution scope is shared by concurrent ``chat`` / ``stream``
+            # invocations (see ``_next_call_index``) — writing them onto the
+            # scope let two calls overwrite each other, so a failure was
+            # reported against the other call's step.
+            scope.metadata.setdefault("session_id", metadata["session_id"])
         # Stash the inner model id so a cost-accounting middleware can record
         # spend even when the provider's response_metadata doesn't echo
         # model_name (some models behind an OpenAI-compat gateway don't).
@@ -176,79 +182,89 @@ class LLMProxy:
         ctx = self._make_ctx(self._next_call_index())
         messages = await self.chain.run_before(ctx, messages)
         attempt = 0
-        while True:
-            start_time = time.time()
-            full_content = ""
-            full_reasoning = ""
-            stream_error: Exception | None = None
-            any_chunk_yielded = False
-            try:
-                async for delta in self.inner.stream(
-                    messages,
-                    tools=tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    extra_headers=extra_headers,
-                    timeout=timeout,
-                ):
-                    full_content += delta.content or ""
-                    full_reasoning += delta.reasoning_content or ""
-                    any_chunk_yielded = True
-                    # Per-chunk middleware hook. A middleware returning
-                    # True (e.g. StreamRepetitionDetector noticing a
-                    # degenerate loop) tells us to stop consuming the
-                    # inner stream and exit cleanly — the partial
-                    # response still flows through ``after_llm`` in the
-                    # finally block so observers see the truncated
-                    # content rather than nothing. The delta that
-                    # triggered the abort IS still yielded so the
-                    # consumer's accumulator stays consistent with the
-                    # LLMResponse we'll synthesise.
-                    yield delta
-                    if await self.chain.run_on_chunk(
-                        ctx,
-                        delta,
-                        full_content,
+        start_time = time.time()
+        full_content = ""
+        full_reasoning = ""
+        stream_error: Exception | None = None
+        try:
+            while True:
+                start_time = time.time()
+                full_content = ""
+                full_reasoning = ""
+                stream_error = None
+                any_chunk_yielded = False
+                try:
+                    async for delta in self.inner.stream(
+                        messages,
+                        tools=tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        extra_headers=extra_headers,
+                        timeout=timeout,
                     ):
-                        ctx.metadata["stream_aborted_by_middleware"] = True
-                        logger.info(
-                            "LLMProxy: stream aborted by middleware after %d chars",
-                            len(full_content),
-                        )
-                        break
-                break
-            except Exception as e:
-                stream_error = e
-                await _log_llm_exception(ctx, e)
-                if not any_chunk_yielded:
-                    should_retry = await self.chain.run_on_llm_error(
-                        ctx,
-                        e,
-                        attempt,
-                    )
-                    if should_retry:
-                        attempt += 1
-                        logger.info(
-                            "LLMProxy: retrying stream after attempt %d (%s)",
+                        full_content += delta.content or ""
+                        full_reasoning += delta.reasoning_content or ""
+                        any_chunk_yielded = True
+                        # Per-chunk middleware hook. A middleware returning
+                        # True (e.g. StreamRepetitionDetector noticing a
+                        # degenerate loop) tells us to stop consuming the
+                        # inner stream and exit cleanly — the partial
+                        # response still flows through ``after_llm`` in the
+                        # finally block so observers see the truncated
+                        # content rather than nothing. The delta that
+                        # triggered the abort IS still yielded so the
+                        # consumer's accumulator stays consistent with the
+                        # LLMResponse we'll synthesise.
+                        yield delta
+                        if await self.chain.run_on_chunk(
+                            ctx,
+                            delta,
+                            full_content,
+                        ):
+                            ctx.metadata["stream_aborted_by_middleware"] = True
+                            logger.info(
+                                "LLMProxy: stream aborted by middleware after %d chars",
+                                len(full_content),
+                            )
+                            break
+                    break
+                except Exception as e:
+                    stream_error = e
+                    await _log_llm_exception(ctx, e)
+                    if not any_chunk_yielded:
+                        should_retry = await self.chain.run_on_llm_error(
+                            ctx,
+                            e,
                             attempt,
-                            type(e).__name__,
                         )
-                        continue
-                raise
-            finally:
-                duration_ms = int(
-                    (time.time() - start_time) * 1000,
-                )
-                ctx.metadata["duration_ms"] = duration_ms
-                if stream_error:
-                    ctx.metadata["error"] = str(stream_error)
-                await self.chain.run_after(
-                    ctx,
-                    LLMResponse(
-                        content=full_content,
-                        reasoning_content=full_reasoning,
-                    ),
-                )
+                        if should_retry:
+                            attempt += 1
+                            logger.info(
+                                "LLMProxy: retrying stream after attempt %d (%s)",
+                                attempt,
+                                type(e).__name__,
+                            )
+                            continue
+                    raise
+        finally:
+            # Once per ``stream()`` call, not once per retry attempt. This
+            # block used to sit inside ``while True``, so a stream that failed
+            # before its first chunk and retried handed every middleware an
+            # empty ``LLMResponse`` and then the real one — any usage/cost
+            # accounting or history-appending middleware double-counted.
+            duration_ms = int(
+                (time.time() - start_time) * 1000,
+            )
+            ctx.metadata["duration_ms"] = duration_ms
+            if stream_error:
+                ctx.metadata["error"] = str(stream_error)
+            await self.chain.run_after(
+                ctx,
+                LLMResponse(
+                    content=full_content,
+                    reasoning_content=full_reasoning,
+                ),
+            )
 
     def __getattr__(self, name: str) -> Any:
         # Defer unknown attributes to the inner client so callers that
