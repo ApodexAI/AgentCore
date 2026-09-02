@@ -11,12 +11,25 @@ _WORKFLOW_DEFAULTS: dict[str, dict[str, Any]] = {}
 def register_workflow_defaults(
     pipeline_ids: str | tuple[str, ...],
     defaults: Mapping[str, Any],
+    *,
+    merge: bool = True,
+    include_none: bool = False,
 ) -> None:
-    """Register an immutable snapshot of product-owned workflow defaults."""
+    """Register product defaults without accidentally blanking prior values.
+
+    Registrations merge by default because hosts commonly contribute defaults
+    from several composition modules. ``None`` means "no product default" and
+    is ignored unless ``include_none`` is explicitly requested.
+    """
     ids = (pipeline_ids,) if isinstance(pipeline_ids, str) else pipeline_ids
-    snapshot = dict(defaults)
+    snapshot = {
+        key: value
+        for key, value in defaults.items()
+        if include_none or value is not None
+    }
     for pipeline_id in ids:
-        _WORKFLOW_DEFAULTS[pipeline_id] = snapshot
+        current = _WORKFLOW_DEFAULTS.get(pipeline_id, {}) if merge else {}
+        _WORKFLOW_DEFAULTS[pipeline_id] = {**current, **snapshot}
 
 
 def clear_workflow_defaults() -> None:
