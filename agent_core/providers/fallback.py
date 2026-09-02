@@ -54,7 +54,9 @@ from __future__ import annotations
 # pyright: basic, reportPrivateImportUsage=false
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Sequence
+import random
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -64,11 +66,33 @@ from agent_core.messages import Message
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CooldownFallbackLLM",
     "FallbackEntry",
     "FallbackTrigger",
     "LLMFallbackChain",
+    "legacy_retryable",
     "with_provider_stamp",
 ]
+
+type FallbackEventHook = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+_LEGACY_RETRYABLE_KEYWORDS = frozenset({
+    "timeout", "timed out", "429", "500", "502", "503", "504", "529",
+    "overloaded", "rate limit", "rate_limit", "server error",
+    "connection reset", "connection error", "econnreset", "gateway timeout",
+    "model_dump", "model_not_found",
+})
+
+
+def legacy_retryable(error: Exception) -> bool:
+    """Match the historical two-model fallback wrapper's retry policy."""
+    return isinstance(error, AttributeError) or any(
+        keyword in str(error).lower() for keyword in _LEGACY_RETRYABLE_KEYWORDS
+    )
+
+
+async def _noop_event(_name: str, _payload: dict[str, Any]) -> None:
+    return None
 
 
 FallbackTrigger = Literal["timeout", "rate_limit", "5xx", "any_error"]
@@ -169,6 +193,225 @@ def _trigger_matches(trigger: FallbackTrigger, exc: BaseException) -> bool:
         )
 
     return False
+
+
+class CooldownFallbackLLM:
+    """Retry a primary client, then use a fallback client during cooldown.
+
+    This preserves the legacy two-model fallback behavior used by both host
+    products. Product tracing is an optional async event hook, keeping the
+    retry state machine independent of execution scopes and trace backends.
+
+    ``stream`` stops retrying the primary once any delta has reached the
+    consumer, because a retry would emit those deltas twice. Set
+    ``replay_partial_stream=True`` to restore the historical duplicating
+    behavior; prefer :class:`LLMFallbackChain` for rewind-safe semantics.
+    """
+
+    def __init__(
+        self,
+        primary: Any,
+        fallback: Any,
+        max_retries: int = 2,
+        cooldown_seconds: int = 60,
+        *,
+        retryable: Callable[[Exception], bool] = legacy_retryable,
+        event_hook: FallbackEventHook = _noop_event,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
+        replay_partial_stream: bool = False,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.max_retries = max_retries
+        self.cooldown_seconds = cooldown_seconds
+        self.model: str = _model_id(primary)
+        self._retryable = retryable
+        self._event_hook = event_hook
+        self._clock = clock
+        self._sleep = sleep
+        self._jitter = jitter
+        self._replay_partial_stream = replay_partial_stream
+        self._cooldown_until = 0.0
+
+    @property
+    def model_name(self) -> str:
+        return f"fallback({_model_id(self.primary)})"
+
+    async def _emit(self, name: str, **payload: Any) -> None:
+        try:
+            await self._event_hook(name, payload)
+        except Exception:
+            logger.debug("Fallback event hook failed", exc_info=True)
+
+    def _kwargs(
+        self,
+        *,
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        extra_headers: dict[str, str] | None,
+        timeout: float | None,
+    ) -> dict[str, Any]:
+        return {
+            "tools": tools,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "extra_headers": extra_headers,
+            "timeout": timeout,
+        }
+
+    async def chat(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        extra_headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> LLMResponse:
+        kwargs = self._kwargs(
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
+        if self._clock() < self._cooldown_until:
+            await self._emit(
+                "degrade",
+                reason="primary_cooldown",
+                degrade_from=_model_id(self.primary),
+                degrade_to=_model_id(self.fallback),
+            )
+            return await self.fallback.chat(messages, **kwargs)
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                await self._emit("request", leg="primary", attempt=attempt + 1)
+                return await self.primary.chat(messages, **kwargs)
+            except Exception as error:
+                last_error = error
+                await self._emit(
+                    "error",
+                    leg="primary",
+                    attempt=attempt + 1,
+                    error=str(error),
+                )
+                if not self._retryable(error):
+                    break
+                if attempt + 1 >= self.max_retries:
+                    # Last attempt: sleeping here only delays the degrade and
+                    # emits a ``retry`` event that no retry follows.
+                    break
+                delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
+                await self._emit("retry", attempt=attempt + 1, delay_s=delay)
+                await self._sleep(delay)
+
+        self._cooldown_until = self._clock() + self.cooldown_seconds
+        await self._emit(
+            "degrade",
+            reason="primary_exhausted",
+            degrade_from=_model_id(self.primary),
+            degrade_to=_model_id(self.fallback),
+            cooldown_seconds=self.cooldown_seconds,
+        )
+        try:
+            return await self.fallback.chat(messages, **kwargs)
+        except Exception as fallback_error:
+            await self._emit("error", leg="fallback", error=str(fallback_error))
+            if last_error is None:
+                raise
+            raise last_error from fallback_error
+
+    async def stream(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        extra_headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> AsyncIterator[StreamDelta]:
+        kwargs = self._kwargs(
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
+        if self._clock() < self._cooldown_until:
+            await self._emit("degrade", reason="primary_stream_cooldown")
+            async for delta in self.fallback.stream(messages, **kwargs):
+                yield delta
+            return
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries):
+            yielded = False
+            try:
+                await self._emit(
+                    "request",
+                    leg="primary",
+                    attempt=attempt + 1,
+                    streaming=True,
+                )
+                async for delta in self.primary.stream(messages, **kwargs):
+                    yielded = True
+                    yield delta
+                return
+            except Exception as error:
+                last_error = error
+                await self._emit(
+                    "error",
+                    leg="primary",
+                    attempt=attempt + 1,
+                    streaming=True,
+                    error=str(error),
+                )
+                if not self._retryable(error):
+                    break
+                if yielded and not self._replay_partial_stream:
+                    # Deltas already reached the consumer; retrying the primary
+                    # would duplicate them. Degrade to the fallback leg instead.
+                    await self._emit(
+                        "abandon_stream_retry",
+                        attempt=attempt + 1,
+                        streaming=True,
+                        yielded=True,
+                    )
+                    break
+                if attempt + 1 >= self.max_retries:
+                    break
+                delay = min(0.5 * (2**attempt), 8.0) + self._jitter() * 0.25
+                await self._emit(
+                    "retry",
+                    attempt=attempt + 1,
+                    delay_s=delay,
+                    streaming=True,
+                    yielded=yielded,
+                )
+                await self._sleep(delay)
+
+        self._cooldown_until = self._clock() + self.cooldown_seconds
+        await self._emit("degrade", reason="primary_stream_exhausted")
+        try:
+            async for delta in self.fallback.stream(messages, **kwargs):
+                yield delta
+        except Exception as fallback_error:
+            await self._emit(
+                "error",
+                leg="fallback",
+                streaming=True,
+                error=str(fallback_error),
+            )
+            if last_error is None:
+                raise
+            raise last_error from fallback_error
 
 
 @dataclass

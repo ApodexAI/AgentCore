@@ -37,6 +37,10 @@ from openai import AsyncOpenAI
 
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
+from agent_core.providers.finish_reason import (
+    normalize_finish_reason,
+    responses_finish_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,13 +161,16 @@ class OpenAIResponsesClient(LLMClient):
                 "response.reasoning_text.delta",
             ):
                 yield StreamDelta(reasoning_content=getattr(event, "delta", "") or "")
-            elif etype == "response.completed":
+            elif etype in ("response.completed", "response.incomplete"):
                 resp = getattr(event, "response", None)
                 usage = _responses_usage_dict(getattr(resp, "usage", None))
+                reason = normalize_finish_reason(
+                    _get(_get(resp, "incomplete_details", None) or {}, "reason", ""),
+                )
                 yield StreamDelta(
                     usage=usage,
                     model=getattr(resp, "model", "") or "",
-                    finish_reason="stop",
+                    finish_reason=reason or "stop",
                 )
 
 
@@ -383,7 +390,12 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
         content=content,
         tool_calls=tool_calls,
         reasoning_content="\n".join(summary_parts),
-        finish_reason=_get(raw, "status", "") or "",
+        # ``status`` is completed/incomplete/failed — never ``length`` — so the
+        # nested ``incomplete_details.reason`` carries the truncation signal.
+        finish_reason=responses_finish_reason(
+            _get(raw, "status", ""),
+            _get(_get(raw, "incomplete_details", None) or {}, "reason", ""),
+        ),
         model=_get(raw, "model", "") or "",
         usage=_responses_usage_dict(_get(raw, "usage", None)),
         response_metadata={"id": _get(raw, "id", "")},

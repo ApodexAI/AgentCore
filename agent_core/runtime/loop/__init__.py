@@ -10,6 +10,11 @@ from agent_core.runtime.loop.compact import (
     DefaultMessageCompactor,
 )
 from agent_core.runtime.loop.compact_llm import LLMSummaryCompactor
+from agent_core.runtime.loop.guardrails import (
+    DEFAULT_DUPLICATE_THRESHOLDS,
+    GuardrailsMiddleware,
+    check_budget_exhausted,
+)
 from agent_core.runtime.loop.llm_client import (
     RUNAWAY_STATE_KEY,
     TRUNCATION_CONTINUATION_GUIDANCE,
@@ -54,6 +59,12 @@ from agent_core.runtime.loop.tool_call_parser import (
     DefaultToolCallParser,
     MultiFormatToolCallParser,
 )
+from agent_core.runtime.loop.tool_call_repair import (
+    DEFAULT_KEY_ALIASES,
+    LITERAL_CONTENT_KEYS,
+    ToolCallRepairMiddleware,
+    repair_truncated_json,
+)
 from agent_core.runtime.loop.tool_exec import (
     DefaultToolResultPostProcessor,
     ToolExecutionHooks,
@@ -62,7 +73,10 @@ from agent_core.runtime.loop.tool_exec import (
 
 __all__ = [
     "COMPACTION_TRIGGER_RATIO",
+    "DEFAULT_DUPLICATE_THRESHOLDS",
+    "DEFAULT_KEY_ALIASES",
     "DEFAULT_TRIGGER_RATIO",
+    "LITERAL_CONTENT_KEYS",
     "RUNAWAY_STATE_KEY",
     "TRUNCATION_CONTINUATION_GUIDANCE",
     "AgentLoopHooks",
@@ -71,6 +85,7 @@ __all__ = [
     "DefaultThinkingParser",
     "DefaultToolCallParser",
     "DefaultToolResultPostProcessor",
+    "GuardrailsMiddleware",
     "HistoryPolicy",
     "InputTokenGauge",
     "InputTokenThresholdPolicy",
@@ -87,12 +102,14 @@ __all__ = [
     "TaskBoundaryTrimmer",
     "ThinkTagSplitter",
     "TieredCompactor",
+    "ToolCallRepairMiddleware",
     "ToolExecutionHooks",
     "bind_max_tokens",
     "bind_session_id",
     "bind_temperature",
     "bind_tools",
     "call_llm",
+    "check_budget_exhausted",
     "check_context_budget",
     "compaction_trigger_tokens",
     "configure_model_registry",
@@ -102,6 +119,7 @@ __all__ = [
     "extract_model_name",
     "extract_usage",
     "is_truncated_with_text",
+    "repair_truncated_json",
     "run_agent_loop",
     "usage_input_tokens",
     "usage_output_tokens",

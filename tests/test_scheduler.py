@@ -15,6 +15,7 @@ from agent_core.scheduling.scheduler import (
 )
 from agent_core.scheduling.workflow_defaults import (
     clear_workflow_defaults,
+    get_workflow_default,
     register_workflow_defaults,
 )
 from agent_core.types import TaskId, TaskStatus
@@ -142,6 +143,22 @@ def test_agent_team_thrash_is_an_incomplete_stop_reason():
         {"TASK_WALL_TIME_S": 900, "TASK_WALL_TIME_MODE": "soft_research"},
     )
     assert resolve_wall_time_s(None, "research") == 900
+    clear_workflow_defaults()
+
+
+def test_workflow_defaults_merge_and_ignore_missing_values():
+    clear_workflow_defaults()
+    register_workflow_defaults("research", {"wall": 900, "mode": "soft"})
+    register_workflow_defaults("research", {"wall": None, "retries": 2})
+    assert get_workflow_default("research", "wall") == 900
+    assert get_workflow_default("research", "mode") == "soft"
+    assert get_workflow_default("research", "retries") == 2
+    register_workflow_defaults(
+        "research",
+        {"wall": None},
+        include_none=True,
+    )
+    assert get_workflow_default("research", "wall") is None
     clear_workflow_defaults()
 
 

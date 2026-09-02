@@ -98,6 +98,15 @@ class PhaseContext:
             self.start_time = time.time()
 
 
+# Reserved ``ToolCallContext.metadata`` keys. A ``before_tool_call``
+# middleware sets ``BLOCKED_KEY`` to veto a call; the host dispatcher MUST
+# check it after running the middleware chain and, when set, skip the tool and
+# return ``BLOCK_REASON_KEY`` to the model as the tool result. AgentCore does
+# not dispatch tools itself, so an unchecked flag means silent non-enforcement.
+BLOCKED_KEY = "blocked"
+BLOCK_REASON_KEY = "block_reason"
+
+
 @dataclass
 class ToolCallContext:
     task_id: str
@@ -106,6 +115,19 @@ class ToolCallContext:
     tool_name: str = ""
     tool_args: dict[str, Any] = field(default_factory=dict[str, Any])
     metadata: dict[str, Any] = field(default_factory=dict[str, Any])
+
+    def block(self, reason: str) -> None:
+        """Veto this tool call. See ``BLOCKED_KEY`` for the host contract."""
+        self.metadata[BLOCKED_KEY] = True
+        self.metadata[BLOCK_REASON_KEY] = reason
+
+    @property
+    def is_blocked(self) -> bool:
+        return bool(self.metadata.get(BLOCKED_KEY))
+
+    @property
+    def block_reason(self) -> str:
+        return str(self.metadata.get(BLOCK_REASON_KEY) or "")
 
 
 class ExecutionMiddleware:
@@ -191,6 +213,8 @@ class SkillLoader(Protocol):
 
 
 __all__ = [
+    "BLOCKED_KEY",
+    "BLOCK_REASON_KEY",
     "EventReader",
     "EventSink",
     "ExecutionMiddleware",

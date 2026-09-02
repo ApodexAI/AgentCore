@@ -303,13 +303,19 @@ class OpenAIClient(LLMClient):
             kwargs["max_completion_tokens"] = eff_mt
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
-            # EAS UCH affinity keys on the URL query parameter (the header
-            # alone never pins an upstream replica) — mirror the per-call
-            # session id into ``extra_query``; per-call wins over any
-            # construction-time ``default_query``.
-            session_query = self._session_query(extra_headers)
-            if session_query:
-                kwargs["extra_query"] = session_query
+        # EAS UCH affinity keys on the URL query parameter (the header alone
+        # never pins an upstream replica) — mirror the session id into
+        # ``extra_query``; per-call wins over construction-time affinity.
+        #
+        # Computed on EVERY call, not only when ``extra_headers`` is present: a
+        # scoped client deliberately withholds ``default_query`` from the SDK
+        # (see ``__init__``) because cached clients outlive their task, so this
+        # is the only path that re-supplies its affinity — and the only one that
+        # runs the staleness check. Gating it on ``extra_headers`` left
+        # ``chat(messages)`` pinning no replica at all.
+        session_query = self._session_query(extra_headers)
+        if session_query:
+            kwargs["extra_query"] = session_query
         extra_body = self._effective_extra_body()
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -360,13 +366,19 @@ class OpenAIClient(LLMClient):
             kwargs["max_completion_tokens"] = eff_mt
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
-            # EAS UCH affinity keys on the URL query parameter (the header
-            # alone never pins an upstream replica) — mirror the per-call
-            # session id into ``extra_query``; per-call wins over any
-            # construction-time ``default_query``.
-            session_query = self._session_query(extra_headers)
-            if session_query:
-                kwargs["extra_query"] = session_query
+        # EAS UCH affinity keys on the URL query parameter (the header alone
+        # never pins an upstream replica) — mirror the session id into
+        # ``extra_query``; per-call wins over construction-time affinity.
+        #
+        # Computed on EVERY call, not only when ``extra_headers`` is present: a
+        # scoped client deliberately withholds ``default_query`` from the SDK
+        # (see ``__init__``) because cached clients outlive their task, so this
+        # is the only path that re-supplies its affinity — and the only one that
+        # runs the staleness check. Gating it on ``extra_headers`` left
+        # ``chat(messages)`` pinning no replica at all.
+        session_query = self._session_query(extra_headers)
+        if session_query:
+            kwargs["extra_query"] = session_query
         extra_body = self._effective_extra_body()
         if extra_body:
             kwargs["extra_body"] = extra_body

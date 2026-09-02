@@ -24,6 +24,8 @@ Version `0.1.x` contains the converged foundation layer:
 - failure-isolated async event dispatch and composable fail-closed tool
   permission policy;
 - provider-neutral LLM response, stream, and client contracts;
+- profile-driven auxiliary-client construction, summary execution, legacy
+  cooldown fallback, and task-local external-API metering;
 - loop configuration, lifecycle contexts, observer protocol, intervention
   merging, and observer dispatch helpers.
 - streamed tool-call recovery checks for missing required arguments.
@@ -72,10 +74,12 @@ Code belongs in AgentCore when it:
 - accepts product behavior through typed inputs or explicit hooks;
 - has tests that run without either product repository installed.
 
-Provider clients, session affinity, durable process/event-store implementations,
+Provider catalogs, credentials, endpoint selection, host session-affinity
+context, billing policy, durable process/event-store implementations,
 user/session retention policy, checkpoint association, workflow node
 implementations, sandbox mounting/authorization, UI history, and
-product-specific observers remain in their product.
+product-specific observers remain in their product. AgentCore owns the
+provider transports and product-neutral affinity lifecycle safeguards.
 
 ## Development
 
@@ -160,7 +164,10 @@ edit both products' core copies, that is evidence it belongs here.
 9. **Provider substrate** (complete in AgentCore): shared provider transports,
    fallback engine, prompt cache, usage metadata normalization, and non-blocking streaming
    behind product configuration and session-affinity adapters.
-10. Remove product compatibility facades after downstream imports have moved to
-   `agent_core`.
+10. **Shared runtime closeout**: portable usage metering, configurable aux-LLM
+    construction, summary execution, tool-call repair/guardrails, and safe
+    workflow-default merging.
+11. Remove product compatibility facades after downstream imports have moved to
+    `agent_core` and the compatibility window has elapsed.
 
 Each slice must leave product CI green and must not depend on a floating branch.
