@@ -157,8 +157,8 @@ edit both products' core copies, that is evidence it belongs here.
    bus/fan-in orchestration, resource management, task budgets, and the
    backend-injected DAG scheduler. Product tool assembly, persistence backends,
    and workflow policy remain downstream.
-9. **Provider substrate** (next): converge the shared provider transports,
-   fallback engine, prompt cache, usage metering, and non-blocking streaming
+9. **Provider substrate** (complete in AgentCore): shared provider transports,
+   fallback engine, prompt cache, usage metadata normalization, and non-blocking streaming
    behind product configuration and session-affinity adapters.
 10. Remove product compatibility facades after downstream imports have moved to
    `agent_core`.
