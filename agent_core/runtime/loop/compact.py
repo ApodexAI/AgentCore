@@ -468,9 +468,7 @@ class KeepLastNToolResultsCompactor:
         if len(keep_set) == len(tool_indices):
             return messages
 
-        id_to_name = (
-            tool_names_by_call_id(messages) if self._protect or self._spill is not None else {}
-        )
+        id_to_name = tool_names_by_call_id(messages)
 
         out: list[Message] = []
         for idx, msg in enumerate(messages):
@@ -487,15 +485,22 @@ class KeepLastNToolResultsCompactor:
                 out.append(msg)
                 continue
             placeholder = OMITTED_TOOL_RESULT_PLACEHOLDER
-            spill_path: str | None = None
-            if self._spill is not None:
+            spill_path = str(msg.get("result_store_ref") or "")
+            if not spill_path and self._spill is not None:
                 tool_name = id_to_name.get(msg.get("tool_call_id", ""), "tool")
                 try:
                     spill_path = self._spill(tool_name, content)
                 except Exception:
                     spill_path = None
-                if spill_path:
-                    placeholder += f"\n[Full text] {spill_path}"
+            # A configured spill callback is a promise that discarded content
+            # remains recoverable. If it declines this body (too small, over a
+            # storage limit, or unavailable), retaining the body is safer than
+            # replacing it with an irrecoverable placeholder.
+            if self._spill is not None and not spill_path:
+                out.append(msg)
+                continue
+            if spill_path:
+                placeholder += f"\n[Full text] {spill_path}"
             replacement = tool_msg(placeholder, msg.get("tool_call_id", ""))
             if spill_path:
                 # The text is for the model; this is for us. ``TieredCompactor``

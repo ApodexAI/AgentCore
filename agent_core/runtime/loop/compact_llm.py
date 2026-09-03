@@ -362,7 +362,7 @@ class LLMSummaryCompactor:
         messages: list[Message],
         keep_recent: int,
     ) -> tuple[list[Message], list[Message], list[Message]]:
-        """Split into ``(system_prefix, to_summarize, kept_recent)``."""
+        """Split history while pinning the original task when history remains."""
         sys_msgs: list[Message] = []
         rest: list[Message] = []
         for msg in messages:
@@ -370,6 +370,18 @@ class LLMSummaryCompactor:
                 sys_msgs.append(msg)
             else:
                 rest.append(msg)
+
+        if len(rest) <= keep_recent:
+            return sys_msgs, [], rest
+
+        if (
+            keep_recent > 0
+            and rest
+            and rest[0].get("role") == "user"
+            and not text_of(rest[0].get("content")).startswith("[Compacted")
+        ):
+            sys_msgs.append(rest[0])
+            rest = rest[1:]
 
         if len(rest) <= keep_recent:
             return sys_msgs, [], rest
@@ -575,6 +587,30 @@ class LLMSummaryCompactor:
         keep_recent: int,
     ) -> list[Message]:
         new_messages = _string_slice_compact(messages, keep_recent)
+        if keep_recent > 0:
+            original_task = next(
+                (
+                    message
+                    for message in messages
+                    if message.get("role") == "user"
+                    and not text_of(message.get("content")).startswith("[Compacted")
+                ),
+                None,
+            )
+            if original_task is not None and not any(
+                message is original_task for message in new_messages
+            ):
+                insert_at = 0
+                while (
+                    insert_at < len(new_messages)
+                    and new_messages[insert_at].get("role") == "system"
+                ):
+                    insert_at += 1
+                new_messages = [
+                    *new_messages[:insert_at],
+                    original_task,
+                    *new_messages[insert_at:],
+                ]
         # Synchronous emit: schedule async path on a dummy loop only when
         # an emitter exists. Most callers pass ``emit_event=None`` (SDK
         # default), so the common case is a pure-sync no-op.
