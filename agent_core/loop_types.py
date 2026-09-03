@@ -183,8 +183,9 @@ class LoopConfig:
     summary_prompt: str = ""
 
     # Per-call reminder added to a copy of history, never persisted.
-    system_addendum_per_call: str = ""
+    system_addendum_per_call: str | Callable[[], str] = ""
     system_addendum_min_turn: int = 0
+    system_addendum_per_call_role: str = "system"
 
 
 @dataclass

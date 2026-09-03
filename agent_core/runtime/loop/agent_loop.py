@@ -383,9 +383,21 @@ async def _run_loop_inner(
             scope.metadata["current_turn"] = turn
 
         (
-            llm_for_turn, messages_for_call, strip_tools, stop_reason,
+            llm_for_turn,
+            messages_for_call,
+            strip_tools,
+            allowed_names,
+            stop_reason,
         ) = await _prepare_llm_request(
-            cfg, obs, llm_with_session, llm_with_tools, messages, metadata, turn
+            cfg,
+            obs,
+            llm_with_session,
+            llm_with_tools,
+            tool_map,
+            tool_names,
+            messages,
+            metadata,
+            turn,
         )
         if stop_reason:
             break
@@ -407,7 +419,7 @@ async def _run_loop_inner(
             last_input_tokens, last_output_tokens,
         ) = await _process_llm_response(
             cfg, obs, tc_parser, profile, policy, thinking_parser, normalizer,
-            tool_names, messages, metadata, turn, response, strip_tools,
+            tool_names, messages, metadata, turn, response, strip_tools, allowed_names,
             last_input_tokens,
             last_output_tokens, first_delta_at, llm_call_started, llm_call_finished,
             call_id, current_attempt_id, current_attempt_index
@@ -538,9 +550,16 @@ async def _run_loop_inner(
 
 
 async def _prepare_llm_request(
-    cfg: LoopConfig, obs: list, llm_with_session: Any, llm_with_tools: Any,
-    messages: list[Message], metadata: dict[str, Any], turn: int
-) -> tuple[Any, list[Message], bool, str]:
+    cfg: LoopConfig,
+    obs: list,
+    llm_with_session: Any,
+    llm_with_tools: Any,
+    tool_map: dict[str, ToolLike],
+    tool_names: set[str],
+    messages: list[Message],
+    metadata: dict[str, Any],
+    turn: int,
+) -> tuple[Any, list[Message], bool, set[str] | None, str]:
     temp_override = metadata.pop("_llm_temp_override", None)
     strip_tools = metadata.pop("_llm_strip_tools", False)
     # ``_llm_strip_tools`` is one-shot and consumed right here, so an observer
@@ -549,7 +568,25 @@ async def _prepare_llm_request(
     # (``continue_to_next_turn``) would otherwise re-bind tools on the landing
     # turn that was deliberately given none.
     metadata["_llm_tools_stripped"] = strip_tools
-    llm_base = llm_with_session if strip_tools else llm_with_tools
+    allowed_override = metadata.get("_llm_allowed_tools")
+    allowed_names = (
+        {
+            str(name)
+            for name in allowed_override
+            if str(name) in tool_names
+        }
+        if isinstance(allowed_override, (list, tuple, set, frozenset))
+        else None
+    )
+    if strip_tools:
+        llm_base = llm_with_session
+    elif allowed_names is not None:
+        llm_base = bind_tools(
+            llm_with_session,
+            [tool_map[name] for name in sorted(allowed_names)],
+        )
+    else:
+        llm_base = llm_with_tools
     llm_for_turn = (
         bind_temperature(llm_base, temp_override)
         if temp_override is not None
@@ -569,7 +606,22 @@ async def _prepare_llm_request(
 
     messages_for_call = messages
     if cfg.system_addendum_per_call and turn > cfg.system_addendum_min_turn:
-        messages_for_call = [*messages, system_msg(cfg.system_addendum_per_call)]
+        try:
+            addendum_text = (
+                cfg.system_addendum_per_call()
+                if callable(cfg.system_addendum_per_call)
+                else cfg.system_addendum_per_call
+            )
+        except Exception as exc:
+            logger.warning("dynamic system addendum failed: %s", exc)
+            addendum_text = ""
+        addendum_factory = (
+            user_msg
+            if cfg.system_addendum_per_call_role.strip().lower() == "user"
+            else system_msg
+        )
+        if addendum_text:
+            messages_for_call = [*messages, addendum_factory(addendum_text)]
 
     # Publish the estimate of THIS request, after observer injections and the
     # addendum. An observer comparing its own estimate against the provider's
@@ -582,6 +634,7 @@ async def _prepare_llm_request(
         llm_for_turn,
         messages_for_call,
         bool(strip_tools),
+        allowed_names,
         merged_before_llm.stop_reason or "",
     )
 
@@ -918,7 +971,8 @@ async def _notify_context_compacted(
 async def _process_llm_response(
     cfg: LoopConfig, obs: list, tc_parser: Any, profile: Any, policy: Any, thinking_parser: Any, normalizer: Any,
     tool_names: set[str], messages: list[Message], metadata: dict[str, Any], turn: int,
-    response: Any, strip_tools: bool, last_input_tokens: int, last_output_tokens: int, first_delta_at: float | None,
+    response: Any, strip_tools: bool, allowed_names: set[str] | None,
+    last_input_tokens: int, last_output_tokens: int, first_delta_at: float | None,
     llm_call_started: float, llm_call_finished: float, call_id: str, current_attempt_id: str, current_attempt_index: int
 ) -> tuple[list[dict], TurnContext, str, bool, bool, int, int]:
     metadata["llm_duration_ms"] = int((llm_call_finished - llm_call_started) * 1000)
@@ -932,9 +986,14 @@ async def _process_llm_response(
         with contextlib.suppress(Exception):
             response.content = tr.visible_content
 
-    parsed_calls = tc_parser.parse(response, tool_names)
+    parser_tool_names = (
+        tool_names
+        if strip_tools or allowed_names is None
+        else allowed_names
+    )
+    parsed_calls = tc_parser.parse(response, parser_tool_names)
     if not parsed_calls and tr.thinking and hasattr(tc_parser, "parse_text"):
-        parsed_calls = tc_parser.parse_text(tr.thinking, tool_names)
+        parsed_calls = tc_parser.parse_text(tr.thinking, parser_tool_names)
         if parsed_calls:
             logger.warning("turn=%d recovered %d tool_call(s) leaked into <think>", turn, len(parsed_calls))
 
@@ -943,6 +1002,43 @@ async def _process_llm_response(
     # landing allowlist and balance rejected native calls with synthetic tool
     # results so strict providers can safely reuse the history.
     blocked_landing_calls: list[dict] = []
+    if not strip_tools and allowed_names is not None and parsed_calls:
+        allowed_calls = [
+            call
+            for call in parsed_calls
+            if str(call.get("name") or "") in allowed_names
+        ]
+        blocked_delivery_calls = [
+            call
+            for call in parsed_calls
+            if str(call.get("name") or "") not in allowed_names
+        ]
+        if blocked_delivery_calls:
+            blocked_names = [
+                str(call.get("name") or "unknown")
+                for call in blocked_delivery_calls
+            ]
+            recorded = metadata.setdefault("blocked_delivery_tool_calls", [])
+            if isinstance(recorded, list):
+                recorded.extend(blocked_names)
+            native_ids = {
+                str(call.get("id") or "")
+                for call in (getattr(response, "tool_calls", None) or [])
+                if isinstance(call, dict) and call.get("id")
+            }
+            for blocked in blocked_delivery_calls:
+                call_id = str(blocked.get("id") or "")
+                if call_id and call_id in native_ids:
+                    messages.append(
+                        tool_msg(
+                            "[tool call blocked] Delivery mode permits only: "
+                            f"{', '.join(sorted(allowed_names))}. Save and "
+                            "validate required artifacts now.",
+                            call_id,
+                        )
+                    )
+            blocked_landing_calls.extend(blocked_delivery_calls)
+        parsed_calls = allowed_calls
     if strip_tools and parsed_calls:
         configured_landing_names = cfg.loop_policy.landing_tool_names
         if configured_landing_names is None:
