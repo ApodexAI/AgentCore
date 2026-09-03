@@ -10,7 +10,7 @@ products consume an immutable AgentCore revision and keep only their adapters.
 
 ## Current scope
 
-Version `0.1.x` contains the converged foundation layer:
+Version `0.2.x` contains the converged foundation layer:
 
 - native message types and constructors;
 - token-estimation helpers;
@@ -85,7 +85,7 @@ provider transports and product-neutral affinity lifecycle safeguards.
 
 ```bash
 uv sync --frozen --extra dev
-uv run ruff check agent_core tests
+uv run ruff check agent_core tests scripts
 uv run pyright agent_core
 uv run pytest -q
 uv build
@@ -102,13 +102,20 @@ AgentCore uses the import namespace `agent_core` and the distribution name
 
 ## Consuming a private revision
 
-Products should pin an immutable commit, never a branch:
+Products should pin a released tag, never a branch:
 
 ```toml
 dependencies = [
-  "apodex-agent-core @ git+https://github.com/ApodexAI/AgentCore.git@<commit>",
+  "apodex-agent-core @ git+ssh://git@github.com/ApodexAI/AgentCore.git@v0.2.0",
 ]
 ```
+
+A tag is as immutable as a commit here — tags are never moved or deleted once
+pushed — and unlike a SHA it is readable in a diff, so a bump PR states which
+version the product is moving to. Every tag has a GitHub Release carrying the
+built wheel, the sdist, and its changelog section. See
+[docs/versioning.md](docs/versioning.md) for what a version number means and
+[CHANGELOG.md](CHANGELOG.md) for what changed.
 
 Because this repository is private, CI needs a read-only credential that can
 clone `ApodexAI/AgentCore`. Use a dedicated GitHub App or fine-grained token
@@ -118,8 +125,12 @@ Configure Git before `uv sync`:
 ```bash
 git config --global \
   url."https://x-access-token:${AGENT_CORE_REPO_TOKEN}@github.com/".insteadOf \
-  "https://github.com/"
+  "ssh://git@github.com/"
 ```
+
+The rewrite must target `ssh://git@github.com/`, which is the scheme the pin
+above declares. Rewriting `https://github.com/` instead is a no-op against an
+`ssh://` dependency URL and leaves CI failing on an SSH key it does not have.
 
 Until that credential is installed in both product repositories, product
 source must not be switched to the private dependency: doing so would make a
@@ -128,12 +139,30 @@ clean checkout and CI unreproducible.
 ## Change and release workflow
 
 1. Reproduce a shared bug with an AgentCore test.
-2. Change AgentCore in one pull request and pass its standalone CI.
-3. Merge and record the immutable commit SHA (or publish a tagged version).
-4. Automation opens dependency-bump PRs in ApodexHarness and
-   FrontierAgentInternal.
+2. Change AgentCore in one pull request. Bump `[project].version`, run
+   `uv lock`, and add a `CHANGELOG.md` entry — CI fails a pull request that
+   changes published code without a version bump.
+3. Merge, then tag and push:
+
+   ```bash
+   git switch main && git pull
+   git tag -a v0.2.0 -m 'AgentCore 0.2.0'
+   git push origin v0.2.0
+   ```
+
+   The `Release` workflow verifies the tag matches the declared version,
+   re-runs the full check suite against the tagged tree, builds, and publishes a
+   GitHub Release with the wheel, sdist, and changelog section.
+4. The release workflow dispatches to ApodexHarness and FrontierAgentInternal,
+   each of which opens a bump PR moving its pin to the new tag. See
+   [docs/downstream-bump.md](docs/downstream-bump.md) for the one-time token and
+   workflow setup those products need.
 5. Product CI validates adapters and end-to-end behavior. Product PRs must not
    patch vendored/shared implementation code.
+
+[docs/versioning.md](docs/versioning.md) covers the version scheme, what counts
+as a breaking change, and why AgentCore is not on 1.0 or a private package
+registry yet.
 
 Product-only bugs stay in the product repository. If a proposed fix needs to
 edit both products' core copies, that is evidence it belongs here.

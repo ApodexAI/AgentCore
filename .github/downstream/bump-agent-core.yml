@@ -1,0 +1,123 @@
+# Template — copy into a product repository as
+# .github/workflows/bump-agent-core.yml
+# together with repin_agent_core.py, as
+# .github/workflows/repin_agent_core.py
+#
+# Opens (or refreshes) a pull request moving this product's AgentCore pin to a
+# newly released tag. Triggered by AgentCore's release workflow, and manually
+# runnable to recover a missed or failed dispatch.
+#
+# Required secrets:
+#   AGENT_CORE_REPO_TOKEN — read access to the private ApodexAI/AgentCore, so
+#       `uv` can resolve the git dependency.
+#   BUMP_PR_TOKEN — token used to push the branch and open the PR. This must NOT
+#       be the default GITHUB_TOKEN: pull requests created with GITHUB_TOKEN do
+#       not trigger workflow runs, so this product's CI would never run against
+#       the bump — which is the entire point of the PR. Use a GitHub App
+#       installation token or a fine-grained PAT with contents:write and
+#       pull-requests:write on this repository.
+#   Both may be the same App token if it is scoped to both repositories.
+
+name: Bump AgentCore
+
+on:
+  repository_dispatch:
+    types: [agent-core-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "AgentCore tag to pin, e.g. v0.2.0"
+        required: true
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.BUMP_PR_TOKEN }}
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+
+      - name: Resolve target version
+        run: |
+          set -euo pipefail
+          version="${{ github.event.client_payload.version || inputs.version }}"
+          case "$version" in
+            v[0-9]*) ;;
+            *) echo "Refusing to pin '$version': expected a v-prefixed release tag." >&2
+               exit 1 ;;
+          esac
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "BRANCH=chore/agent-core-$version" >> "$GITHUB_ENV"
+
+      # The dependency is declared as ssh://git@github.com/...; rewrite that
+      # exact scheme so uv resolves it over HTTPS with a token instead of
+      # needing an SSH key on the runner.
+      - name: Authenticate git for the private dependency
+        env:
+          AGENT_CORE_REPO_TOKEN: ${{ secrets.AGENT_CORE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global \
+            url."https://x-access-token:${AGENT_CORE_REPO_TOKEN}@github.com/".insteadOf \
+            "ssh://git@github.com/"
+
+      # Substitute the rev in place, then relock. Do NOT use `uv add` here: it
+      # rewrites the standard PEP 508 direct-URL dependency into uv's
+      # proprietary [tool.uv.sources] table, which pip ignores — silently
+      # breaking any non-uv install path and adding a structural diff to every
+      # bump PR.
+      - name: Repin AgentCore
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/repin_agent_core.py "$VERSION"
+          uv lock
+
+      - name: Stop if already pinned
+        id: diff
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- pyproject.toml uv.lock; then
+            echo "Already pinned to ${VERSION}; nothing to open."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or refresh the bump pull request
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BUMP_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Force-push a deterministic branch so a re-dispatch of the same
+          # version refreshes the existing PR instead of failing.
+          git switch -c "$BRANCH"
+          git add pyproject.toml uv.lock
+          git commit -m "chore: bump AgentCore to ${VERSION}"
+          git push --force origin "$BRANCH"
+
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            echo "Refreshed existing pull request for ${BRANCH}."
+            exit 0
+          fi
+
+          cat > /tmp/bump-body.md <<EOF
+          Moves the \`apodex-agent-core\` pin to [\`${VERSION}\`](https://github.com/ApodexAI/AgentCore/releases/tag/${VERSION}).
+
+          Release notes and the changelog entry are on that release page.
+
+          Opened automatically by AgentCore's release workflow. Merge once this
+          product's CI is green; do not patch shared implementation code here —
+          shared fixes belong in AgentCore.
+          EOF
+
+          gh pr create \
+            --head "$BRANCH" \
+            --title "chore: bump AgentCore to ${VERSION}" \
+            --body-file /tmp/bump-body.md

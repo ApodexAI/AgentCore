@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+
+      # Fail before building anything if the tag names a version the tree does
+      # not declare, or if the release has no changelog entry to publish.
+      - name: Verify tag matches declared version
+        run: python3 scripts/version.py --check-tag "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+
+      - name: Extract release notes
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/version.py)"
+          python3 scripts/changelog_section.py "$version" > release-notes.md
+
+      # The tagged tree is re-verified rather than trusting main's CI run: a tag
+      # can point at a commit that never went through a pull request.
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check agent_core tests scripts
+      - run: uv run pyright agent_core
+      - run: uv run pytest -q
+      - run: uv build
+
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "AgentCore ${TAG#v}" \
+            --notes-file release-notes.md \
+            dist/*.whl dist/*.tar.gz
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Notify both consumers so a release always produces a visible bump PR
+      # rather than waiting for someone to remember. This runs after the release
+      # exists, and a missing token degrades to a warning: the release itself is
+      # already published and must not be failed by downstream plumbing.
+      - name: Request downstream bump PRs
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.DOWNSTREAM_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning title=No downstream dispatch::DOWNSTREAM_BUMP_TOKEN is not set; \
+          no bump PRs were requested. Open them manually, or see docs/downstream-bump.md."
+            exit 0
+          fi
+          for repo in ApodexAI/ApodexHarness ApodexAI/FrontierAgentInternal; do
+            echo "Dispatching agent-core-release ${TAG} to ${repo}"
+            gh api "repos/${repo}/dispatches" \
+              --method POST \
+              -f event_type=agent-core-release \
+              -f "client_payload[version]=${TAG}" \
+              || echo "::warning title=Dispatch failed::Could not notify ${repo}; open its bump PR manually."
+          done
