@@ -69,6 +69,12 @@ async def test_host_hooks_own_timeout_context_and_result_policies() -> None:
         call_scope=scope,
         on_call=lambda name: events.append(f"meter:{name}"),
         transform_result=lambda name, value: f"{name}={value}",
+        result_metadata=lambda _name, _raw, _rendered: {
+            "error_kind": "command_exit",
+            "result_id": "spill-1",
+            "repeat_count": 2,
+            "repeat_recovery_id": "spill-0",
+        },
         transform_batch=lambda results: [replace(results[0], result="batch")],
     )
     results = await execute_tools(
@@ -81,7 +87,37 @@ async def test_host_hooks_own_timeout_context_and_result_policies() -> None:
     )
 
     assert results[0].result == "batch"
+    assert results[0].is_error is True
+    assert results[0].error_kind == "command_exit"
+    assert results[0].result_id == "spill-1"
+    assert results[0].repeat_count == 2
+    assert results[0].repeat_recovery_id == "spill-0"
     assert events == ["meter:echo", "enter:tc:12", "await:echo:3:12", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_exception_have_structured_error_kinds() -> None:
+    results = await execute_tools(
+        [
+            {"name": "slow", "args": {}, "id": "a"},
+            {"name": "bad", "args": {}, "id": "b"},
+        ],
+        {
+            "slow": FakeTool("slow", delay=1),
+            "bad": FakeTool("bad", ValueError("boom")),
+        },
+        timeout=1,
+        turn=1,
+        count_offset=0,
+        hooks=ToolExecutionHooks(
+            resolve_timeout=lambda name, _args, _configured: (
+                0.001 if name == "slow" else 1.0
+            )
+        ),
+    )
+
+    assert results[0].error_kind == "timeout"
+    assert results[1].error_kind == "exception"
 
 
 @pytest.mark.asyncio

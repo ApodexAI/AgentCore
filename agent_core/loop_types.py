@@ -306,6 +306,14 @@ class ToolResult:
     is_error: bool
     # Interrupted results remain in history to preserve tool-call pairing.
     interrupted: bool = False
+    # Stable machine-readable failure category supplied by the execution
+    # engine or a host classifier. Empty for successful legacy tools.
+    error_kind: str = ""
+    # Opaque host-owned handle for a result body shed from model context.
+    result_id: str = ""
+    # Host-provided repeated-invocation metadata. Execution is never skipped.
+    repeat_count: int = 1
+    repeat_recovery_id: str = ""
 
 
 @dataclass
