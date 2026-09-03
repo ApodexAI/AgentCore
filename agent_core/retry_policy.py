@@ -23,6 +23,7 @@ LEGACY_RETRYABLE_KEYWORDS = frozenset({
 
 def legacy_retryable(error: Exception) -> bool:
     """Match the historical two-model fallback wrapper's retry policy."""
+    message = str(error).lower()
     return isinstance(error, AttributeError) or any(
-        keyword in str(error).lower() for keyword in LEGACY_RETRYABLE_KEYWORDS
+        keyword in message for keyword in LEGACY_RETRYABLE_KEYWORDS
     )

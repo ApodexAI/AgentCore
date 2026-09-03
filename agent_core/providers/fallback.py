@@ -244,16 +244,17 @@ class CooldownFallbackLLM:
 
     Logging
     -------
-    Every event is also logged, independently of ``event_hook`` — a degrade
-    moves traffic to a different model for ``cooldown_seconds`` and an operator
-    has to be able to see that in logs whether or not a telemetry sink is
-    wired. Retries, abandoned stream retries and the two *exhausted* degrades —
-    the transitions — log at ``warning``; a failing fallback leg logs at
-    ``error``. The cooldown degrades log at ``debug``: they repeat once per
-    request for the whole window, so at warning they would bury the one line
-    that marks the transition. A primary-leg error also logs at ``debug``,
-    since the ``retry`` or ``degrade`` line that follows it carries the
-    operational signal. Hosts should not re-log off the hook.
+    Retry, abandonment, degradation and error events are also logged,
+    independently of ``event_hook`` — a degrade moves traffic to a different
+    model for ``cooldown_seconds`` and an operator has to be able to see that
+    in logs whether or not a telemetry sink is wired. ``request`` events remain
+    hook-only to avoid per-call log noise. Retries, abandoned stream retries
+    and the two *exhausted* degrades — the transitions — log at ``warning``; a
+    failing fallback leg logs at ``error``. The cooldown degrades log at
+    ``debug``: they repeat once per request for the whole window, so at warning
+    they would bury the one line that marks the transition. A primary-leg error
+    also logs at ``debug``, since the ``retry`` or ``degrade`` line that follows
+    it carries the operational signal. Hosts should not re-log off the hook.
     """
 
     def __init__(
