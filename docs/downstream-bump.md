@@ -1,104 +1,118 @@
-# Automated downstream bump PRs
+# Publishing releases and automating downstream bumps
 
-When AgentCore publishes a release, both products should get a pull request
-moving their pin — without anyone remembering to open it. This document is the
-one-time setup.
+AgentCore is public and publishes to PyPI. Consumers depend on a normal version
+specifier, and **Dependabot** opens the bump pull requests — so there is no
+cross-repository credential, no dispatch, and no bespoke repin script anywhere
+in this design.
 
-Flow: release tag pushed → `Release` workflow publishes the GitHub Release →
-`repository_dispatch` (`agent-core-release`) fires at both products → each opens
-`chore/agent-core-<tag>` with the repinned `pyproject.toml` and `uv.lock`, and
-its own CI validates the upgrade.
+Flow: tag `v0.3.0` → `Release` workflow verifies, tests, builds, publishes the
+GitHub Release, then publishes to PyPI via Trusted Publishing → Dependabot in
+each product notices the new version and opens a pull request that the product's
+own CI validates.
 
-## One-time setup
+## One-time setup in AgentCore
 
-### 1. A GitHub App for release automation
+### 1. Register the PyPI publisher (before the first release)
 
-Create a GitHub App installed only on `ApodexAI/AgentCore`,
-`ApodexAI/ApodexHarness`, and `ApodexAI/FrontierAgentInternal`. Grant the App:
+`apodex-agent-core` does not exist on PyPI yet, so use the **pending publisher**
+flow: on PyPI, go to your account → *Publishing* (not a project page, since
+there is no project yet) and add a GitHub Actions publisher:
 
-- **contents: write**, needed to dispatch and push bump branches;
-- **pull-requests: write**, needed to open bump pull requests.
-
-GitHub App permissions apply to the installation rather than varying per
-repository. The workflows therefore generate separate, short-lived tokens and
-downscope each one to only the repositories and permissions needed by that
-step: read-only for resolving AgentCore, product-write for a bump PR, and
-downstream-only write access for dispatch.
-
-Do not create an installation token by hand and save it as a secret.
-Installation tokens expire after one hour; the workflows use
-`actions/create-github-app-token` to mint and revoke one for every run.
-
-### 2. In all three repositories
-
-Configure the same two values in AgentCore and each product:
-
-- repository variable `AGENT_CORE_AUTOMATION_APP_CLIENT_ID` — the App's client
-  ID;
-- repository secret `AGENT_CORE_AUTOMATION_APP_PRIVATE_KEY` — the App's private
-  key.
-
-If those values are absent or invalid in AgentCore, publishing the release still
-succeeds and logs a warning — dispatching is downstream plumbing and must never
-fail a published release. Missing or invalid credentials in a product correctly
-fail its bump workflow because it cannot safely resolve or push the update.
-
-### 3. In each product repository
-
-Copy both files out of `.github/downstream/` in this repository:
-
-| From | To |
+| Field | Value |
 | --- | --- |
-| `.github/downstream/bump-agent-core.yml` | `.github/workflows/bump-agent-core.yml` |
-| `.github/downstream/repin_agent_core.py` | `.github/workflows/repin_agent_core.py` |
+| PyPI project name | `apodex-agent-core` |
+| Owner | `ApodexAI` |
+| Repository name | `AgentCore` |
+| Workflow name | `release.yml` |
+| Environment | `pypi` |
 
-The workflow creates one read-only token for AgentCore and a separate write
-token for the current product. It checks out with `persist-credentials: false`,
-so neither token remains embedded in the repository's Git configuration. Do not
-replace the App token with the default `GITHUB_TOKEN`: pull requests created
-with `GITHUB_TOKEN` do not trigger workflow runs, so the product's CI would never
-run against the bump — which is the only reason the PR exists.
+This needs **no GitHub organization permission and no GitHub App** — it is
+configured entirely on the PyPI side by whoever will own the PyPI project. A
+pending publisher does not reserve the name: it converts to a real publisher on
+the first successful upload, and if someone else registers `apodex-agent-core`
+first it is invalidated.
 
-## Verifying the wiring without cutting a release
+### 2. Create the `pypi` environment on GitHub
 
-Each product's workflow also accepts `workflow_dispatch` with a version input.
-Run it manually against an existing tag: it should open a PR, or report
-`Already pinned`. Use the same path to recover a dispatch that was missed
-because a secret was absent when the release ran.
+Settings → Environments → *New environment* → `pypi`. The publishing job
+declares `environment: pypi`, and the registration above binds PyPI's trust to
+that name. Add a required reviewer there if you want releases to pause for
+approval.
 
-## Two things that will bite
+No secrets are involved: `permissions: id-token: write` on the publishing job
+lets PyPI verify an OIDC claim naming this repository, this workflow file, and
+that environment, and PyPI then issues its own short-lived upload token.
 
-**The pin's declaration shape.** `repin_agent_core.py` substitutes the rev in
-place and fails loudly if it does not find exactly one pin. Do not "simplify" it
-to `uv add`: that rewrites the PEP 508 direct URL into uv's `[tool.uv.sources]`
-table, which pip ignores, breaking non-uv install paths such as a Dockerfile
-running `pip install .`. If the check reports a count other than 1, the
-dependency was redeclared and the script needs updating — that is the intended
-behavior, not an obstacle.
+## One-time setup in each product
 
-**`uv.lock` must be committed with `pyproject.toml`.** The lock records both the
-tag and the commit it resolved to, plus AgentCore's own version. A bump that
-edits only `pyproject.toml` leaves the lock stale and fails `uv sync --frozen`.
-The workflow commits both.
+### 1. Depend on the published package
 
-## Prerequisite: the pin must be on the product's default branch
+```toml
+dependencies = [
+  "apodex-agent-core==0.3.0",
+]
+```
 
-As of AgentCore 0.2.0, **neither product declares AgentCore on `main`**. The pin
-lives only on each product's in-progress migration branch:
+Pin exactly (`==`). AgentCore is `0.x`, where a MINOR bump may be breaking (see
+[versioning.md](versioning.md)); an exact pin is what makes the Dependabot pull
+request the place where an upgrade is reviewed. The old
+`git+ssh://git@github.com/ApodexAI/AgentCore.git@<rev>` form and every credential
+it required — deploy keys, `AGENT_CORE_REPO_TOKEN`, `insteadOf` rewriting — are
+obsolete now that the package is public.
 
-| Product | Branch carrying the pin | Pinned revision |
-| --- | --- | --- |
-| ApodexHarness | `fix/ci-bwrap-soft-probe` | `a9b5272` |
-| FrontierAgentInternal | `refactor/agent-core` | `a9b5272` |
+### 2. Add `.github/dependabot.yml`
 
-Until one of those merges, this workflow has nothing to repin on `main`:
-`repin_agent_core.py` will report `found 0` and exit non-zero rather than commit
-a half-edited pin. That is the intended behavior, but it means the automation is
-inert — install it now so it is ready, and expect its first real run only after
-the migration lands.
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    # Watch only AgentCore here. Everything else this product depends on is its
+    # own concern and would bury the one bump that needs product review.
+    allow:
+      - dependency-name: "apodex-agent-core"
+    commit-message:
+      prefix: "chore"
+    labels:
+      - "agent-core"
+```
 
-Both branches pin `a9b5272` (the #21 merge) and both lockfiles report
-`apodex-agent-core 0.1.0`. Whichever merges first, moving it to `v0.2.0` also
-picks up the five commits after that merge — the cooldown-fallback observability
-fixes in `components/middleware/llm/base.py`, `providers/fallback.py`, and
-`retry_policy.py`.
+Dependabot's `uv` ecosystem updates both `pyproject.toml` and `uv.lock`, and
+works in private and internal repositories.
+
+## The one real limitation
+
+**A Dependabot pull request runs CI as if it came from a fork.** Its workflow
+run gets a read-only `GITHUB_TOKEN` and, critically, `secrets.*` resolves
+against **Dependabot secrets** — a separate store — not Actions secrets.
+
+- Plain test CI (checkout, `uv sync`, `pytest`) works unchanged: it needs only
+  read access.
+- Any step that consumes a secret sees an empty value unless that secret is
+  *also* added under Settings → Secrets and variables → **Dependabot**. Check
+  each product for steps that need one (container registry pushes, for instance)
+  and either duplicate the secret there or guard the step to skip on
+  Dependabot-authored pull requests.
+- A step needing write access must ask for it explicitly with a `permissions:`
+  block.
+
+This is worth the trade: the alternative was a cross-repository App or PAT,
+which needs organization-level administration and puts a long-lived credential
+in both products.
+
+## Current state
+
+Neither product declares AgentCore on `main` yet. The dependency lives only on
+each product's in-progress migration branch:
+
+| Product | Branch carrying the dependency |
+| --- | --- |
+| ApodexHarness | `fix/ci-bwrap-soft-probe` |
+| FrontierAgentInternal | `refactor/agent-core` |
+
+Both still use the pre-open-source `git+ssh://…@a9b5272` form. Whichever merges
+first should switch to `apodex-agent-core==0.3.0` and add the Dependabot config
+above; Dependabot has nothing to update until a PyPI dependency is on the
+default branch.
