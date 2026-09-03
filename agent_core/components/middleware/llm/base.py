@@ -10,6 +10,7 @@ from typing import Any
 
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
+from agent_core.retry_policy import LEGACY_RETRYABLE_KEYWORDS, legacy_retryable
 
 logger = logging.getLogger(__name__)
 
@@ -31,38 +32,11 @@ def unwrap_runnable_binding(
     return model, kwargs
 
 
-# Keywords that indicate a transient error worth retrying.
-# Shared with FallbackLLM in llm_adapter.py — keep in sync.
-_RETRYABLE_KEYWORDS = frozenset(
-    {
-        "timeout",
-        "timed out",
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-        "529",
-        "overloaded",
-        "rate limit",
-        "rate_limit",
-        "server error",
-        "connection reset",
-        "connection error",
-        "econnreset",
-        "gateway timeout",
-        "model_dump",
-        "model_not_found",
-    }
-)
-
-
-def _is_retryable(error: Exception) -> bool:
-    """Return True if *error* looks transient and worth retrying."""
-    if isinstance(error, AttributeError):
-        return True
-    msg = str(error).lower()
-    return any(kw in msg for kw in _RETRYABLE_KEYWORDS)
+# One table, defined in the leaf ``agent_core.retry_policy`` so this framework
+# module does not import the whole ``providers`` package for a frozenset.
+# Both names stay bound here: host products re-export them from this module.
+_RETRYABLE_KEYWORDS = LEGACY_RETRYABLE_KEYWORDS
+_is_retryable = legacy_retryable
 
 
 # ── Context ──────────────────────────────────────────────────────────────
