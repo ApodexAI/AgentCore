@@ -344,7 +344,8 @@ class TieredCompactor:
                 for call in message.get("tool_calls") or []
                 if call.get("id")
             }
-            return frozenset(ids)
+            if ids:
+                return frozenset(ids)
         return frozenset()
 
     def _spill_changed_tool_results(
@@ -423,6 +424,16 @@ class TieredCompactor:
 
         insert_at = 0
         while insert_at < len(out) and out[insert_at].get("role") == "system":
+            insert_at += 1
+        if (
+            insert_at < len(out)
+            and out[insert_at].get("role") == "user"
+            and not out[insert_at].get("spill_refs")
+            and not text_of(out[insert_at].get("content")).startswith("[Compacted")
+        ):
+            # Keep the immutable original task immediately after the system
+            # prefix; the recovery index is supporting context, not a
+            # replacement for the request the run must satisfy.
             insert_at += 1
         out.insert(insert_at, index)
         return out

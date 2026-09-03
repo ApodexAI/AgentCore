@@ -12,8 +12,15 @@ from agent_core.loop_types import (
     LoopConfig,
     LoopPolicy,
     ToolCallIntervention,
+    TurnContext,
 )
-from agent_core.runtime.loop.agent_loop import AgentLoopHooks, run_agent_loop
+from agent_core.messages import assistant_msg, user_msg
+from agent_core.runtime.loop.agent_loop import (
+    AgentLoopHooks,
+    _handle_context_overflow,
+    _handle_turn_end,
+    run_agent_loop,
+)
 from agent_core.runtime.loop.model_profile import HistoryPolicy, ModelProfile
 from agent_core.runtime.loop.tool_exec import ToolExecutionHooks
 
@@ -132,6 +139,223 @@ async def test_runtime_hooks_wrap_scope_llm_and_tool_boundaries() -> None:
     assert events[1].startswith("enter:1:")
     assert "deadline" in events
     assert events[-1] == "exit:token"
+
+
+@pytest.mark.asyncio
+async def test_active_scope_receives_llm_call_identity() -> None:
+    from agent_core.execution_context import (
+        ExecutionScope,
+        get_current_execution_scope,
+        reset_current_execution_scope,
+        set_current_execution_scope,
+    )
+
+    seen: dict[str, Any] = {}
+
+    class ScopeInspectingLLM(SequenceLLM):
+        async def chat(self, messages, **kwargs) -> LLMResponse:
+            scope = get_current_execution_scope()
+            assert scope is not None
+            seen.update(scope.metadata)
+            return await super().chat(messages, **kwargs)
+
+    def enter_scope(cfg, phase_id, metadata):
+        scope = ExecutionScope(
+            task_id=cfg.task_id,
+            phase_id=phase_id,
+            role_id=cfg.role_id,
+            metadata=metadata,
+        )
+        return scope, set_current_execution_scope(scope)
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=ScopeInspectingLLM([LLMResponse(content="done")]),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            task_id="task",
+            role_id="role",
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        runtime_hooks=AgentLoopHooks(
+            enter_scope=enter_scope,
+            exit_scope=reset_current_execution_scope,
+        ),
+    )
+
+    assert str(seen["_llm_call_id"]).startswith("llm_")
+    assert str(seen["_llm_attempt_id"]).endswith("_attempt_01")
+    assert seen["_llm_attempt_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_observer_receives_pre_provider_llm_input() -> None:
+    captured: list[Any] = []
+
+    class InputObserver:
+        async def on_llm_input(self, ctx) -> None:
+            captured.append(ctx)
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=SequenceLLM([LLMResponse(content="done")]),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            task_id="task",
+            role_id="role",
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        observers=[InputObserver()],
+    )
+
+    assert len(captured) == 1
+    assert captured[0].messages[0]["content"] == "system"
+    assert captured[0].messages[1]["content"] == "start"
+    assert str(captured[0].metadata["_llm_call_id"]).startswith("llm_")
+
+
+@pytest.mark.asyncio
+async def test_rollback_notifies_observer_before_discarding_history() -> None:
+    events: list[Any] = []
+
+    class RollbackOnce:
+        critical = True
+        done = False
+
+        async def on_llm_response(self, _ctx):
+            if self.done:
+                return None
+            self.done = True
+            return Intervention(pop_last_message=True, continue_to_next_turn=True)
+
+    class CaptureDiscard:
+        critical = True
+
+        async def on_context_compacted(self, ctx) -> None:
+            events.append(
+                {
+                    "reason": ctx.reason,
+                    "before": list(ctx.messages_before),
+                    "after": list(ctx.messages_after),
+                }
+            )
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=SequenceLLM(
+            [LLMResponse(content="rejected"), LLMResponse(content="accepted")]
+        ),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            no_tool_max_retries=2,
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        observers=[RollbackOnce(), CaptureDiscard()],
+    )
+
+    assert len(events) == 1
+    assert events[0]["reason"] == "rollback_pop"
+    assert events[0]["before"][-1]["content"] == "rejected"
+    assert events[0]["after"][-1]["content"] == "start"
+
+
+@pytest.mark.asyncio
+async def test_overflow_replacement_notifies_when_history_length_is_unchanged() -> None:
+    events: list[Any] = []
+
+    class CaptureDiscard:
+        critical = True
+
+        async def on_context_compacted(self, ctx) -> None:
+            events.append(ctx)
+
+    messages = [user_msg("start"), assistant_msg("discard me")]
+    config = LoopConfig(
+        context_overflow_guard=True,
+        max_context_length=1,
+        max_completion_tokens=0,
+    )
+
+    stopped_by = await _handle_context_overflow(
+        config,
+        [CaptureDiscard()],
+        messages,
+        {},
+        1,
+        1,
+        1,
+        lambda _trailing: user_msg("recovery note"),
+    )
+
+    assert stopped_by == "context_limit_reached"
+    assert len(messages) == 2
+    assert messages[-1]["content"] == "recovery note"
+    assert len(events) == 1
+    assert events[0].messages_before[-1]["content"] == "discard me"
+
+
+@pytest.mark.asyncio
+async def test_in_place_compactor_notifies_context_observers() -> None:
+    events: list[Any] = []
+
+    class AlwaysCompact:
+        def should_compact(self, turn, messages, estimated_tokens):
+            return True
+
+    class InPlaceCompactor:
+        def compact(self, messages, keep_recent):
+            del messages[1]
+            return messages
+
+    class CaptureDiscard:
+        critical = True
+
+        async def on_context_compacted(self, ctx) -> None:
+            events.append(ctx)
+
+    messages = [user_msg("task"), assistant_msg("discard me")]
+    config = LoopConfig(
+        compaction_policy=AlwaysCompact(),
+        compactor=InPlaceCompactor(),
+    )
+    ctx = TurnContext(
+        turn=1,
+        max_turns=config.max_turns,
+        task_id="",
+        role_id="",
+        ai_text="",
+        thinking="",
+        tool_calls=[],
+        messages=messages,
+        usage=None,
+        metadata={},
+    )
+
+    stopped_by, continue_to_next_turn = await _handle_turn_end(
+        config,
+        [CaptureDiscard()],
+        messages,
+        {},
+        1,
+        ctx,
+        None,
+        None,
+    )
+
+    assert stopped_by == ""
+    assert continue_to_next_turn is False
+    assert messages == [user_msg("task")]
+    assert len(events) == 1
+    assert events[0].messages_before[-1]["content"] == "discard me"
 
 
 @pytest.mark.asyncio

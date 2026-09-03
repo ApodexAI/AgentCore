@@ -105,9 +105,9 @@ async def test_end_to_end_with_last_turn_forcer():
 
     with_tools = object()
     without_tools = object()
-    llm_for_turn, _messages, _stripped, _ = await _prepare_llm_request(
+    llm_for_turn, _messages, _stripped, _allowed, _ = await _prepare_llm_request(
         LoopConfig(task_id="t1", role_id="solver", max_turns=4),
-        [], without_tools, with_tools, [], metadata, 4,
+        [], without_tools, with_tools, {}, set(), [], metadata, 4,
     )
 
     assert llm_for_turn is without_tools, "landing turn must run without tools"

@@ -31,6 +31,7 @@ __all__ = [
     "compact_messages",
     "compress_tool_results",
     "estimate_tokens",
+    "partition_for_compaction",
     "tool_names_by_call_id",
 ]
 
@@ -239,6 +240,44 @@ def estimate_tokens(messages: list[Message]) -> int:
     return total
 
 
+def partition_for_compaction(
+    messages: list[Message],
+    keep_recent: int,
+) -> tuple[list[Message], list[Message], list[Message]]:
+    """Split history while pinning the original user task verbatim."""
+    prefix: list[Message] = []
+    rest: list[Message] = []
+    for message in messages:
+        if message.get("role") == "system" and not rest:
+            prefix.append(message)
+        else:
+            rest.append(message)
+
+    if len(rest) <= keep_recent:
+        return prefix, [], rest
+    if (
+        keep_recent > 0
+        and rest
+        and rest[0].get("role") == "user"
+        and not text_of(rest[0].get("content")).startswith("[Compacted")
+    ):
+        prefix.append(rest[0])
+        rest = rest[1:]
+    if len(rest) <= keep_recent:
+        return prefix, [], rest
+
+    split_idx = len(rest) - keep_recent
+    forward = split_idx
+    while forward < len(rest) and is_tool_msg(rest[forward]):
+        forward += 1
+    if forward < len(rest):
+        split_idx = forward
+    elif split_idx < len(rest):
+        while split_idx > 0 and is_tool_msg(rest[split_idx]):
+            split_idx -= 1
+    return prefix, rest[:split_idx], rest[split_idx:]
+
+
 def compact_messages(
     messages: list[Message],
     keep_recent: int,
@@ -250,27 +289,9 @@ def compact_messages(
     ``HumanMessage`` containing short snippets of user / agent / tool
     turns so the loop still has some context of what happened earlier.
     """
-    system_msgs: list[Message] = []
-    rest: list[Message] = []
-    for msg in messages:
-        if msg.get("role") == "system" and not rest:
-            system_msgs.append(msg)
-        else:
-            rest.append(msg)
-
-    if len(rest) <= keep_recent:
-        return messages  # nothing to compact
-
-    # Find a clean split point: the recent window must NOT start on a
-    # ToolMessage — its matching AIMessage(tool_calls=[...]) would be
-    # split into the middle and Azure would reject the orphan
-    # tool_call_id with HTTP 400.
-    split_idx = len(rest) - keep_recent
-    while split_idx < len(rest) - 1 and is_tool_msg(rest[split_idx]):
-        split_idx += 1
-
-    middle = rest[:split_idx]
-    recent = rest[split_idx:]
+    prefix, middle, recent = partition_for_compaction(messages, keep_recent)
+    if not middle:
+        return messages
 
     # Keep short snippets of user / agent / tool output so the loop can
     # still reason about what happened earlier. For tool calls we preserve
@@ -331,7 +352,7 @@ def compact_messages(
 
     compact_summary = user_msg(summary_text)
 
-    return [*system_msgs, compact_summary, *recent]
+    return [*prefix, compact_summary, *recent]
 
 
 class StringSliceCompactor:
@@ -468,9 +489,7 @@ class KeepLastNToolResultsCompactor:
         if len(keep_set) == len(tool_indices):
             return messages
 
-        id_to_name = (
-            tool_names_by_call_id(messages) if self._protect or self._spill is not None else {}
-        )
+        id_to_name = tool_names_by_call_id(messages)
 
         out: list[Message] = []
         for idx, msg in enumerate(messages):
@@ -487,15 +506,22 @@ class KeepLastNToolResultsCompactor:
                 out.append(msg)
                 continue
             placeholder = OMITTED_TOOL_RESULT_PLACEHOLDER
-            spill_path: str | None = None
-            if self._spill is not None:
+            spill_path = str(msg.get("result_store_ref") or "")
+            if not spill_path and self._spill is not None:
                 tool_name = id_to_name.get(msg.get("tool_call_id", ""), "tool")
                 try:
                     spill_path = self._spill(tool_name, content)
                 except Exception:
                     spill_path = None
-                if spill_path:
-                    placeholder += f"\n[Full text] {spill_path}"
+            # A configured spill callback is a promise that discarded content
+            # remains recoverable. If it declines this body (too small, over a
+            # storage limit, or unavailable), retaining the body is safer than
+            # replacing it with an irrecoverable placeholder.
+            if self._spill is not None and not spill_path:
+                out.append(msg)
+                continue
+            if spill_path:
+                placeholder += f"\n[Full text] {spill_path}"
             replacement = tool_msg(placeholder, msg.get("tool_call_id", ""))
             if spill_path:
                 # The text is for the model; this is for us. ``TieredCompactor``

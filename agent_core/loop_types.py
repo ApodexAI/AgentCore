@@ -183,8 +183,9 @@ class LoopConfig:
     summary_prompt: str = ""
 
     # Per-call reminder added to a copy of history, never persisted.
-    system_addendum_per_call: str = ""
+    system_addendum_per_call: str | Callable[[], str] = ""
     system_addendum_min_turn: int = 0
+    system_addendum_per_call_role: str = "system"
 
 
 @dataclass
@@ -306,6 +307,30 @@ class ToolResult:
     is_error: bool
     # Interrupted results remain in history to preserve tool-call pairing.
     interrupted: bool = False
+    # Stable machine-readable failure category supplied by the execution
+    # engine or a host classifier. Empty for successful legacy tools.
+    error_kind: str = ""
+    # Opaque host-owned handle for a result body shed from model context.
+    result_id: str = ""
+    # Host-provided repeated-invocation metadata. Execution is never skipped.
+    repeat_count: int = 1
+    repeat_recovery_id: str = ""
+
+
+@dataclass
+class ContextCompactionContext:
+    """Pre/post snapshot for any loop operation that discards history."""
+
+    turn: int
+    task_id: str
+    role_id: str
+    reason: str
+    compactor: str
+    policy: str
+    messages_before: list[Message]
+    messages_after: list[Message]
+    tokens_before: int
+    metadata: dict[str, Any]
 
 
 @dataclass
@@ -471,6 +496,9 @@ class BaseObserver:
     async def on_compaction(self, event: CompactionEvent) -> None:
         """History was rewritten. Passive: compaction has already happened by
         the time this runs, so there is no intervention to return."""
+
+    async def on_context_compacted(self, ctx: ContextCompactionContext) -> None:
+        """History was discarded while its pre-change form was still reachable."""
 
     async def on_loop_end(self, result: AgentLoopResult) -> None:
         pass
@@ -689,6 +717,7 @@ __all__ = [
     "CancellationObserver",
     "CompactionEvent",
     "CompactionObserver",
+    "ContextCompactionContext",
     "Intervention",
     "LLMAttemptContext",
     "LLMDeltaContext",

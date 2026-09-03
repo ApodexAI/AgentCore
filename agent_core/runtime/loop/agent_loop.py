@@ -14,12 +14,13 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from agent_core.llm import LLMClient
 from agent_core.loop_types import (
     AgentLoopResult,
     CompactionEvent,
+    ContextCompactionContext,
     LLMAttemptContext,
     LLMDeltaContext,
     LoopConfig,
@@ -114,6 +115,10 @@ def _body_has_no_spill(_body: str) -> bool:
     return False
 
 
+def _no_recovery_note(_messages: list[Message]) -> Message | None:
+    return None
+
+
 def _no_deadline() -> float | None:
     return None
 
@@ -130,6 +135,16 @@ def _exit_no_scope(_token: Any) -> None:
 
 async def _no_cancel_cleanup() -> None:
     return None
+
+
+async def _default_render_tool_result(
+    observers: list[Any],
+    ctx: TurnContext,
+    result: ToolResult,
+    processor: Any,
+) -> tuple[ToolResult, str, dict[str, Any]]:
+    observed = await notify_tool_result(observers, ctx, result)
+    return observed, processor.process(observed), {}
 
 
 @dataclass(frozen=True)
@@ -152,6 +167,13 @@ class AgentLoopHooks:
     cancellation_cleanup: Callable[[], Awaitable[None]] = _no_cancel_cleanup
     body_has_spill_reference: Callable[[str], bool] = _body_has_no_spill
     tool_execution: ToolExecutionHooks = field(default_factory=ToolExecutionHooks)
+    render_tool_result: Callable[
+        [list[Any], TurnContext, ToolResult, Any],
+        Awaitable[tuple[ToolResult, str, dict[str, Any]]],
+    ] = _default_render_tool_result
+    context_overflow_recovery_note: Callable[
+        [list[Message]], Message | None
+    ] = _no_recovery_note
 
 
 async def _wait_for_tool_interrupt(
@@ -382,9 +404,21 @@ async def _run_loop_inner(
             scope.metadata["current_turn"] = turn
 
         (
-            llm_for_turn, messages_for_call, strip_tools, stop_reason,
+            llm_for_turn,
+            messages_for_call,
+            strip_tools,
+            allowed_names,
+            stop_reason,
         ) = await _prepare_llm_request(
-            cfg, obs, llm_with_session, llm_with_tools, messages, metadata, turn
+            cfg,
+            obs,
+            llm_with_session,
+            llm_with_tools,
+            tool_map,
+            tool_names,
+            messages,
+            metadata,
+            turn,
         )
         if stop_reason:
             break
@@ -406,7 +440,7 @@ async def _run_loop_inner(
             last_input_tokens, last_output_tokens,
         ) = await _process_llm_response(
             cfg, obs, tc_parser, profile, policy, thinking_parser, normalizer,
-            tool_names, messages, metadata, turn, response, strip_tools,
+            tool_names, messages, metadata, turn, response, strip_tools, allowed_names,
             last_input_tokens,
             last_output_tokens, first_delta_at, llm_call_started, llm_call_finished,
             call_id, current_attempt_id, current_attempt_index
@@ -491,6 +525,7 @@ async def _run_loop_inner(
                 cfg, obs, tool_map, messages, metadata, turn, total_tool_calls,
                 ctx, parsed_calls, runtime.tool_execution,
                 runtime.body_has_spill_reference,
+                runtime.render_tool_result,
                 result_max_chars=tool_result_cap,
             )
             total_tool_calls += tool_calls_executed
@@ -506,8 +541,15 @@ async def _run_loop_inner(
                 "still needed.",
             )
 
-        stop_reason = _handle_context_overflow(
-            cfg, messages, turn, last_input_tokens, last_output_tokens
+        stop_reason = await _handle_context_overflow(
+            cfg,
+            obs,
+            messages,
+            metadata,
+            turn,
+            last_input_tokens,
+            last_output_tokens,
+            runtime.context_overflow_recovery_note,
         )
         if stop_reason:
             break
@@ -537,9 +579,16 @@ async def _run_loop_inner(
 
 
 async def _prepare_llm_request(
-    cfg: LoopConfig, obs: list, llm_with_session: Any, llm_with_tools: Any,
-    messages: list[Message], metadata: dict[str, Any], turn: int
-) -> tuple[Any, list[Message], bool, str]:
+    cfg: LoopConfig,
+    obs: list,
+    llm_with_session: Any,
+    llm_with_tools: Any,
+    tool_map: dict[str, ToolLike],
+    tool_names: set[str],
+    messages: list[Message],
+    metadata: dict[str, Any],
+    turn: int,
+) -> tuple[Any, list[Message], bool, set[str] | None, str]:
     temp_override = metadata.pop("_llm_temp_override", None)
     strip_tools = metadata.pop("_llm_strip_tools", False)
     # ``_llm_strip_tools`` is one-shot and consumed right here, so an observer
@@ -548,7 +597,25 @@ async def _prepare_llm_request(
     # (``continue_to_next_turn``) would otherwise re-bind tools on the landing
     # turn that was deliberately given none.
     metadata["_llm_tools_stripped"] = strip_tools
-    llm_base = llm_with_session if strip_tools else llm_with_tools
+    allowed_override = metadata.get("_llm_allowed_tools")
+    allowed_names = (
+        {
+            str(name)
+            for name in allowed_override
+            if str(name) in tool_names
+        }
+        if isinstance(allowed_override, (list, tuple, set, frozenset))
+        else None
+    )
+    if strip_tools:
+        llm_base = llm_with_session
+    elif allowed_names is not None:
+        llm_base = bind_tools(
+            llm_with_session,
+            [tool_map[name] for name in sorted(allowed_names)],
+        )
+    else:
+        llm_base = llm_with_tools
     llm_for_turn = (
         bind_temperature(llm_base, temp_override)
         if temp_override is not None
@@ -568,7 +635,22 @@ async def _prepare_llm_request(
 
     messages_for_call = messages
     if cfg.system_addendum_per_call and turn > cfg.system_addendum_min_turn:
-        messages_for_call = [*messages, system_msg(cfg.system_addendum_per_call)]
+        try:
+            addendum_text = (
+                cfg.system_addendum_per_call()
+                if callable(cfg.system_addendum_per_call)
+                else cfg.system_addendum_per_call
+            )
+        except Exception as exc:
+            logger.warning("dynamic system addendum failed: %s", exc)
+            addendum_text = ""
+        addendum_factory = (
+            user_msg
+            if cfg.system_addendum_per_call_role.strip().lower() == "user"
+            else system_msg
+        )
+        if addendum_text:
+            messages_for_call = [*messages, addendum_factory(addendum_text)]
 
     # Publish the estimate of THIS request, after observer injections and the
     # addendum. An observer comparing its own estimate against the provider's
@@ -581,6 +663,7 @@ async def _prepare_llm_request(
         llm_for_turn,
         messages_for_call,
         bool(strip_tools),
+        allowed_names,
         merged_before_llm.stop_reason or "",
     )
 
@@ -601,6 +684,35 @@ async def _call_llm_with_callbacks(
     metadata["_llm_attempt_index"] = current_attempt_index
     metadata["_llm_attempt_outcome"] = ""
     metadata["_llm_attempt_count"] = 0
+    # Middleware proxies resolve their per-call context from the active scope,
+    # while observer contexts use the loop-local metadata mapping above. Keep
+    # the shared identity keys aligned so host wire-capture hooks can join the
+    # pre-middleware and post-middleware views of the same physical request.
+    from agent_core.execution_context import get_current_execution_scope
+
+    active_scope = get_current_execution_scope()
+    if active_scope is not None:
+        active_scope.metadata.update(
+            {
+                "_llm_call_id": call_id,
+                "_llm_attempt_id": current_attempt_id,
+                "_llm_attempt_index": current_attempt_index,
+            }
+        )
+
+    input_ctx = TurnContext(
+        turn=turn,
+        max_turns=cfg.max_turns,
+        task_id=cfg.task_id,
+        role_id=cfg.role_id,
+        ai_text="",
+        thinking="",
+        tool_calls=[],
+        messages=list(messages_for_call),
+        usage=None,
+        metadata=dict(metadata),
+    )
+    await notify_observers(obs, "on_llm_input", input_ctx)
 
     async def _on_attempt(event: dict[str, Any]) -> None:
         nonlocal current_attempt_id, current_attempt_index
@@ -615,6 +727,14 @@ async def _call_llm_with_callbacks(
             metadata["_llm_attempt_outcome"] = outcome
             metadata["_llm_attempt_count"] = max(
                 int(metadata.get("_llm_attempt_count", 0) or 0), current_attempt_index
+            )
+        if active_scope is not None:
+            active_scope.metadata.update(
+                {
+                    "_llm_call_id": call_id,
+                    "_llm_attempt_id": current_attempt_id,
+                    "_llm_attempt_index": current_attempt_index,
+                }
             )
         attempt_usage = event.get("usage")
         if isinstance(attempt_usage, dict):
@@ -801,7 +921,7 @@ def _answer_unexecuted_tool_calls(messages: list[Message], detail: str) -> None:
         answered.add(call_id)
 
 
-def _pop_last_assistant_turn(messages: list[Message]) -> None:
+def _pop_last_assistant_turn(messages: list[Message]) -> list[Message] | None:
     """Remove the assistant message a rollback observer rejected, in full.
 
     ``pop_last_message`` fires while the turn's tool calls are still
@@ -837,17 +957,51 @@ def _pop_last_assistant_turn(messages: list[Message]) -> None:
             "_pop_last_assistant_turn: no assistant message in history; "
             "leaving it unchanged"
         )
-        return
+        return None
     end = idx + 1
     while end < len(messages) and is_tool_msg(messages[end]):
         end += 1
+    removed = messages[idx:end]
     del messages[idx:end]
+    return removed
+
+
+async def _notify_context_compacted(
+    obs: list[Any],
+    *,
+    cfg: LoopConfig,
+    turn: int,
+    reason: str,
+    before: list[Message],
+    after: list[Message],
+    tokens_before: int,
+    metadata: dict[str, Any],
+    compactor: str = "",
+    policy: str = "",
+) -> None:
+    await notify_observers(
+        obs,
+        "on_context_compacted",
+        ContextCompactionContext(
+            turn=turn,
+            task_id=cfg.task_id,
+            role_id=cfg.role_id,
+            reason=reason,
+            compactor=compactor,
+            policy=policy,
+            messages_before=before,
+            messages_after=after,
+            tokens_before=tokens_before,
+            metadata=metadata,
+        ),
+    )
 
 
 async def _process_llm_response(
     cfg: LoopConfig, obs: list, tc_parser: Any, profile: Any, policy: Any, thinking_parser: Any, normalizer: Any,
     tool_names: set[str], messages: list[Message], metadata: dict[str, Any], turn: int,
-    response: Any, strip_tools: bool, last_input_tokens: int, last_output_tokens: int, first_delta_at: float | None,
+    response: Any, strip_tools: bool, allowed_names: set[str] | None,
+    last_input_tokens: int, last_output_tokens: int, first_delta_at: float | None,
     llm_call_started: float, llm_call_finished: float, call_id: str, current_attempt_id: str, current_attempt_index: int
 ) -> tuple[list[dict], TurnContext, str, bool, bool, int, int]:
     metadata["llm_duration_ms"] = int((llm_call_finished - llm_call_started) * 1000)
@@ -861,9 +1015,14 @@ async def _process_llm_response(
         with contextlib.suppress(Exception):
             response.content = tr.visible_content
 
-    parsed_calls = tc_parser.parse(response, tool_names)
+    parser_tool_names = (
+        tool_names
+        if strip_tools or allowed_names is None
+        else allowed_names
+    )
+    parsed_calls = tc_parser.parse(response, parser_tool_names)
     if not parsed_calls and tr.thinking and hasattr(tc_parser, "parse_text"):
-        parsed_calls = tc_parser.parse_text(tr.thinking, tool_names)
+        parsed_calls = tc_parser.parse_text(tr.thinking, parser_tool_names)
         if parsed_calls:
             logger.warning("turn=%d recovered %d tool_call(s) leaked into <think>", turn, len(parsed_calls))
 
@@ -872,6 +1031,43 @@ async def _process_llm_response(
     # landing allowlist and balance rejected native calls with synthetic tool
     # results so strict providers can safely reuse the history.
     blocked_landing_calls: list[dict] = []
+    if not strip_tools and allowed_names is not None and parsed_calls:
+        allowed_calls = [
+            call
+            for call in parsed_calls
+            if str(call.get("name") or "") in allowed_names
+        ]
+        blocked_delivery_calls = [
+            call
+            for call in parsed_calls
+            if str(call.get("name") or "") not in allowed_names
+        ]
+        if blocked_delivery_calls:
+            blocked_names = [
+                str(call.get("name") or "unknown")
+                for call in blocked_delivery_calls
+            ]
+            recorded = metadata.setdefault("blocked_delivery_tool_calls", [])
+            if isinstance(recorded, list):
+                recorded.extend(blocked_names)
+            native_ids = {
+                str(call.get("id") or "")
+                for call in (getattr(response, "tool_calls", None) or [])
+                if isinstance(call, dict) and call.get("id")
+            }
+            for blocked in blocked_delivery_calls:
+                call_id = str(blocked.get("id") or "")
+                if call_id and call_id in native_ids:
+                    messages.append(
+                        tool_msg(
+                            "[tool call blocked] Delivery mode permits only: "
+                            f"{', '.join(sorted(allowed_names))}. Save and "
+                            "validate required artifacts now.",
+                            call_id,
+                        )
+                    )
+            blocked_landing_calls.extend(blocked_delivery_calls)
+        parsed_calls = allowed_calls
     if strip_tools and parsed_calls:
         configured_landing_names = cfg.loop_policy.landing_tool_names
         if configured_landing_names is None:
@@ -979,7 +1175,21 @@ async def _process_llm_response(
     stop_reason = merged_llm.stop_reason or ""
 
     if merged_llm.pop_last_message and messages:
-        _pop_last_assistant_turn(messages)
+        rollback_before = list(messages)
+        rollback_tokens = estimate_tokens(messages)
+        removed = _pop_last_assistant_turn(messages)
+        if removed is not None:
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="rollback_pop",
+                before=rollback_before,
+                after=messages,
+                tokens_before=rollback_tokens,
+                metadata=metadata,
+                policy="on_llm_response_rollback",
+            )
     if merged_llm.continue_to_next_turn:
         if merged_llm.inject_messages:
             for msg_text in merged_llm.inject_messages:
@@ -1043,6 +1253,10 @@ async def _execute_tool_calls(
     turn: int, total_tool_calls: int, ctx: TurnContext, parsed_calls: list[dict],
     execution_hooks: ToolExecutionHooks,
     body_has_spill_reference: Callable[[str], bool],
+    render_tool_result: Callable[
+        [list[Any], TurnContext, ToolResult, Any],
+        Awaitable[tuple[ToolResult, str, dict[str, Any]]],
+    ],
     *,
     result_max_chars: int | None = None,
 ) -> tuple[str, int]:
@@ -1118,7 +1332,12 @@ async def _execute_tool_calls(
     )
     can_recover = "recover_result" in tool_map
     for tr_result in results:
-        tr_result = await notify_tool_result(obs, ctx, tr_result)
+        tr_result, body, message_metadata = await render_tool_result(
+            obs,
+            ctx,
+            tr_result,
+            processor,
+        )
         # ``notify_tool_result`` ran FIRST, so the trajectory already holds
         # ``tr_result.result`` in full. The post-processor cuts only the string
         # that becomes the message — at a far smaller cap than the 150K upstream
@@ -1126,8 +1345,7 @@ async def _execute_tool_calls(
         # here the difference is simply lost to the model. Minted at this site
         # only: the two earlier cuts happen before the ``ToolResult`` exists, so
         # for those the trajectory holds the same preview the model already has.
-        body = processor.process(tr_result)
-        messages.append(tool_msg(
+        history_message = tool_msg(
             _with_recovery_handle(
                 body,
                 tr_result,
@@ -1136,7 +1354,9 @@ async def _execute_tool_calls(
                 body_has_spill_reference=body_has_spill_reference,
             ),
             tr_result.tool_call_id,
-        ))
+        )
+        cast("dict[str, Any]", history_message).update(message_metadata)
+        messages.append(history_message)
 
     if any(result.interrupted for result in results):
         wait_interventions = await notify_observers(obs, "on_tool_wait_interrupted", ctx)
@@ -1150,8 +1370,15 @@ async def _execute_tool_calls(
     return "", len(parsed_calls)
 
 
-def _handle_context_overflow(
-    cfg: LoopConfig, messages: list[Message], turn: int, last_input_tokens: int, last_output_tokens: int
+async def _handle_context_overflow(
+    cfg: LoopConfig,
+    obs: list[Any],
+    messages: list[Message],
+    metadata: dict[str, Any],
+    turn: int,
+    last_input_tokens: int,
+    last_output_tokens: int,
+    recovery_note: Callable[[list[Message]], Message | None],
 ) -> str:
     if not cfg.context_overflow_guard or not messages:
         return ""
@@ -1178,10 +1405,26 @@ def _handle_context_overflow(
             turn, estimated_total, cfg.max_context_length,
             last_input_tokens, last_output_tokens, trailing_tool_tokens, summary_tokens,
         )
+        popped_before = list(messages)
+        note = recovery_note(messages[trailing_tool_idx:])
         while messages and is_tool_msg(messages[-1]):
             messages.pop()
         if messages and is_assistant_msg(messages[-1]):
             messages.pop()
+        if note is not None:
+            messages.append(note)
+        if messages != popped_before:
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="context_limit_pop",
+                before=popped_before,
+                after=messages,
+                tokens_before=estimated_total,
+                metadata=metadata,
+                policy="context_overflow_guard",
+            )
         return "context_limit_reached"
     return ""
 
@@ -1275,7 +1518,21 @@ async def _handle_turn_end(
     # complete assistant turn, skip compaction/persistence for the discarded
     # attempt, and let the caller retry without consuming a logical turn.
     if merged_turn.pop_last_message:
-        _pop_last_assistant_turn(messages)
+        rollback_before = list(messages)
+        rollback_tokens = estimate_tokens(messages)
+        removed = _pop_last_assistant_turn(messages)
+        if removed is not None:
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="rollback_pop",
+                before=rollback_before,
+                after=messages,
+                tokens_before=rollback_tokens,
+                metadata=metadata,
+                policy="on_turn_end_rollback",
+            )
     if merged_turn.inject_messages:
         for msg_text in merged_turn.inject_messages:
             messages.append(user_msg(msg_text))
@@ -1289,8 +1546,24 @@ async def _handle_turn_end(
     forced_compaction = bool(metadata.pop(FORCE_COMPACTION_KEY, False))
     if forced_compaction or compaction_policy.should_compact(turn, messages, est_tokens):
         compactor = cfg.compactor or DefaultMessageCompactor()
+        messages_before = list(messages)
         result = compactor.compact(messages, cfg.keep_recent)
-        messages[:] = await result if inspect.isawaitable(result) else result
+        compacted = await result if inspect.isawaitable(result) else result
+        if compacted is not messages:
+            messages[:] = compacted
+        if messages != messages_before:
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="policy_compact",
+                before=messages_before,
+                after=messages,
+                tokens_before=est_tokens,
+                metadata=metadata,
+                compactor=type(compactor).__name__,
+                policy=type(compaction_policy).__name__,
+            )
         metadata[COMPACTION_SEQ_KEY] = int(
             metadata.get(COMPACTION_SEQ_KEY, 0) or 0,
         ) + 1

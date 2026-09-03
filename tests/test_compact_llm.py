@@ -82,9 +82,10 @@ async def test_happy_path_returns_system_summary_recent() -> None:
     out = await compactor.compact(history, keep_recent=4)
 
     assert out[0].get("role") == "system"
-    # The single rollup user message carries the LLM-supplied summary.
+    # The original task is pinned before the LLM-supplied summary.
     assert out[1].get("role") == "user"
-    assert "ROLLUP-CONTENT" in out[1].get("content")
+    assert out[1] is history[1]
+    assert "ROLLUP-CONTENT" in out[2].get("content")
     # ``keep_recent`` recent messages must follow verbatim.
     assert out[-1] is history[-1]
 
@@ -116,8 +117,9 @@ async def test_rollback_on_llm_failure_keeps_only_system_and_last_user() -> None
 
     assert out[0].get("role") == "system"
     assert out[1].get("role") == "user"
-    assert "Compaction failed" in out[1].get("content")
-    assert "llm_error" in out[1].get("content")
+    assert out[1] is history[1]
+    assert "Compaction failed" in out[2].get("content")
+    assert "llm_error" in out[2].get("content")
     # Last user query preserved so the next turn has something to answer.
     assert out[-1] is last_user
 
@@ -141,7 +143,8 @@ async def test_rollback_on_empty_summary() -> None:
     out = await compactor.compact(history, keep_recent=4)
 
     assert out[1].get("role") == "user"
-    assert "Compaction failed" in out[1].get("content")
+    assert out[1] is history[1]
+    assert "Compaction failed" in out[2].get("content")
     assert captured[0]["rollback_reason"] == "empty_summary"
 
 
@@ -155,9 +158,10 @@ async def test_no_llm_falls_through_to_string_slice() -> None:
     # String-slice keeps system + ONE compact summary user message + recent.
     assert out[0].get("role") == "system"
     assert out[1].get("role") == "user"
-    assert "Compacted" in out[1].get("content")
+    assert out[1] is history[1]
+    assert "Compacted" in out[2].get("content")
     # Importantly: no rollback placeholder text.
-    assert "Compaction failed" not in out[1].get("content")
+    assert "Compaction failed" not in out[2].get("content")
 
 
 @pytest.mark.asyncio

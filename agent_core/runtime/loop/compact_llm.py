@@ -17,7 +17,6 @@ from typing import Any, cast
 
 from agent_core.messages import (
     Message,
-    is_tool_msg,
     text_of,
     user_msg,
 )
@@ -25,6 +24,7 @@ from agent_core.runtime.loop.compact import (
     SPILL_MANIFEST_HEADER,
     compress_tool_results,
     estimate_tokens,
+    partition_for_compaction,
     tool_names_by_call_id,
 )
 from agent_core.runtime.loop.compact import (
@@ -362,43 +362,7 @@ class LLMSummaryCompactor:
         messages: list[Message],
         keep_recent: int,
     ) -> tuple[list[Message], list[Message], list[Message]]:
-        """Split into ``(system_prefix, to_summarize, kept_recent)``."""
-        sys_msgs: list[Message] = []
-        rest: list[Message] = []
-        for msg in messages:
-            if msg.get("role") == "system" and not rest:
-                sys_msgs.append(msg)
-            else:
-                rest.append(msg)
-
-        if len(rest) <= keep_recent:
-            return sys_msgs, [], rest
-
-        split_idx = len(rest) - keep_recent
-        # Avoid an orphan ToolMessage at the head of the kept window: the
-        # matching AIMessage(tool_calls=[...]) would otherwise be left
-        # in the middle and Azure rejects an orphan tool_call_id with 400.
-        forward = split_idx
-        while forward < len(rest) and is_tool_msg(rest[forward]):
-            forward += 1
-        if forward < len(rest):
-            split_idx = forward
-        elif split_idx < len(rest):
-            # The whole tail is tool results — a parallel tool-call turn that
-            # emitted at least ``keep_recent`` of them. Walking forward runs off
-            # the end and leaves the last result orphaned (the bug this guard
-            # exists to prevent), so walk BACK to the assistant message that
-            # owns the calls and keep that turn whole instead. The kept window
-            # grows past ``keep_recent``; ``keep_recent`` is a floor on how much
-            # recent history survives, not a cap.
-            while split_idx > 0 and is_tool_msg(rest[split_idx]):
-                split_idx -= 1
-        # ``split_idx == len(rest)`` (``keep_recent=0``: summarise everything) is
-        # neither case. The kept window is EMPTY, so no orphan is possible, and
-        # both walks are meaningless — the forward one has nothing to scan and
-        # the backward one would index one past the end. Leave the split alone.
-
-        return sys_msgs, rest[:split_idx], rest[split_idx:]
+        return partition_for_compaction(messages, keep_recent)
 
     async def _generate_summary_with_retry(
         self,
@@ -575,6 +539,30 @@ class LLMSummaryCompactor:
         keep_recent: int,
     ) -> list[Message]:
         new_messages = _string_slice_compact(messages, keep_recent)
+        if keep_recent > 0:
+            original_task = next(
+                (
+                    message
+                    for message in messages
+                    if message.get("role") == "user"
+                    and not text_of(message.get("content")).startswith("[Compacted")
+                ),
+                None,
+            )
+            if original_task is not None and not any(
+                message is original_task for message in new_messages
+            ):
+                insert_at = 0
+                while (
+                    insert_at < len(new_messages)
+                    and new_messages[insert_at].get("role") == "system"
+                ):
+                    insert_at += 1
+                new_messages = [
+                    *new_messages[:insert_at],
+                    original_task,
+                    *new_messages[insert_at:],
+                ]
         # Synchronous emit: schedule async path on a dummy loop only when
         # an emitter exists. Most callers pass ``emit_event=None`` (SDK
         # default), so the common case is a pure-sync no-op.

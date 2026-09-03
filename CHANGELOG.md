@@ -7,6 +7,30 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.4.0] - 2026-09-03
+
+### Added
+
+- `ToolResult` now carries optional structured failure, recovery, and repeated-
+  invocation metadata. `ToolExecutionHooks.result_metadata` lets products
+  populate those fields without moving product-specific classifiers or stores
+  into AgentCore. Timeouts and exceptions receive stable core-owned
+  `error_kind` values.
+- Loop observers can inspect the exact pre-provider LLM input, correlate calls
+  and retries through stable identifiers, and receive pre/post snapshots for
+  rollback, overflow recovery, and policy-driven context compaction.
+- Products can dynamically constrain the tools available to an individual turn,
+  supply callable per-call addenda as system or user messages, customize tool
+  history rendering, and preserve host-owned recovery metadata.
+- Deterministic and LLM-backed compaction now retain the original task,
+  tool-call/result pairing, recoverability references, and recovery-index order.
+
+### Fixed
+
+- Context-discard notifications now fire when overflow recovery replaces a
+  message without changing history length and when a custom compactor mutates
+  the history list in place.
+
 ## [0.3.0] - 2026-09-03
 
 First published release. AgentCore is now open source under Apache-2.0 and

@@ -77,6 +77,7 @@ CallScopeFactory = Callable[
     [dict[str, Any], float], AbstractContextManager[Any]
 ]
 ResultTransform = Callable[[str, str], str]
+ResultMetadata = Callable[[str, dict[str, Any], Any, str], dict[str, Any]]
 BatchTransform = Callable[[list[ToolResult]], list[ToolResult]]
 CallObserver = Callable[[str], None]
 UnknownResult = Callable[[str, tuple[str, ...]], str]
@@ -123,6 +124,15 @@ def _identity_result(_name: str, value: str) -> str:
 
 def _identity_batch(results: list[ToolResult]) -> list[ToolResult]:
     return results
+
+
+def _empty_result_metadata(
+    _name: str,
+    _args: dict[str, Any],
+    _raw: Any,
+    _rendered: str,
+) -> dict[str, Any]:
+    return {}
 
 
 def _noop_call(_name: str) -> None:
@@ -215,6 +225,7 @@ class ToolExecutionHooks:
     await_call: AwaitCall = _default_await
     call_scope: CallScopeFactory = _default_scope
     transform_result: ResultTransform = _identity_result
+    result_metadata: ResultMetadata = _empty_result_metadata
     transform_batch: BatchTransform = _identity_batch
     on_call: CallObserver = _noop_call
     unknown_result: UnknownResult = _unknown_result
@@ -325,14 +336,29 @@ async def execute_tools(
                     raw = await invocation
 
             result = runtime.transform_result(name, str(raw) if raw is not None else "")
+            metadata_raw = _safe_hook(
+                "result_metadata",
+                lambda: runtime.result_metadata(name, args, raw, result),
+                dict,
+            )
+            metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+            error_kind = str(metadata.get("error_kind") or "")
+            try:
+                repeat_count = max(1, int(metadata.get("repeat_count") or 1))
+            except (TypeError, ValueError):
+                repeat_count = 1
             return ToolResult(
                 name=name,
                 args=args,
                 result=result,
                 duration_ms=int((time.monotonic() - start) * 1000),
                 tool_call_id=tool_call_id,
-                is_error=False,
+                is_error=bool(error_kind),
                 interrupted=woke_for_interrupt,
+                error_kind=error_kind,
+                result_id=str(metadata.get("result_id") or ""),
+                repeat_count=repeat_count,
+                repeat_recovery_id=str(metadata.get("repeat_recovery_id") or ""),
             )
         except TimeoutError:
             elapsed = int((time.monotonic() - start) * 1000)
@@ -351,6 +377,7 @@ async def execute_tools(
                 duration_ms=elapsed,
                 tool_call_id=tool_call_id,
                 is_error=True,
+                error_kind="timeout",
             )
         except asyncio.CancelledError:
             raise
@@ -367,6 +394,7 @@ async def execute_tools(
                 duration_ms=int((time.monotonic() - start) * 1000),
                 tool_call_id=tool_call_id,
                 is_error=True,
+                error_kind="exception",
             )
         finally:
             if interrupt_task is not None and not interrupt_task.done():
