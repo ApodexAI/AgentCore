@@ -81,50 +81,67 @@ Releases are cut from `main` after CI is green:
 ```bash
 git switch main && git pull
 python3 scripts/version.py          # confirm the version you are about to tag
-git tag -a v0.2.0 -m 'AgentCore 0.2.0'
-git push origin v0.2.0
+git tag -a v0.3.0 -m 'AgentCore 0.3.0'
+git push origin v0.3.0
 ```
 
 Pushing the tag triggers `.github/workflows/release.yml`, which:
 
 1. verifies the tag matches `[project].version` (a mismatch fails the release);
 2. re-runs ruff, pyright, and pytest against the tagged tree;
-3. runs `uv build`;
-4. creates a GitHub Release carrying the wheel, the sdist, and the CHANGELOG
-   section for that version.
+3. runs `uv build` and `twine check`;
+4. publishes to PyPI from a separate job using Trusted Publishing;
+5. creates or repairs a GitHub Release carrying the wheel, the sdist, and the
+   CHANGELOG section for that version.
 
-A tag is never moved or deleted once pushed — products may already have resolved
-it. To correct a bad release, bump to the next PATCH and tag again.
+**A PyPI version number is consumed permanently.** It cannot be re-uploaded even
+after deleting the release or the entire project; yanking hides a release from
+resolution but does not free the number. So a botched release is never fixed in
+place — bump to the next PATCH and tag again. The same rule applies to tags,
+which are never moved or deleted once pushed because a consumer may already have
+resolved one.
+
+Because the number cannot be reclaimed, the release job runs `twine check`
+before publishing, and it is worth doing a first-time dry run against TestPyPI
+rather than discovering a metadata problem on the real index.
 
 ## How products consume a release
 
-Pin the tag, not a branch and not a SHA:
+Depend on the published package with an exact pin:
 
 ```toml
 dependencies = [
-  "apodex-agent-core @ git+ssh://git@github.com/ApodexAI/AgentCore.git@v0.2.0",
+  "apodex-agent-core==0.3.0",
 ]
 ```
 
-A tag is as immutable as a SHA in practice (it is never moved, per above) and it
-is readable in a diff, so a bump PR states plainly which version a product is
-moving to.
+Exact, because this is a `0.x` series where a MINOR bump may be breaking. The
+pin is what makes each upgrade an explicit, reviewable event: Dependabot opens a
+pull request against it and the product's own CI decides whether the new version
+is safe. See [downstream-bump.md](downstream-bump.md).
 
-## On a private package registry
+## On the package registry
 
-Not currently used, and not currently needed. A registry would buy convenience —
-no SSH/token plumbing for `docker build` and CI runners, no full-repository clone
-during `uv lock`, and clean resolution if AgentCore ever becomes a *transitive*
-dependency. It buys nothing in reproducibility: a Git tag is already immutable,
-whereas a registry version can in principle be yanked or replaced.
+AgentCore publishes to PyPI. This became the obvious choice when the repository
+went public, and it is worth recording why the earlier answer was the opposite.
 
-With two first-party consumers in one organization, the credential rotation,
-availability, and backup burden of a private index (CodeArtifact, Artifactory,
-Gemfury) outweighs that convenience. Revisit when either becomes true:
+While the repository was private, the options were a private index
+(CodeArtifact, Artifactory, Gemfury) or Git pins. Git pins won: a private index
+costs credential rotation, availability, and backup work, while buying only
+convenience — a Git tag was already immutable, so there was nothing to gain in
+reproducibility.
 
-- a third consumer appears, or AgentCore becomes a transitive dependency;
-- Git credential distribution starts causing real build failures.
+Going public removed the entire cost side of that trade. Public PyPI needs no
+credentials to read, nothing to operate, and Trusted Publishing means nothing to
+store on the publishing side either. It also removed the *reason* for Git pins:
+every consumer previously needed a credential just to resolve the dependency.
 
-The intermediate step, if only the plumbing hurts: attach the wheel built by the
-release workflow — already published on each GitHub Release — and install via
-`--find-links`, with no index to operate.
+What PyPI adds beyond convenience:
+
+- installation with no credential at all, including inside `docker build`;
+- no full-repository clone during `uv lock`;
+- clean resolution if AgentCore ever becomes a *transitive* dependency;
+- Dependabot support, which replaces a bespoke cross-repository bump mechanism
+  that would otherwise need organization-level administration;
+- stronger immutability than a Git tag, not weaker: a published version number
+  can never be reused, whereas a tag is only immutable by convention.

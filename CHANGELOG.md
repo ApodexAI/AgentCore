@@ -7,7 +7,70 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.3.0] - 2026-09-03
+
+First published release. AgentCore is now open source under Apache-2.0 and
+distributed on PyPI as [`apodex-agent-core`](https://pypi.org/project/apodex-agent-core/).
+
+### Consumer action
+
+Replace the Git dependency with the published package:
+
+```toml
+dependencies = [
+  "apodex-agent-core==0.3.0",   # was: apodex-agent-core @ git+ssh://…@<rev>
+]
+```
+
+Then delete the credential plumbing this required — the AgentCore deploy key,
+`AGENT_CORE_REPO_TOKEN`, and any `insteadOf` rewriting. Installing needs no
+credential now, `docker build` included.
+
+### Changed
+
+- **Distribution.** Releases publish to PyPI from the tagged tree using Trusted
+  Publishing (OIDC): no API token is stored anywhere, and `id-token: write` is
+  scoped to the publishing job alone. GitHub Releases still carry the wheel,
+  sdist, and changelog section.
+- **Downstream bumps are Dependabot's job.** The `repository_dispatch` +
+  repin-script mechanism is deleted along with `.github/downstream/`. It existed
+  only because a private Git dependency could not be resolved without a
+  credential; a public PyPI package needs none, and Dependabot's `uv` ecosystem
+  updates `pyproject.toml` and `uv.lock` and opens a pull request that the
+  product's own CI validates. This also removes the need for an organization-level
+  GitHub App or a cross-repository PAT.
+- Package metadata: SPDX `license = "Apache-2.0"` with `license-files` (PEP 639),
+  trove classifiers, and project URLs.
+- `docs/versioning.md` records why publishing to PyPI reversed the earlier
+  decision to stay on Git pins — going public removed that trade's entire cost
+  side.
+
+### Added
+
+- The release now runs `twine check` and installs the built wheel in a clean
+  environment to `import agent_core` before publishing. A PyPI version number
+  can never be reused, so a broken artifact must fail the release rather than
+  consume the number.
+- `docs/downstream-bump.md`: PyPI publisher registration, the `pypi` environment,
+  the Dependabot config, and the one real limitation — a Dependabot pull request
+  runs CI as if from a fork, so `secrets.*` resolves against Dependabot secrets
+  rather than Actions secrets.
+
+### Fixed
+
+- The version gate accepted a *decreasing* version: it compared for inequality
+  rather than an increase, so a pull request could move `0.2.0` back to `0.1.9`
+  and pass.
+- The `skip-version-bump` label was inert. The default `pull_request` event types
+  exclude `labeled`, so applying the label did not re-run the check and the pull
+  request stayed red forever.
+
 ## [0.2.0] - 2026-09-03
+
+**Never published.** No tag was pushed and no artifact was distributed; the
+version exists only in `main`'s history. Consumers went from Git revisions
+straight to `0.3.0` on PyPI. The entry below is kept because it records when
+version discipline was introduced.
 
 First versioned release. Functionally this is the runtime that products have
 already been consuming by commit SHA; what changes is that the revision now has

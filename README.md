@@ -107,44 +107,30 @@ AgentCore uses the import namespace `agent_core` and the distribution name
 
 ## Consuming the release package
 
-FrontierAgent should pin a released tag, never a branch:
+AgentCore is published on PyPI:
+
+```bash
+uv add apodex-agent-core        # or: pip install apodex-agent-core
+```
+
+FrontierAgent pins an exact version:
 
 ```toml
 dependencies = [
-  "apodex-agent-core @ git+ssh://git@github.com/ApodexAI/AgentCore.git@v0.2.0",
+  "apodex-agent-core==0.3.0",
 ]
 ```
 
-A tag is as immutable as a commit here — tags are never moved or deleted once
-pushed — and unlike a SHA it is readable in a diff, so a bump PR states which
-version the product is moving to. Every tag has a GitHub Release carrying the
-built wheel, the sdist, and its changelog section. See
+Exact, because this is a `0.x` series where a MINOR bump may be breaking. The
+pin makes each upgrade a reviewable event: Dependabot opens a pull request
+against it and FrontierAgent CI decides whether the new version is safe. See
+[docs/downstream-bump.md](docs/downstream-bump.md).
+
+No credential is involved anywhere in that path — the repository and the package
+are both public. Every release also has a GitHub Release carrying the wheel, the
+sdist, and its changelog section. See
 [docs/versioning.md](docs/versioning.md) for what a version number means and
 [CHANGELOG.md](CHANGELOG.md) for what changed.
-
-Because this repository is private, CI needs a read-only credential that can
-clone `ApodexAI/AgentCore`. Prefer a dedicated GitHub App: store its client ID
-as a repository variable and its private key as a secret, then mint a
-short-lived installation token during each job with
-`actions/create-github-app-token`. Do not store the generated installation
-token as a secret; it expires after one hour. A fine-grained machine-user PAT
-stored as `AGENT_CORE_REPO_TOKEN` is the fallback, not a developer's personal
-token. Expose either credential to the following step as
-`AGENT_CORE_REPO_TOKEN`, then configure Git before `uv sync`:
-
-```bash
-git config --global \
-  url."https://x-access-token:${AGENT_CORE_REPO_TOKEN}@github.com/".insteadOf \
-  "ssh://git@github.com/"
-```
-
-The rewrite must target `ssh://git@github.com/`, which is the scheme the pin
-above declares. Rewriting `https://github.com/` instead is a no-op against an
-`ssh://` dependency URL and leaves CI failing on an SSH key it does not have.
-
-Until that credential is installed in both product repositories, product
-source must not be switched to the private dependency: doing so would make a
-clean checkout and CI unreproducible.
 
 ## Release package contract
 
@@ -163,7 +149,8 @@ The release must:
 - pass lint, type checking, the complete test suite, and an install/import smoke
   test against the built wheel before publication;
 - attach the wheel, source distribution, and matching changelog section to the
-  GitHub Release, then trigger FrontierAgent's pinned-version bump workflow.
+  GitHub Release, and publish the same artifacts to PyPI so Dependabot can open
+  FrontierAgent's bump pull request.
 
 A release is not complete merely because a tag exists. It is complete when its
 artifacts can be installed in a clean Python 3.12 environment, `import
@@ -181,23 +168,24 @@ must not depend on a sibling checkout or files outside the distribution.
 
    ```bash
    git switch main && git pull
-   git tag -a v0.2.0 -m 'AgentCore 0.2.0'
-   git push origin v0.2.0
+   git tag -a v0.3.0 -m 'AgentCore 0.3.0'
+   git push origin v0.3.0
    ```
 
    The `Release` workflow verifies the tag matches the declared version,
-   re-runs the full check suite against the tagged tree, builds, and publishes a
-   GitHub Release with the wheel, sdist, and changelog section.
-4. The release workflow dispatches to ApodexHarness and FrontierAgent, each of
-   which opens a bump PR moving its pin to the new tag. See
-   [docs/downstream-bump.md](docs/downstream-bump.md) for the one-time token and
-   workflow setup those products need.
+   re-runs the full check suite against the tagged tree, builds and validates the
+   artifacts, publishes them to PyPI through Trusted Publishing, then creates a
+   retry-safe GitHub Release with the wheel, sdist, and changelog section.
+4. Dependabot normally opens an exact-version bump PR in each product. While
+   GitHub's current `uv` updater defect is unresolved, open that PR with the
+   documented no-credential manual fallback instead. See
+   [docs/downstream-bump.md](docs/downstream-bump.md).
 5. Product CI validates adapters and end-to-end behavior. Product PRs must not
    patch vendored/shared implementation code.
 
 [docs/versioning.md](docs/versioning.md) covers the version scheme, what counts
-as a breaking change, and why AgentCore is not on 1.0 or a private package
-registry yet.
+as a breaking change, why AgentCore is not on 1.0 yet, and why publishing to
+PyPI replaced the earlier Git-pin approach.
 
 Product-only bugs stay in the product repository. If a proposed fix needs to
 edit both products' core copies, that is evidence it belongs here.

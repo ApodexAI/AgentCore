@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import check_version_bump
 
@@ -58,22 +59,107 @@ def test_version_label_changes_retrigger_ci() -> None:
     assert "types: [opened, synchronize, reopened, labeled, unlabeled]" in workflow
 
 
-def test_downstream_version_input_is_not_interpolated_into_shell_source() -> None:
-    workflow = (ROOT / ".github/downstream/bump-agent-core.yml").read_text(encoding="utf-8")
-
-    assert "INPUT_VERSION: ${{ github.event.client_payload.version || inputs.version }}" in workflow
-    assert 'version="$INPUT_VERSION"' in workflow
-    assert 'version="${{ github.event.client_payload.version || inputs.version }}"' not in workflow
-    assert "persist-credentials: false" in workflow
+def _release_workflow() -> str:
+    return (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 
 
-def test_workflows_mint_short_lived_github_app_tokens() -> None:
-    downstream = (ROOT / ".github/downstream/bump-agent-core.yml").read_text(encoding="utf-8")
-    release = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+def test_pypi_publishing_uses_trusted_publishing_without_any_token() -> None:
+    """A stored PyPI token is the thing Trusted Publishing exists to remove.
 
-    action = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
-    assert downstream.count(action) == 2
-    assert release.count(action) == 1
-    assert "DOWNSTREAM_BUMP_TOKEN" not in release
-    assert "BUMP_PR_TOKEN" not in downstream
-    assert "AGENT_CORE_REPO_TOKEN: ${{ secrets." not in downstream
+    Reintroducing one would be a silent downgrade: publishing keeps working, so
+    nothing fails to reveal that a long-lived credential is back in the repo.
+    """
+    release = _release_workflow()
+
+    assert "pypa/gh-action-pypi-publish@" in release
+    for forbidden in ("PYPI_API_TOKEN", "PYPI_TOKEN", "TWINE_PASSWORD", "password:"):
+        assert forbidden not in release, forbidden
+
+
+def test_id_token_permission_is_scoped_to_the_publish_job_alone() -> None:
+    """`id-token: write` mints the identity PyPI trusts.
+
+    Granted workflow-wide, every third-party action in the build could request
+    that identity, so the permission must sit on the publishing job only.
+    """
+    workflow = yaml.safe_load(_release_workflow())
+    jobs = workflow["jobs"]
+
+    assert jobs["publish-pypi"]["permissions"] == {"id-token": "write"}
+    assert jobs["publish-pypi"]["needs"] == "build"
+    assert "id-token" not in jobs["build"]["permissions"]
+    assert jobs["build"]["permissions"] == {"contents": "read"}
+    # Workflow-level permissions would apply to both jobs.
+    assert "permissions" not in workflow
+
+
+def test_github_release_is_published_last_and_is_retry_safe() -> None:
+    """A failed upload must not advertise a release that is absent from PyPI."""
+    workflow = yaml.safe_load(_release_workflow())
+    jobs = workflow["jobs"]
+
+    assert jobs["publish-github"]["needs"] == "publish-pypi"
+    assert jobs["publish-github"]["permissions"] == {"contents": "write"}
+    release = _release_workflow()
+    assert 'gh release view "$TAG"' in release
+    assert 'gh release upload "$TAG" --clobber' in release
+    assert "packages-dir: release-artifacts/dist/" in release
+
+
+def test_metadata_is_validated_before_a_version_number_is_consumed() -> None:
+    """A PyPI version can never be reused, not even after deletion.
+
+    Invalid metadata must fail the build rather than burn the number.
+    """
+    assert "twine check dist/*" in _release_workflow()
+
+
+def test_the_removed_dispatch_machinery_has_not_returned() -> None:
+    """Downstream bumps are Dependabot's job now.
+
+    The dispatch/repin path needed a cross-repository write credential, which is
+    exactly what publishing to PyPI removed the need for.
+    """
+    assert not (ROOT / ".github/downstream").exists()
+
+    release = _release_workflow()
+    for forbidden in ("repository_dispatch", "DOWNSTREAM_BUMP_TOKEN", "create-github-app-token"):
+        assert forbidden not in release, forbidden
+
+
+def test_release_verifies_the_wheel_installs_and_imports() -> None:
+    """The artifact, not just the tree, is what consumers get.
+
+    A wheel that builds but cannot be imported would consume the version number
+    before anyone noticed, and PyPI never releases a number back.
+    """
+    release = _release_workflow()
+
+    assert "uv pip install --python /tmp/wheel-smoke/bin/python dist/*.whl" in release
+    assert "import agent_core" in release
+
+
+def test_typed_marker_backs_the_typing_classifier() -> None:
+    """`Typing :: Typed` is a promise consumers' type checkers rely on."""
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+
+    assert "Typing :: Typed" in project["classifiers"]
+    assert (ROOT / "agent_core/py.typed").is_file()
+
+
+def test_license_is_declared_as_an_spdx_expression() -> None:
+    """PEP 639: an SPDX expression, and no redundant License:: classifier.
+
+    Declaring both makes PyPI reject the upload — after the tag already exists.
+    """
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+
+    assert project["license"] == "Apache-2.0"
+    assert project["license-files"] == ["LICENSE"]
+    assert not [c for c in project["classifiers"] if c.startswith("License ::")]

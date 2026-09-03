@@ -1,10 +1,21 @@
 [project]
 name = "apodex-agent-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared, product-neutral runtime primitives for Apodex agents"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = ["agent", "llm", "runtime", "agent-loop", "tool-calling"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
 dependencies = [
     "anthropic[bedrock]>=0.69",
     "httpx>=0.27,<1",
@@ -27,6 +38,12 @@ dev = [
     "pyright[nodejs]>=1.1.400",
     "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ApodexAI/AgentCore"
+Repository = "https://github.com/ApodexAI/AgentCore"
+Changelog = "https://github.com/ApodexAI/AgentCore/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ApodexAI/AgentCore/issues"
 
 [build-system]
 requires = ["hatchling"]
