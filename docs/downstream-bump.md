@@ -1,14 +1,15 @@
 # Publishing releases and automating downstream bumps
 
 AgentCore is public and publishes to PyPI. Consumers depend on a normal version
-specifier, and **Dependabot** opens the bump pull requests — so there is no
+specifier, and **Dependabot** is the long-term bump mechanism — so there is no
 cross-repository credential, no dispatch, and no bespoke repin script anywhere
-in this design.
+in this design. A no-credential manual fallback covers the current upstream
+Dependabot defect documented below.
 
-Flow: tag `v0.3.0` → `Release` workflow verifies, tests, builds, publishes the
-GitHub Release, then publishes to PyPI via Trusted Publishing → Dependabot in
-each product notices the new version and opens a pull request that the product's
-own CI validates.
+Flow: tag `v0.3.0` → `Release` workflow verifies, tests, and builds → publishes
+to PyPI via Trusted Publishing → creates or repairs the matching GitHub Release
+→ Dependabot (or the temporary manual fallback) opens a product pull request
+that the product's own CI validates.
 
 ## One-time setup in AgentCore
 
@@ -79,8 +80,26 @@ updates:
       - "agent-core"
 ```
 
-Dependabot's `uv` ecosystem updates both `pyproject.toml` and `uv.lock`, and
-works in private and internal repositories.
+Dependabot's `uv` ecosystem is intended to update both `pyproject.toml` and
+`uv.lock`, and it works with private and internal repositories. However, as of
+2026-09-03 its hosted updater has an open defect that passes the target version
+as an invalid positional argument to `uv lock`, so version-update jobs can fail
+before opening a pull request. Track
+[dependabot-core#15842](https://github.com/dependabot/dependabot-core/issues/15842)
+and keep the configuration above in place so automation resumes when GitHub
+ships the fix.
+
+Until then, update without any AgentCore credential from a product checkout:
+
+```bash
+uv add 'apodex-agent-core==0.3.0'
+uv sync --frozen
+```
+
+Commit both `pyproject.toml` and `uv.lock` in the same pull request and let the
+product's normal CI validate it. Substitute the new release number each time;
+the package and repository are public, so this fallback needs no token, deploy
+key, GitHub App, or cross-repository permission.
 
 ## The one real limitation
 

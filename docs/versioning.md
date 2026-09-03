@@ -90,9 +90,9 @@ Pushing the tag triggers `.github/workflows/release.yml`, which:
 1. verifies the tag matches `[project].version` (a mismatch fails the release);
 2. re-runs ruff, pyright, and pytest against the tagged tree;
 3. runs `uv build` and `twine check`;
-4. creates a GitHub Release carrying the wheel, the sdist, and the CHANGELOG
-   section for that version;
-5. publishes to PyPI from a separate job using Trusted Publishing.
+4. publishes to PyPI from a separate job using Trusted Publishing;
+5. creates or repairs a GitHub Release carrying the wheel, the sdist, and the
+   CHANGELOG section for that version.
 
 **A PyPI version number is consumed permanently.** It cannot be re-uploaded even
 after deleting the release or the entire project; yanking hides a release from

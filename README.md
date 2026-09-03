@@ -168,17 +168,18 @@ must not depend on a sibling checkout or files outside the distribution.
 
    ```bash
    git switch main && git pull
-   git tag -a v0.2.0 -m 'AgentCore 0.2.0'
-   git push origin v0.2.0
+   git tag -a v0.3.0 -m 'AgentCore 0.3.0'
+   git push origin v0.3.0
    ```
 
    The `Release` workflow verifies the tag matches the declared version,
-   re-runs the full check suite against the tagged tree, builds, and publishes a
-   GitHub Release with the wheel, sdist, and changelog section.
-4. The release workflow dispatches to ApodexHarness and FrontierAgent, each of
-   which opens a bump PR moving its pin to the new tag. See
-   [docs/downstream-bump.md](docs/downstream-bump.md) for the one-time token and
-   workflow setup those products need.
+   re-runs the full check suite against the tagged tree, builds and validates the
+   artifacts, publishes them to PyPI through Trusted Publishing, then creates a
+   retry-safe GitHub Release with the wheel, sdist, and changelog section.
+4. Dependabot normally opens an exact-version bump PR in each product. While
+   GitHub's current `uv` updater defect is unresolved, open that PR with the
+   documented no-credential manual fallback instead. See
+   [docs/downstream-bump.md](docs/downstream-bump.md).
 5. Product CI validates adapters and end-to-end behavior. Product PRs must not
    patch vendored/shared implementation code.
 

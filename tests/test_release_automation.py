@@ -86,10 +86,24 @@ def test_id_token_permission_is_scoped_to_the_publish_job_alone() -> None:
     jobs = workflow["jobs"]
 
     assert jobs["publish-pypi"]["permissions"] == {"id-token": "write"}
-    assert jobs["publish-pypi"]["needs"] == "release"
-    assert "id-token" not in jobs["release"]["permissions"]
+    assert jobs["publish-pypi"]["needs"] == "build"
+    assert "id-token" not in jobs["build"]["permissions"]
+    assert jobs["build"]["permissions"] == {"contents": "read"}
     # Workflow-level permissions would apply to both jobs.
     assert "permissions" not in workflow
+
+
+def test_github_release_is_published_last_and_is_retry_safe() -> None:
+    """A failed upload must not advertise a release that is absent from PyPI."""
+    workflow = yaml.safe_load(_release_workflow())
+    jobs = workflow["jobs"]
+
+    assert jobs["publish-github"]["needs"] == "publish-pypi"
+    assert jobs["publish-github"]["permissions"] == {"contents": "write"}
+    release = _release_workflow()
+    assert 'gh release view "$TAG"' in release
+    assert 'gh release upload "$TAG" --clobber' in release
+    assert "packages-dir: release-artifacts/dist/" in release
 
 
 def test_metadata_is_validated_before_a_version_number_is_consumed() -> None:

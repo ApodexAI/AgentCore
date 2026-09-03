@@ -5,10 +5,10 @@ on:
     tags: ["v*"]
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -58,28 +58,19 @@ jobs:
           print("imported", agent_core.__name__, "with", len(agent_core.__all__), "exports")
           SMOKE
 
-      - name: Publish GitHub Release
-        run: |
-          set -euo pipefail
-          gh release create "$TAG" \
-            --title "AgentCore ${TAG#v}" \
-            --notes-file release-notes.md \
-            dist/*.whl dist/*.tar.gz
-        env:
-          TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dist
-          path: dist/
+          name: release-artifacts
+          path: |
+            dist/
+            release-notes.md
           if-no-files-found: error
 
   # Separate job so `id-token: write` — which mints the OIDC identity PyPI
   # trusts — is scoped to publishing alone and never exposed to the build or to
   # any third-party action running beside it.
   publish-pypi:
-    needs: release
+    needs: build
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -87,9 +78,44 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
-          path: dist/
+          name: release-artifacts
+          path: release-artifacts/
       # Trusted Publishing: no API token, no secret. PyPI verifies the OIDC
       # claim naming this repository, this workflow file, and the environment
       # above, then issues a short-lived upload token itself.
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: release-artifacts/dist/
+
+  # Publish the GitHub Release last. A failed PyPI upload therefore cannot leave
+  # a GitHub Release claiming that a version was published when it was not.
+  publish-github:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-artifacts
+          path: release-artifacts/
+      # `gh release create` is not retry-safe after a partial API failure. Use
+      # an upsert so rerunning this job always converges on the same release.
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "AgentCore ${TAG#v}" \
+              --notes-file release-artifacts/release-notes.md
+            gh release upload "$TAG" --clobber \
+              release-artifacts/dist/*.whl release-artifacts/dist/*.tar.gz
+          else
+            gh release create "$TAG" \
+              --title "AgentCore ${TAG#v}" \
+              --notes-file release-artifacts/release-notes.md \
+              release-artifacts/dist/*.whl release-artifacts/dist/*.tar.gz
+          fi
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
