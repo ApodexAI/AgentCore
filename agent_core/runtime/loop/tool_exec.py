@@ -77,7 +77,7 @@ CallScopeFactory = Callable[
     [dict[str, Any], float], AbstractContextManager[Any]
 ]
 ResultTransform = Callable[[str, str], str]
-ResultMetadata = Callable[[str, Any, str], dict[str, Any]]
+ResultMetadata = Callable[[str, dict[str, Any], Any, str], dict[str, Any]]
 BatchTransform = Callable[[list[ToolResult]], list[ToolResult]]
 CallObserver = Callable[[str], None]
 UnknownResult = Callable[[str, tuple[str, ...]], str]
@@ -128,6 +128,7 @@ def _identity_batch(results: list[ToolResult]) -> list[ToolResult]:
 
 def _empty_result_metadata(
     _name: str,
+    _args: dict[str, Any],
     _raw: Any,
     _rendered: str,
 ) -> dict[str, Any]:
@@ -337,7 +338,7 @@ async def execute_tools(
             result = runtime.transform_result(name, str(raw) if raw is not None else "")
             metadata_raw = _safe_hook(
                 "result_metadata",
-                lambda: runtime.result_metadata(name, raw, result),
+                lambda: runtime.result_metadata(name, args, raw, result),
                 dict,
             )
             metadata = metadata_raw if isinstance(metadata_raw, dict) else {}

@@ -69,7 +69,7 @@ async def test_host_hooks_own_timeout_context_and_result_policies() -> None:
         call_scope=scope,
         on_call=lambda name: events.append(f"meter:{name}"),
         transform_result=lambda name, value: f"{name}={value}",
-        result_metadata=lambda _name, _raw, _rendered: {
+        result_metadata=lambda _name, _args, _raw, _rendered: {
             "error_kind": "command_exit",
             "result_id": "spill-1",
             "repeat_count": 2,
