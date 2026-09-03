@@ -1413,7 +1413,7 @@ async def _handle_context_overflow(
             messages.pop()
         if note is not None:
             messages.append(note)
-        if len(messages) != len(popped_before):
+        if messages != popped_before:
             await _notify_context_compacted(
                 obs,
                 cfg=cfg,
@@ -1551,6 +1551,7 @@ async def _handle_turn_end(
         compacted = await result if inspect.isawaitable(result) else result
         if compacted is not messages:
             messages[:] = compacted
+        if messages != messages_before:
             await _notify_context_compacted(
                 obs,
                 cfg=cfg,

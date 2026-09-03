@@ -12,8 +12,15 @@ from agent_core.loop_types import (
     LoopConfig,
     LoopPolicy,
     ToolCallIntervention,
+    TurnContext,
 )
-from agent_core.runtime.loop.agent_loop import AgentLoopHooks, run_agent_loop
+from agent_core.messages import assistant_msg, user_msg
+from agent_core.runtime.loop.agent_loop import (
+    AgentLoopHooks,
+    _handle_context_overflow,
+    _handle_turn_end,
+    run_agent_loop,
+)
 from agent_core.runtime.loop.model_profile import HistoryPolicy, ModelProfile
 from agent_core.runtime.loop.tool_exec import ToolExecutionHooks
 
@@ -259,6 +266,96 @@ async def test_rollback_notifies_observer_before_discarding_history() -> None:
     assert events[0]["reason"] == "rollback_pop"
     assert events[0]["before"][-1]["content"] == "rejected"
     assert events[0]["after"][-1]["content"] == "start"
+
+
+@pytest.mark.asyncio
+async def test_overflow_replacement_notifies_when_history_length_is_unchanged() -> None:
+    events: list[Any] = []
+
+    class CaptureDiscard:
+        critical = True
+
+        async def on_context_compacted(self, ctx) -> None:
+            events.append(ctx)
+
+    messages = [user_msg("start"), assistant_msg("discard me")]
+    config = LoopConfig(
+        context_overflow_guard=True,
+        max_context_length=1,
+        max_completion_tokens=0,
+    )
+
+    stopped_by = await _handle_context_overflow(
+        config,
+        [CaptureDiscard()],
+        messages,
+        {},
+        1,
+        1,
+        1,
+        lambda _trailing: user_msg("recovery note"),
+    )
+
+    assert stopped_by == "context_limit_reached"
+    assert len(messages) == 2
+    assert messages[-1]["content"] == "recovery note"
+    assert len(events) == 1
+    assert events[0].messages_before[-1]["content"] == "discard me"
+
+
+@pytest.mark.asyncio
+async def test_in_place_compactor_notifies_context_observers() -> None:
+    events: list[Any] = []
+
+    class AlwaysCompact:
+        def should_compact(self, turn, messages, estimated_tokens):
+            return True
+
+    class InPlaceCompactor:
+        def compact(self, messages, keep_recent):
+            del messages[1]
+            return messages
+
+    class CaptureDiscard:
+        critical = True
+
+        async def on_context_compacted(self, ctx) -> None:
+            events.append(ctx)
+
+    messages = [user_msg("task"), assistant_msg("discard me")]
+    config = LoopConfig(
+        compaction_policy=AlwaysCompact(),
+        compactor=InPlaceCompactor(),
+    )
+    ctx = TurnContext(
+        turn=1,
+        max_turns=config.max_turns,
+        task_id="",
+        role_id="",
+        ai_text="",
+        thinking="",
+        tool_calls=[],
+        messages=messages,
+        usage=None,
+        metadata={},
+    )
+
+    stopped_by, continue_to_next_turn = await _handle_turn_end(
+        config,
+        [CaptureDiscard()],
+        messages,
+        {},
+        1,
+        ctx,
+        None,
+        None,
+    )
+
+    assert stopped_by == ""
+    assert continue_to_next_turn is False
+    assert messages == [user_msg("task")]
+    assert len(events) == 1
+    assert events[0].messages_before[-1]["content"] == "discard me"
 
 
 @pytest.mark.asyncio
