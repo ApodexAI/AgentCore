@@ -58,7 +58,8 @@ of a breaking PATCH is a product discovering it in production.
 ## Bumping
 
 CI fails any pull request that touches `agent_core/` or `pyproject.toml` without
-moving `[project].version`. To bump:
+increasing the three-part `[project].version`. Equal versions, downgrades, and
+malformed versions are rejected. To bump:
 
 ```bash
 # 1. Edit [project].version in pyproject.toml.
@@ -70,6 +71,8 @@ uv lock
 
 If a change genuinely cannot affect consumers and the check is wrong, apply the
 `skip-version-bump` label to the pull request and say why in the description.
+Adding or removing that label triggers a fresh CI run, so the gate reflects the
+current escape-hatch decision without requiring an unrelated commit.
 
 ## Releasing
 

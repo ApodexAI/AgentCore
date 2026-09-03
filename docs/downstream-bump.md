@@ -11,23 +11,37 @@ its own CI validates the upgrade.
 
 ## One-time setup
 
-### 1. A token that can reach both repositories
+### 1. A GitHub App for release automation
 
-Create a GitHub App installed on `ApodexAI/AgentCore`,
-`ApodexAI/ApodexHarness`, and `ApodexAI/FrontierAgentInternal`, with:
+Create a GitHub App installed only on `ApodexAI/AgentCore`,
+`ApodexAI/ApodexHarness`, and `ApodexAI/FrontierAgentInternal`. Grant the App:
 
-- **contents: read** on AgentCore (so `uv` can resolve the private dependency);
-- **contents: write** and **pull-requests: write** on the two products.
+- **contents: write**, needed to dispatch and push bump branches;
+- **pull-requests: write**, needed to open bump pull requests.
 
-A fine-grained PAT works too, but must not be a personal one — it becomes a
-single-person dependency for every release. Do not reuse the default
-`GITHUB_TOKEN`; see the warning in step 3.
+GitHub App permissions apply to the installation rather than varying per
+repository. The workflows therefore generate separate, short-lived tokens and
+downscope each one to only the repositories and permissions needed by that
+step: read-only for resolving AgentCore, product-write for a bump PR, and
+downstream-only write access for dispatch.
 
-### 2. In AgentCore
+Do not create an installation token by hand and save it as a secret.
+Installation tokens expire after one hour; the workflows use
+`actions/create-github-app-token` to mint and revoke one for every run.
 
-Add the token as the `DOWNSTREAM_BUMP_TOKEN` secret. Without it the release
-still succeeds and logs a warning — dispatching is downstream plumbing and must
-never fail a published release.
+### 2. In all three repositories
+
+Configure the same two values in AgentCore and each product:
+
+- repository variable `AGENT_CORE_AUTOMATION_APP_CLIENT_ID` — the App's client
+  ID;
+- repository secret `AGENT_CORE_AUTOMATION_APP_PRIVATE_KEY` — the App's private
+  key.
+
+If those values are absent or invalid in AgentCore, publishing the release still
+succeeds and logs a warning — dispatching is downstream plumbing and must never
+fail a published release. Missing or invalid credentials in a product correctly
+fail its bump workflow because it cannot safely resolve or push the update.
 
 ### 3. In each product repository
 
@@ -38,15 +52,12 @@ Copy both files out of `.github/downstream/` in this repository:
 | `.github/downstream/bump-agent-core.yml` | `.github/workflows/bump-agent-core.yml` |
 | `.github/downstream/repin_agent_core.py` | `.github/workflows/repin_agent_core.py` |
 
-Then add two secrets:
-
-- `AGENT_CORE_REPO_TOKEN` — read access to AgentCore, for dependency resolution.
-- `BUMP_PR_TOKEN` — used to push the branch and open the PR.
-
-**`BUMP_PR_TOKEN` must not be the default `GITHUB_TOKEN`.** Pull requests created
+The workflow creates one read-only token for AgentCore and a separate write
+token for the current product. It checks out with `persist-credentials: false`,
+so neither token remains embedded in the repository's Git configuration. Do not
+replace the App token with the default `GITHUB_TOKEN`: pull requests created
 with `GITHUB_TOKEN` do not trigger workflow runs, so the product's CI would never
-run against the bump — which is the only reason the PR exists. The failure is
-silent: you get a PR with no checks on it.
+run against the bump — which is the only reason the PR exists.
 
 ## Verifying the wiring without cutting a release
 

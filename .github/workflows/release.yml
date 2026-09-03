@@ -48,21 +48,51 @@ jobs:
           TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check downstream automation credentials
+        id: downstream-app
+        env:
+          APP_CLIENT_ID: ${{ vars.AGENT_CORE_AUTOMATION_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.AGENT_CORE_AUTOMATION_APP_PRIVATE_KEY }}
+        run: |
+          if [[ -n "$APP_CLIENT_ID" && -n "$APP_PRIVATE_KEY" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No downstream dispatch::GitHub App credentials are not configured; no bump PRs were requested. See docs/downstream-bump.md."
+          fi
+
+      - name: Create downstream dispatch token
+        id: downstream-token
+        if: steps.downstream-app.outputs.configured == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AGENT_CORE_AUTOMATION_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AGENT_CORE_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ApodexHarness
+            FrontierAgentInternal
+          permission-contents: write
+
+      - name: Warn if dispatch authentication failed
+        if: >-
+          steps.downstream-app.outputs.configured == 'true' &&
+          steps.downstream-token.outcome != 'success'
+        run: echo "::warning title=Downstream authentication failed::Could not create a GitHub App token; no bump PRs were requested."
+
       # Notify both consumers so a release always produces a visible bump PR
       # rather than waiting for someone to remember. This runs after the release
-      # exists, and a missing token degrades to a warning: the release itself is
-      # already published and must not be failed by downstream plumbing.
+      # exists, and authentication/dispatch failures degrade to warnings: the
+      # release itself is already published and must not be failed by downstream
+      # plumbing.
       - name: Request downstream bump PRs
+        if: steps.downstream-token.outcome == 'success'
         env:
           TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ secrets.DOWNSTREAM_BUMP_TOKEN }}
+          GH_TOKEN: ${{ steps.downstream-token.outputs.token }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning title=No downstream dispatch::DOWNSTREAM_BUMP_TOKEN is not set; \
-          no bump PRs were requested. Open them manually, or see docs/downstream-bump.md."
-            exit 0
-          fi
           for repo in ApodexAI/ApodexHarness ApodexAI/FrontierAgentInternal; do
             echo "Dispatching agent-core-release ${TAG} to ${repo}"
             gh api "repos/${repo}/dispatches" \

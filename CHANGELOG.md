@@ -60,7 +60,10 @@ wherever the declaration currently lives.
 - Automated downstream bump PRs: a release dispatches to ApodexHarness and
   FrontierAgentInternal, which repin and open a pull request for their own CI to
   validate. Templates live in `.github/downstream/`; setup is
-  [docs/downstream-bump.md](docs/downstream-bump.md).
+  [docs/downstream-bump.md](docs/downstream-bump.md). The workflows mint
+  least-privilege, short-lived GitHub App tokens per run, strictly validate the
+  dispatched version before exposing it to shell, and do not persist write
+  credentials in the checkout.
 - Corrected the documented pin scheme to `git+ssh://git@github.com/`, which is
   what both products actually declare. The credential note previously rewrote
   `https://github.com/`, a no-op against an `ssh://` dependency URL.

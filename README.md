@@ -1,12 +1,16 @@
 # AgentCore
 
-AgentCore is the single source of truth for product-neutral agent runtime code
-shared by ApodexHarness and FrontierAgentInternal.
+AgentCore is the engine runtime package for
+[FrontierAgent](https://github.com/ApodexAI/FrontierAgent). It is the single
+source of truth for the product-neutral execution engine: FrontierAgent owns
+the product experience and composition, while AgentCore owns the reusable
+runtime beneath it.
 
 The repository exists to remove a failure-prone workflow: implementing a core
 change independently in two products and then opening more pull requests to
 reconcile the copies. Shared behavior is changed and reviewed here once;
-products consume an immutable AgentCore revision and keep only their adapters.
+FrontierAgent consumes an immutable AgentCore release and keeps only its
+product adapters, workflows, tools, and user-facing surfaces.
 
 ## Current scope
 
@@ -53,7 +57,8 @@ Version `0.2.x` contains the converged foundation layer:
 The initial extraction is based on the already-merged integration branches:
 
 - ApodexHarness `c1229050` (PR #501);
-- FrontierAgentInternal `63b89c8` (PR #92).
+- FrontierAgent (originally extracted from FrontierAgentInternal) `63b89c8`
+  (PR #92).
 
 Those revisions are provenance, not runtime dependencies. AgentCore tests and
 builds without either product checkout.
@@ -100,9 +105,9 @@ uv pip install -e ../AgentCore
 AgentCore uses the import namespace `agent_core` and the distribution name
 `apodex-agent-core`.
 
-## Consuming a private revision
+## Consuming the release package
 
-Products should pin a released tag, never a branch:
+FrontierAgent should pin a released tag, never a branch:
 
 ```toml
 dependencies = [
@@ -118,9 +123,14 @@ built wheel, the sdist, and its changelog section. See
 [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 Because this repository is private, CI needs a read-only credential that can
-clone `ApodexAI/AgentCore`. Use a dedicated GitHub App or fine-grained token
-stored as `AGENT_CORE_REPO_TOKEN`; do not use a developer's personal token.
-Configure Git before `uv sync`:
+clone `ApodexAI/AgentCore`. Prefer a dedicated GitHub App: store its client ID
+as a repository variable and its private key as a secret, then mint a
+short-lived installation token during each job with
+`actions/create-github-app-token`. Do not store the generated installation
+token as a secret; it expires after one hour. A fine-grained machine-user PAT
+stored as `AGENT_CORE_REPO_TOKEN` is the fallback, not a developer's personal
+token. Expose either credential to the following step as
+`AGENT_CORE_REPO_TOKEN`, then configure Git before `uv sync`:
 
 ```bash
 git config --global \
@@ -135,6 +145,31 @@ above declares. Rewriting `https://github.com/` instead is a no-op against an
 Until that credential is installed in both product repositories, product
 source must not be switched to the private dependency: doing so would make a
 clean checkout and CI unreproducible.
+
+## Release package contract
+
+Each AgentCore release is the installable engine runtime used by FrontierAgent.
+The release must:
+
+- publish both a Python wheel and source distribution built from the tagged,
+  clean repository state;
+- include the `agent_core` package, `py.typed`, README, and Apache-2.0 license,
+  with package metadata matching the tag;
+- expose only product-neutral runtime APIs and keep FrontierAgent imports,
+  prompts, workflow profiles, tools, UI/TUI code, benchmarks, credentials, and
+  deployment configuration out of the package;
+- document compatibility or migration impact in `CHANGELOG.md`, and use the
+  versioning rules in [docs/versioning.md](docs/versioning.md);
+- pass lint, type checking, the complete test suite, and an install/import smoke
+  test against the built wheel before publication;
+- attach the wheel, source distribution, and matching changelog section to the
+  GitHub Release, then trigger FrontierAgent's pinned-version bump workflow.
+
+A release is not complete merely because a tag exists. It is complete when its
+artifacts can be installed in a clean Python 3.12 environment, `import
+agent_core` succeeds, the artifacts carry the repository license, and
+FrontierAgent CI passes against the exact released version. Release artifacts
+must not depend on a sibling checkout or files outside the distribution.
 
 ## Change and release workflow
 
@@ -153,8 +188,8 @@ clean checkout and CI unreproducible.
    The `Release` workflow verifies the tag matches the declared version,
    re-runs the full check suite against the tagged tree, builds, and publishes a
    GitHub Release with the wheel, sdist, and changelog section.
-4. The release workflow dispatches to ApodexHarness and FrontierAgentInternal,
-   each of which opens a bump PR moving its pin to the new tag. See
+4. The release workflow dispatches to ApodexHarness and FrontierAgent, each of
+   which opens a bump PR moving its pin to the new tag. See
    [docs/downstream-bump.md](docs/downstream-bump.md) for the one-time token and
    workflow setup those products need.
 5. Product CI validates adapters and end-to-end behavior. Product PRs must not
@@ -200,3 +235,8 @@ edit both products' core copies, that is evidence it belongs here.
     `agent_core` and the compatibility window has elapsed.
 
 Each slice must leave product CI green and must not depend on a floating branch.
+
+## License
+
+AgentCore is licensed under the [Apache License 2.0](LICENSE), the same license
+as FrontierAgent.
