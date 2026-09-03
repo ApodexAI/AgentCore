@@ -41,6 +41,11 @@ No source changes are required: the code at `v0.2.0` is `main` as of this
 release. Installed metadata now reports `0.2.0`, so `pip list` and the
 `dist-info` in a product image finally identify which AgentCore is running.
 
+Note that as of this release neither product declares AgentCore on its `main`
+branch — the pin exists only on each product's in-progress migration branch
+(`fix/ci-bwrap-soft-probe`, `refactor/agent-core`). The repin above applies
+wherever the declaration currently lives.
+
 ### Added
 
 - `docs/versioning.md`: version policy, what counts as a breaking change while

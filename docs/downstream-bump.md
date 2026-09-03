@@ -70,11 +70,24 @@ tag and the commit it resolved to, plus AgentCore's own version. A bump that
 edits only `pyproject.toml` leaves the lock stale and fails `uv sync --frozen`.
 The workflow commits both.
 
-## What the products currently pin
+## Prerequisite: the pin must be on the product's default branch
 
-As of AgentCore 0.2.0, both products pin commit
-`a9b5272` (the PR #21 merge) and both report `apodex-agent-core 0.1.0` in their
-lockfiles. Moving them to `v0.2.0` also picks up the five commits after that
-merge — the cooldown-fallback observability fixes in
-`components/middleware/llm/base.py`, `providers/fallback.py`, and
+As of AgentCore 0.2.0, **neither product declares AgentCore on `main`**. The pin
+lives only on each product's in-progress migration branch:
+
+| Product | Branch carrying the pin | Pinned revision |
+| --- | --- | --- |
+| ApodexHarness | `fix/ci-bwrap-soft-probe` | `a9b5272` |
+| FrontierAgentInternal | `refactor/agent-core` | `a9b5272` |
+
+Until one of those merges, this workflow has nothing to repin on `main`:
+`repin_agent_core.py` will report `found 0` and exit non-zero rather than commit
+a half-edited pin. That is the intended behavior, but it means the automation is
+inert — install it now so it is ready, and expect its first real run only after
+the migration lands.
+
+Both branches pin `a9b5272` (the #21 merge) and both lockfiles report
+`apodex-agent-core 0.1.0`. Whichever merges first, moving it to `v0.2.0` also
+picks up the five commits after that merge — the cooldown-fallback observability
+fixes in `components/middleware/llm/base.py`, `providers/fallback.py`, and
 `retry_policy.py`.
