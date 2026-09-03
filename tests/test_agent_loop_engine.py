@@ -185,6 +185,35 @@ async def test_active_scope_receives_llm_call_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_observer_receives_pre_provider_llm_input() -> None:
+    captured: list[Any] = []
+
+    class InputObserver:
+        async def on_llm_input(self, ctx) -> None:
+            captured.append(ctx)
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=SequenceLLM([LLMResponse(content="done")]),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            task_id="task",
+            role_id="role",
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        observers=[InputObserver()],
+    )
+
+    assert len(captured) == 1
+    assert captured[0].messages[0]["content"] == "system"
+    assert captured[0].messages[1]["content"] == "start"
+    assert str(captured[0].metadata["_llm_call_id"]).startswith("llm_")
+
+
+@pytest.mark.asyncio
 async def test_host_can_override_session_binding() -> None:
     bound: list[str] = []
     llm = SequenceLLM([LLMResponse(content="done")])

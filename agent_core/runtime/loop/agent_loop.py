@@ -617,6 +617,20 @@ async def _call_llm_with_callbacks(
             }
         )
 
+    input_ctx = TurnContext(
+        turn=turn,
+        max_turns=cfg.max_turns,
+        task_id=cfg.task_id,
+        role_id=cfg.role_id,
+        ai_text="",
+        thinking="",
+        tool_calls=[],
+        messages=list(messages_for_call),
+        usage=None,
+        metadata=dict(metadata),
+    )
+    await notify_observers(obs, "on_llm_input", input_ctx)
+
     async def _on_attempt(event: dict[str, Any]) -> None:
         nonlocal current_attempt_id, current_attempt_index
         current_attempt_index = int(event.get("attempt_index", 1) or 1)
