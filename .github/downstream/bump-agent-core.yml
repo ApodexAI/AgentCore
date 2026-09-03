@@ -41,16 +41,17 @@ jobs:
           python-version: "3.12"
 
       - name: Resolve target version
+        env:
+          TARGET_VERSION: ${{ github.event.client_payload.version || inputs.version }}
         run: |
           set -euo pipefail
-          version="${{ github.event.client_payload.version || inputs.version }}"
-          case "$version" in
-            v[0-9]*) ;;
-            *) echo "Refusing to pin '$version': expected a v-prefixed release tag." >&2
-               exit 1 ;;
-          esac
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-          echo "BRANCH=chore/agent-core-$version" >> "$GITHUB_ENV"
+          # Keep event data out of shell source: workflow expressions are
+          # expanded before bash parses the script, so direct interpolation
+          # would make a crafted manual-dispatch input executable.
+          python3 .github/workflows/repin_agent_core.py \
+            --validate-only "$TARGET_VERSION"
+          printf 'VERSION=%s\n' "$TARGET_VERSION" >> "$GITHUB_ENV"
+          printf 'BRANCH=chore/agent-core-%s\n' "$TARGET_VERSION" >> "$GITHUB_ENV"
 
       # The dependency is declared as ssh://git@github.com/...; rewrite that
       # exact scheme so uv resolves it over HTTPS with a token instead of

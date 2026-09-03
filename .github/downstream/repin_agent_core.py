@@ -19,6 +19,20 @@ from pathlib import Path
 # Anchor on the repository path so the '@' inside 'git@github.com' is never
 # mistaken for the rev separator.
 PIN = re.compile(r'(AgentCore\.git@)[^"\'\s]+')
+# AgentCore follows a three-part release scheme and may publish standard PEP 440
+# prereleases, post releases, dev releases, or local versions. Keeping this an
+# allow-list also makes the value safe for GITHUB_ENV and git branch names.
+VERSION = re.compile(
+    r"v[0-9]+\.[0-9]+\.[0-9]+"
+    r"(?:(?:a|b|rc)[0-9]+)?"
+    r"(?:\.post[0-9]+)?"
+    r"(?:\.dev[0-9]+)?"
+    r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+)
+
+
+def is_valid_version(version: str) -> bool:
+    return VERSION.fullmatch(version) is not None
 
 
 def repin(text: str, version: str) -> tuple[str, int]:
@@ -29,7 +43,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("version", help="Release tag to pin, e.g. v0.2.0")
     parser.add_argument("--file", default="pyproject.toml")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate the release tag without editing the dependency file.",
+    )
     args = parser.parse_args(argv)
+
+    if not is_valid_version(args.version):
+        print(
+            f"Refusing to pin {args.version!r}: expected an AgentCore release tag "
+            "such as v0.2.0 or v0.3.0rc1.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.validate_only:
+        print(f"Validated release tag {args.version}.")
+        return 0
 
     path = Path(args.file)
     original = path.read_text(encoding="utf-8")
