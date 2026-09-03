@@ -15,7 +15,25 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --frozen --extra dev
-      - run: uv run ruff check agent_core tests
+      - run: uv run ruff check agent_core tests scripts
       - run: uv run pyright agent_core
       - run: uv run pytest -q
       - run: uv build
+
+  # Two products pin an AgentCore revision. If published code changes without a
+  # version bump, both end up reporting the same version for different code and
+  # the installed dist-info stops identifying what is running. Enforce the bump
+  # at the pull request, where it is cheap to fix.
+  version-bump:
+    if: >-
+      github.event_name == 'pull_request' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-version-bump')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The check needs the merge base, which a shallow clone does not have.
+          fetch-depth: 0
+      - run: python3 scripts/check_version_bump.py --base "$BASE_SHA"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
