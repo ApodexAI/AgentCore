@@ -10,10 +10,7 @@ from typing import Any
 
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
-from agent_core.providers.fallback import (
-    LEGACY_RETRYABLE_KEYWORDS,
-    legacy_retryable,
-)
+from agent_core.retry_policy import LEGACY_RETRYABLE_KEYWORDS, legacy_retryable
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +32,8 @@ def unwrap_runnable_binding(
     return model, kwargs
 
 
-# One table, owned by the two-model fallback wrapper that also needs it.
+# One table, defined in the leaf ``agent_core.retry_policy`` so this framework
+# module does not import the whole ``providers`` package for a frozenset.
 # Both names stay bound here: host products re-export them from this module.
 _RETRYABLE_KEYWORDS = LEGACY_RETRYABLE_KEYWORDS
 _is_retryable = legacy_retryable

@@ -63,6 +63,11 @@ from typing import Any, Literal
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
 
+# Re-exported below: host products and ``components.middleware.llm.base``
+# import these from here. The definitions live in a leaf module so neither
+# side has to import the other's package for them — see that module.
+from agent_core.retry_policy import LEGACY_RETRYABLE_KEYWORDS, legacy_retryable
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -77,22 +82,11 @@ __all__ = [
 
 type FallbackEventHook = Callable[[str, dict[str, Any]], Awaitable[None]]
 
-# The single retryable-keyword table. ``components.middleware.llm.base``
-# re-binds its own ``_RETRYABLE_KEYWORDS`` to this rather than keeping a second
-# copy — two tables for one policy drift.
-LEGACY_RETRYABLE_KEYWORDS = frozenset({
-    "timeout", "timed out", "429", "500", "502", "503", "504", "529",
-    "overloaded", "rate limit", "rate_limit", "server error",
-    "connection reset", "connection error", "econnreset", "gateway timeout",
-    "model_dump", "model_not_found",
+# The two ``degrade`` reasons that mark an actual transition to the fallback
+# leg, as opposed to the cooldown window re-routing another call.
+_DEGRADE_TRANSITIONS = frozenset({
+    "primary_exhausted", "primary_stream_exhausted",
 })
-
-
-def legacy_retryable(error: Exception) -> bool:
-    """Match the historical two-model fallback wrapper's retry policy."""
-    return isinstance(error, AttributeError) or any(
-        keyword in str(error).lower() for keyword in LEGACY_RETRYABLE_KEYWORDS
-    )
 
 
 async def _noop_event(_name: str, _payload: dict[str, Any]) -> None:
@@ -231,9 +225,20 @@ class CooldownFallbackLLM:
     - ``retry`` — the primary failed and will be retried after ``delay_s``.
     - ``abandon_stream_retry`` — the primary stream failed after deltas had
       already reached the consumer, so it degrades instead of replaying. A
-      retry-shaped event: the ``degrade`` that follows describes the move.
-    - ``degrade`` — traffic moves to the fallback leg (``leg="fallback"``);
-      always carries ``reason``, ``degrade_from`` and ``degrade_to``.
+      retry-shaped event: the ``degrade`` that follows describes the move. Its
+      "why" is ``abandon_reason``, deliberately not ``reason`` — ``reason``
+      belongs to ``degrade``, and a host dispatching on it would otherwise
+      write two degrade records for one degradation.
+    - ``degrade`` — traffic moves to the fallback leg (``leg="fallback"``).
+      Always carries ``reason``, ``degrade_from``, ``degrade_to``,
+      ``cooldown_seconds`` (the configured window) and ``error`` (the primary
+      failure that forced it; ``""`` when the cooldown window, not a fresh
+      failure, is what routed this call). The ``primary_cooldown`` /
+      ``primary_stream_cooldown`` reasons additionally carry
+      ``cooldown_remaining_s``.
+
+    ``degrade`` fires once per *call* served by the fallback, not once per
+    transition: expect one per request for the length of the cooldown window.
 
     Stream-path events additionally carry ``streaming=True``.
 
@@ -242,10 +247,13 @@ class CooldownFallbackLLM:
     Every event is also logged, independently of ``event_hook`` — a degrade
     moves traffic to a different model for ``cooldown_seconds`` and an operator
     has to be able to see that in logs whether or not a telemetry sink is
-    wired. Retries, abandoned stream retries and degrades log at ``warning``; a
-    failing fallback leg logs at ``error``; a primary-leg error logs at
-    ``debug``, since the ``retry`` or ``degrade`` line that follows it carries
-    the operational signal. Hosts should not re-log off the hook.
+    wired. Retries, abandoned stream retries and the two *exhausted* degrades —
+    the transitions — log at ``warning``; a failing fallback leg logs at
+    ``error``. The cooldown degrades log at ``debug``: they repeat once per
+    request for the whole window, so at warning they would bury the one line
+    that marks the transition. A primary-leg error also logs at ``debug``,
+    since the ``retry`` or ``degrade`` line that follows it carries the
+    operational signal. Hosts should not re-log off the hook.
     """
 
     def __init__(
@@ -315,12 +323,23 @@ class CooldownFallbackLLM:
                 payload.get("attempt"),
             )
         elif name == "degrade":
-            logger.warning(
+            reason = payload.get("reason")
+            # A transition is news; the cooldown window repeating itself once
+            # per request is not. See the class docstring.
+            log = (
+                logger.warning
+                if reason in _DEGRADE_TRANSITIONS
+                else logger.debug
+            )
+            remaining = payload.get("cooldown_remaining_s")
+            log(
                 "CooldownFallbackLLM: degrading %s -> %s (%s), cooldown %ss",
                 payload.get("degrade_from"),
                 payload.get("degrade_to"),
-                payload.get("reason"),
-                payload.get("cooldown_seconds", self.cooldown_seconds),
+                reason,
+                payload.get("cooldown_seconds", self.cooldown_seconds)
+                if remaining is None
+                else f"{remaining:.0f}s remaining of {self.cooldown_seconds}",
             )
 
     async def _emit(self, name: str, **payload: Any) -> None:
@@ -364,16 +383,30 @@ class CooldownFallbackLLM:
             extra_headers=extra_headers,
             timeout=timeout,
         )
-        if self._clock() < self._cooldown_until:
+        now = self._clock()
+        if now < self._cooldown_until:
             await self._emit(
                 "degrade",
                 leg="fallback",
                 reason="primary_cooldown",
                 degrade_from=_model_id(self.primary),
                 degrade_to=_model_id(self.fallback),
+                cooldown_seconds=self.cooldown_seconds,
+                cooldown_remaining_s=self._cooldown_until - now,
+                error="",
             )
             await self._emit("request", leg="fallback", mode="cooldown")
-            return await self.fallback.chat(messages, **kwargs)
+            # Guarded like the degraded path below: cooldown-window traffic is
+            # the bulk of fallback traffic, so "the fallback leg also failed"
+            # has to be visible here or the metric under-counts the case that
+            # matters most.
+            try:
+                return await self.fallback.chat(messages, **kwargs)
+            except Exception as fallback_error:
+                await self._emit(
+                    "error", leg="fallback", error=str(fallback_error),
+                )
+                raise
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
@@ -440,20 +473,33 @@ class CooldownFallbackLLM:
             extra_headers=extra_headers,
             timeout=timeout,
         )
-        if self._clock() < self._cooldown_until:
+        now = self._clock()
+        if now < self._cooldown_until:
             await self._emit(
                 "degrade",
                 leg="fallback",
                 reason="primary_stream_cooldown",
                 degrade_from=_model_id(self.primary),
                 degrade_to=_model_id(self.fallback),
+                cooldown_seconds=self.cooldown_seconds,
+                cooldown_remaining_s=self._cooldown_until - now,
+                error="",
                 streaming=True,
             )
             await self._emit(
                 "request", leg="fallback", mode="cooldown", streaming=True,
             )
-            async for delta in self.fallback.stream(messages, **kwargs):
-                yield delta
+            try:
+                async for delta in self.fallback.stream(messages, **kwargs):
+                    yield delta
+            except Exception as fallback_error:
+                await self._emit(
+                    "error",
+                    leg="fallback",
+                    streaming=True,
+                    error=str(fallback_error),
+                )
+                raise
             return
 
         last_error: Exception | None = None
@@ -487,7 +533,7 @@ class CooldownFallbackLLM:
                     await self._emit(
                         "abandon_stream_retry",
                         leg="primary",
-                        reason="primary_stream_partial",
+                        abandon_reason="primary_stream_partial",
                         attempt=attempt + 1,
                         streaming=True,
                         yielded=True,
@@ -515,6 +561,7 @@ class CooldownFallbackLLM:
             degrade_from=_model_id(self.primary),
             degrade_to=_model_id(self.fallback),
             cooldown_seconds=self.cooldown_seconds,
+            error=str(last_error) if last_error else "",
             streaming=True,
         )
         await self._emit(
