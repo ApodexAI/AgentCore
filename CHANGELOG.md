@@ -16,6 +16,20 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   populate those fields without moving product-specific classifiers or stores
   into AgentCore. Timeouts and exceptions receive stable core-owned
   `error_kind` values.
+- Loop observers can inspect the exact pre-provider LLM input, correlate calls
+  and retries through stable identifiers, and receive pre/post snapshots for
+  rollback, overflow recovery, and policy-driven context compaction.
+- Products can dynamically constrain the tools available to an individual turn,
+  supply callable per-call addenda as system or user messages, customize tool
+  history rendering, and preserve host-owned recovery metadata.
+- Deterministic and LLM-backed compaction now retain the original task,
+  tool-call/result pairing, recoverability references, and recovery-index order.
+
+### Fixed
+
+- Context-discard notifications now fire when overflow recovery replaces a
+  message without changing history length and when a custom compactor mutates
+  the history list in place.
 
 ## [0.3.0] - 2026-09-03
 
