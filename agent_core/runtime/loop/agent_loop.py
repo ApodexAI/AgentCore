@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from agent_core.llm import LLMClient
 from agent_core.loop_types import (
@@ -115,6 +115,10 @@ def _body_has_no_spill(_body: str) -> bool:
     return False
 
 
+def _no_recovery_note(_messages: list[Message]) -> Message | None:
+    return None
+
+
 def _no_deadline() -> float | None:
     return None
 
@@ -131,6 +135,16 @@ def _exit_no_scope(_token: Any) -> None:
 
 async def _no_cancel_cleanup() -> None:
     return None
+
+
+async def _default_render_tool_result(
+    observers: list[Any],
+    ctx: TurnContext,
+    result: ToolResult,
+    processor: Any,
+) -> tuple[ToolResult, str, dict[str, Any]]:
+    observed = await notify_tool_result(observers, ctx, result)
+    return observed, processor.process(observed), {}
 
 
 @dataclass(frozen=True)
@@ -153,6 +167,13 @@ class AgentLoopHooks:
     cancellation_cleanup: Callable[[], Awaitable[None]] = _no_cancel_cleanup
     body_has_spill_reference: Callable[[str], bool] = _body_has_no_spill
     tool_execution: ToolExecutionHooks = field(default_factory=ToolExecutionHooks)
+    render_tool_result: Callable[
+        [list[Any], TurnContext, ToolResult, Any],
+        Awaitable[tuple[ToolResult, str, dict[str, Any]]],
+    ] = _default_render_tool_result
+    context_overflow_recovery_note: Callable[
+        [list[Message]], Message | None
+    ] = _no_recovery_note
 
 
 async def _wait_for_tool_interrupt(
@@ -504,6 +525,7 @@ async def _run_loop_inner(
                 cfg, obs, tool_map, messages, metadata, turn, total_tool_calls,
                 ctx, parsed_calls, runtime.tool_execution,
                 runtime.body_has_spill_reference,
+                runtime.render_tool_result,
                 result_max_chars=tool_result_cap,
             )
             total_tool_calls += tool_calls_executed
@@ -519,8 +541,15 @@ async def _run_loop_inner(
                 "still needed.",
             )
 
-        stop_reason = _handle_context_overflow(
-            cfg, messages, turn, last_input_tokens, last_output_tokens
+        stop_reason = await _handle_context_overflow(
+            cfg,
+            obs,
+            messages,
+            metadata,
+            turn,
+            last_input_tokens,
+            last_output_tokens,
+            runtime.context_overflow_recovery_note,
         )
         if stop_reason:
             break
@@ -1224,6 +1253,10 @@ async def _execute_tool_calls(
     turn: int, total_tool_calls: int, ctx: TurnContext, parsed_calls: list[dict],
     execution_hooks: ToolExecutionHooks,
     body_has_spill_reference: Callable[[str], bool],
+    render_tool_result: Callable[
+        [list[Any], TurnContext, ToolResult, Any],
+        Awaitable[tuple[ToolResult, str, dict[str, Any]]],
+    ],
     *,
     result_max_chars: int | None = None,
 ) -> tuple[str, int]:
@@ -1299,7 +1332,12 @@ async def _execute_tool_calls(
     )
     can_recover = "recover_result" in tool_map
     for tr_result in results:
-        tr_result = await notify_tool_result(obs, ctx, tr_result)
+        tr_result, body, message_metadata = await render_tool_result(
+            obs,
+            ctx,
+            tr_result,
+            processor,
+        )
         # ``notify_tool_result`` ran FIRST, so the trajectory already holds
         # ``tr_result.result`` in full. The post-processor cuts only the string
         # that becomes the message — at a far smaller cap than the 150K upstream
@@ -1307,8 +1345,7 @@ async def _execute_tool_calls(
         # here the difference is simply lost to the model. Minted at this site
         # only: the two earlier cuts happen before the ``ToolResult`` exists, so
         # for those the trajectory holds the same preview the model already has.
-        body = processor.process(tr_result)
-        messages.append(tool_msg(
+        history_message = tool_msg(
             _with_recovery_handle(
                 body,
                 tr_result,
@@ -1317,7 +1354,9 @@ async def _execute_tool_calls(
                 body_has_spill_reference=body_has_spill_reference,
             ),
             tr_result.tool_call_id,
-        ))
+        )
+        cast("dict[str, Any]", history_message).update(message_metadata)
+        messages.append(history_message)
 
     if any(result.interrupted for result in results):
         wait_interventions = await notify_observers(obs, "on_tool_wait_interrupted", ctx)
@@ -1331,8 +1370,15 @@ async def _execute_tool_calls(
     return "", len(parsed_calls)
 
 
-def _handle_context_overflow(
-    cfg: LoopConfig, messages: list[Message], turn: int, last_input_tokens: int, last_output_tokens: int
+async def _handle_context_overflow(
+    cfg: LoopConfig,
+    obs: list[Any],
+    messages: list[Message],
+    metadata: dict[str, Any],
+    turn: int,
+    last_input_tokens: int,
+    last_output_tokens: int,
+    recovery_note: Callable[[list[Message]], Message | None],
 ) -> str:
     if not cfg.context_overflow_guard or not messages:
         return ""
@@ -1359,10 +1405,26 @@ def _handle_context_overflow(
             turn, estimated_total, cfg.max_context_length,
             last_input_tokens, last_output_tokens, trailing_tool_tokens, summary_tokens,
         )
+        popped_before = list(messages)
+        note = recovery_note(messages[trailing_tool_idx:])
         while messages and is_tool_msg(messages[-1]):
             messages.pop()
         if messages and is_assistant_msg(messages[-1]):
             messages.pop()
+        if note is not None:
+            messages.append(note)
+        if len(messages) != len(popped_before):
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="context_limit_pop",
+                before=popped_before,
+                after=messages,
+                tokens_before=estimated_total,
+                metadata=metadata,
+                policy="context_overflow_guard",
+            )
         return "context_limit_reached"
     return ""
 
@@ -1484,8 +1546,23 @@ async def _handle_turn_end(
     forced_compaction = bool(metadata.pop(FORCE_COMPACTION_KEY, False))
     if forced_compaction or compaction_policy.should_compact(turn, messages, est_tokens):
         compactor = cfg.compactor or DefaultMessageCompactor()
+        messages_before = list(messages)
         result = compactor.compact(messages, cfg.keep_recent)
-        messages[:] = await result if inspect.isawaitable(result) else result
+        compacted = await result if inspect.isawaitable(result) else result
+        if compacted is not messages:
+            messages[:] = compacted
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="policy_compact",
+                before=messages_before,
+                after=messages,
+                tokens_before=est_tokens,
+                metadata=metadata,
+                compactor=type(compactor).__name__,
+                policy=type(compaction_policy).__name__,
+            )
         metadata[COMPACTION_SEQ_KEY] = int(
             metadata.get(COMPACTION_SEQ_KEY, 0) or 0,
         ) + 1
