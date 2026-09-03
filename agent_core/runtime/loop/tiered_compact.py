@@ -344,7 +344,8 @@ class TieredCompactor:
                 for call in message.get("tool_calls") or []
                 if call.get("id")
             }
-            return frozenset(ids)
+            if ids:
+                return frozenset(ids)
         return frozenset()
 
     def _spill_changed_tool_results(

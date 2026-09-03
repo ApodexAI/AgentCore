@@ -66,14 +66,15 @@ def test_system_msg_preserved_and_recent_verbatim():
         user_msg("recent-2"),
     ]
     out = compact_messages(msgs, keep_recent=2)
-    # [system, compact_summary, recent-1, recent-2]
-    assert len(out) == 4
+    # [system, original task, compact_summary, recent-1, recent-2]
+    assert len(out) == 5
     assert out[0].get("role") == "system"
     assert out[0].get("content") == "sys"
     assert out[1].get("role") == "user"
-    assert text_of(out[1].get("content")).startswith("[Compacted")
-    assert "recent-1" in text_of(out[2].get("content"))
-    assert "recent-2" in text_of(out[3].get("content"))
+    assert out[1] is msgs[1]
+    assert text_of(out[2].get("content")).startswith("[Compacted")
+    assert "recent-1" in text_of(out[3].get("content"))
+    assert "recent-2" in text_of(out[4].get("content"))
 
 
 def test_tool_url_preserved_in_summary():
@@ -89,7 +90,7 @@ def test_tool_url_preserved_in_summary():
         user_msg("recent"),
     ]
     out = compact_messages(msgs, keep_recent=1)
-    summary = text_of(out[1].get("content"))
+    summary = text_of(out[2].get("content"))
     # Even though body was 1000+ chars, the URL survives.
     assert url in summary
     # Tool name is in the summary
@@ -110,7 +111,7 @@ def test_ai_tool_calls_preserved_in_summary():
         user_msg("recent"),
     ]
     out = compact_messages(msgs, keep_recent=1)
-    summary = text_of(out[1].get("content"))
+    summary = text_of(out[2].get("content"))
     assert "web_search" in summary
     assert "NVIDIA H100" in summary
 
