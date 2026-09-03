@@ -20,6 +20,7 @@ from agent_core.llm import LLMClient
 from agent_core.loop_types import (
     AgentLoopResult,
     CompactionEvent,
+    ContextCompactionContext,
     LLMAttemptContext,
     LLMDeltaContext,
     LoopConfig,
@@ -838,7 +839,7 @@ def _answer_unexecuted_tool_calls(messages: list[Message], detail: str) -> None:
         answered.add(call_id)
 
 
-def _pop_last_assistant_turn(messages: list[Message]) -> None:
+def _pop_last_assistant_turn(messages: list[Message]) -> list[Message] | None:
     """Remove the assistant message a rollback observer rejected, in full.
 
     ``pop_last_message`` fires while the turn's tool calls are still
@@ -874,11 +875,44 @@ def _pop_last_assistant_turn(messages: list[Message]) -> None:
             "_pop_last_assistant_turn: no assistant message in history; "
             "leaving it unchanged"
         )
-        return
+        return None
     end = idx + 1
     while end < len(messages) and is_tool_msg(messages[end]):
         end += 1
+    removed = messages[idx:end]
     del messages[idx:end]
+    return removed
+
+
+async def _notify_context_compacted(
+    obs: list[Any],
+    *,
+    cfg: LoopConfig,
+    turn: int,
+    reason: str,
+    before: list[Message],
+    after: list[Message],
+    tokens_before: int,
+    metadata: dict[str, Any],
+    compactor: str = "",
+    policy: str = "",
+) -> None:
+    await notify_observers(
+        obs,
+        "on_context_compacted",
+        ContextCompactionContext(
+            turn=turn,
+            task_id=cfg.task_id,
+            role_id=cfg.role_id,
+            reason=reason,
+            compactor=compactor,
+            policy=policy,
+            messages_before=before,
+            messages_after=after,
+            tokens_before=tokens_before,
+            metadata=metadata,
+        ),
+    )
 
 
 async def _process_llm_response(
@@ -1016,7 +1050,21 @@ async def _process_llm_response(
     stop_reason = merged_llm.stop_reason or ""
 
     if merged_llm.pop_last_message and messages:
-        _pop_last_assistant_turn(messages)
+        rollback_before = list(messages)
+        rollback_tokens = estimate_tokens(messages)
+        removed = _pop_last_assistant_turn(messages)
+        if removed is not None:
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="rollback_pop",
+                before=rollback_before,
+                after=messages,
+                tokens_before=rollback_tokens,
+                metadata=metadata,
+                policy="on_llm_response_rollback",
+            )
     if merged_llm.continue_to_next_turn:
         if merged_llm.inject_messages:
             for msg_text in merged_llm.inject_messages:
@@ -1312,7 +1360,21 @@ async def _handle_turn_end(
     # complete assistant turn, skip compaction/persistence for the discarded
     # attempt, and let the caller retry without consuming a logical turn.
     if merged_turn.pop_last_message:
-        _pop_last_assistant_turn(messages)
+        rollback_before = list(messages)
+        rollback_tokens = estimate_tokens(messages)
+        removed = _pop_last_assistant_turn(messages)
+        if removed is not None:
+            await _notify_context_compacted(
+                obs,
+                cfg=cfg,
+                turn=turn,
+                reason="rollback_pop",
+                before=rollback_before,
+                after=messages,
+                tokens_before=rollback_tokens,
+                metadata=metadata,
+                policy="on_turn_end_rollback",
+            )
     if merged_turn.inject_messages:
         for msg_text in merged_turn.inject_messages:
             messages.append(user_msg(msg_text))

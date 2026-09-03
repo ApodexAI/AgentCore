@@ -214,6 +214,54 @@ async def test_observer_receives_pre_provider_llm_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rollback_notifies_observer_before_discarding_history() -> None:
+    events: list[Any] = []
+
+    class RollbackOnce:
+        critical = True
+        done = False
+
+        async def on_llm_response(self, _ctx):
+            if self.done:
+                return None
+            self.done = True
+            return Intervention(pop_last_message=True, continue_to_next_turn=True)
+
+    class CaptureDiscard:
+        critical = True
+
+        async def on_context_compacted(self, ctx) -> None:
+            events.append(
+                {
+                    "reason": ctx.reason,
+                    "before": list(ctx.messages_before),
+                    "after": list(ctx.messages_after),
+                }
+            )
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=SequenceLLM(
+            [LLMResponse(content="rejected"), LLMResponse(content="accepted")]
+        ),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            no_tool_max_retries=2,
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        observers=[RollbackOnce(), CaptureDiscard()],
+    )
+
+    assert len(events) == 1
+    assert events[0]["reason"] == "rollback_pop"
+    assert events[0]["before"][-1]["content"] == "rejected"
+    assert events[0]["after"][-1]["content"] == "start"
+
+
+@pytest.mark.asyncio
 async def test_host_can_override_session_binding() -> None:
     bound: list[str] = []
     llm = SequenceLLM([LLMResponse(content="done")])

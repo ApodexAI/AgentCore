@@ -317,6 +317,22 @@ class ToolResult:
 
 
 @dataclass
+class ContextCompactionContext:
+    """Pre/post snapshot for any loop operation that discards history."""
+
+    turn: int
+    task_id: str
+    role_id: str
+    reason: str
+    compactor: str
+    policy: str
+    messages_before: list[Message]
+    messages_after: list[Message]
+    tokens_before: int
+    metadata: dict[str, Any]
+
+
+@dataclass
 class Intervention:
     inject_messages: list[str] | None = None
     stop_reason: str | None = None
@@ -479,6 +495,9 @@ class BaseObserver:
     async def on_compaction(self, event: CompactionEvent) -> None:
         """History was rewritten. Passive: compaction has already happened by
         the time this runs, so there is no intervention to return."""
+
+    async def on_context_compacted(self, ctx: ContextCompactionContext) -> None:
+        """History was discarded while its pre-change form was still reachable."""
 
     async def on_loop_end(self, result: AgentLoopResult) -> None:
         pass
@@ -697,6 +716,7 @@ __all__ = [
     "CancellationObserver",
     "CompactionEvent",
     "CompactionObserver",
+    "ContextCompactionContext",
     "Intervention",
     "LLMAttemptContext",
     "LLMDeltaContext",
