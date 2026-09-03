@@ -135,6 +135,56 @@ async def test_runtime_hooks_wrap_scope_llm_and_tool_boundaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_active_scope_receives_llm_call_identity() -> None:
+    from agent_core.execution_context import (
+        ExecutionScope,
+        get_current_execution_scope,
+        reset_current_execution_scope,
+        set_current_execution_scope,
+    )
+
+    seen: dict[str, Any] = {}
+
+    class ScopeInspectingLLM(SequenceLLM):
+        async def chat(self, messages, **kwargs) -> LLMResponse:
+            scope = get_current_execution_scope()
+            assert scope is not None
+            seen.update(scope.metadata)
+            return await super().chat(messages, **kwargs)
+
+    def enter_scope(cfg, phase_id, metadata):
+        scope = ExecutionScope(
+            task_id=cfg.task_id,
+            phase_id=phase_id,
+            role_id=cfg.role_id,
+            metadata=metadata,
+        )
+        return scope, set_current_execution_scope(scope)
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=ScopeInspectingLLM([LLMResponse(content="done")]),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            task_id="task",
+            role_id="role",
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        runtime_hooks=AgentLoopHooks(
+            enter_scope=enter_scope,
+            exit_scope=reset_current_execution_scope,
+        ),
+    )
+
+    assert str(seen["_llm_call_id"]).startswith("llm_")
+    assert str(seen["_llm_attempt_id"]).endswith("_attempt_01")
+    assert seen["_llm_attempt_index"] == 1
+
+
+@pytest.mark.asyncio
 async def test_host_can_override_session_binding() -> None:
     bound: list[str] = []
     llm = SequenceLLM([LLMResponse(content="done")])

@@ -601,6 +601,21 @@ async def _call_llm_with_callbacks(
     metadata["_llm_attempt_index"] = current_attempt_index
     metadata["_llm_attempt_outcome"] = ""
     metadata["_llm_attempt_count"] = 0
+    # Middleware proxies resolve their per-call context from the active scope,
+    # while observer contexts use the loop-local metadata mapping above. Keep
+    # the shared identity keys aligned so host wire-capture hooks can join the
+    # pre-middleware and post-middleware views of the same physical request.
+    from agent_core.execution_context import get_current_execution_scope
+
+    active_scope = get_current_execution_scope()
+    if active_scope is not None:
+        active_scope.metadata.update(
+            {
+                "_llm_call_id": call_id,
+                "_llm_attempt_id": current_attempt_id,
+                "_llm_attempt_index": current_attempt_index,
+            }
+        )
 
     async def _on_attempt(event: dict[str, Any]) -> None:
         nonlocal current_attempt_id, current_attempt_index
@@ -615,6 +630,14 @@ async def _call_llm_with_callbacks(
             metadata["_llm_attempt_outcome"] = outcome
             metadata["_llm_attempt_count"] = max(
                 int(metadata.get("_llm_attempt_count", 0) or 0), current_attempt_index
+            )
+        if active_scope is not None:
+            active_scope.metadata.update(
+                {
+                    "_llm_call_id": call_id,
+                    "_llm_attempt_id": current_attempt_id,
+                    "_llm_attempt_index": current_attempt_index,
+                }
             )
         attempt_usage = event.get("usage")
         if isinstance(attempt_usage, dict):
