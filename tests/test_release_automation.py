@@ -163,3 +163,21 @@ def test_license_is_declared_as_an_spdx_expression() -> None:
     assert project["license"] == "Apache-2.0"
     assert project["license-files"] == ["LICENSE"]
     assert not [c for c in project["classifiers"] if c.startswith("License ::")]
+
+
+def test_github_release_job_names_the_repository_explicitly() -> None:
+    """The GitHub Release job never checks out the repository.
+
+    Without GH_REPO, `gh release` tries to infer the target from a git remote
+    and dies with "not a git repository". That failure is not recoverable by
+    rerunning: a rerun replays the workflow definition at the tag, and by then
+    PyPI has already published the version — which can never be reused. This
+    happened on v0.3.0; the release had to be created by hand.
+    """
+    workflow = yaml.safe_load(_release_workflow())
+    job = workflow["jobs"]["publish-github"]
+
+    assert not any("checkout" in str(step.get("uses", "")) for step in job["steps"])
+
+    publish = next(s for s in job["steps"] if s.get("name") == "Publish GitHub Release")
+    assert publish["env"]["GH_REPO"] == "${{ github.repository }}"

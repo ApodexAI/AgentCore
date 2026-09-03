@@ -119,3 +119,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job downloads artifacts and never checks out the repository, so
+          # `gh` has no git remote to infer the target from and fails with
+          # "not a git repository". Name it explicitly.
+          GH_REPO: ${{ github.repository }}
