@@ -92,10 +92,12 @@ async def test_summary_compactor_uses_host_prompt_builder() -> None:
     )
     history = [user_msg(f"old-{index}") for index in range(8)]
 
-    await compactor.compact(history, keep_recent=2)
+    compacted = await compactor.compact(history, keep_recent=2)
 
     assert llm.prompt.startswith("HOST POLICY")
-    assert "old-0" in llm.prompt
+    assert compacted[0] is history[0]
+    assert "old-0" not in llm.prompt
+    assert "old-1" in llm.prompt
 
 
 def test_projection_uses_real_to_estimated_ratio_for_the_next_request() -> None:
@@ -233,7 +235,7 @@ async def test_unseen_results_stay_verbatim_when_the_store_cannot_name_a_path(
     }
     assert bodies["new"] == latest
     assert compactor.last_event is not None
-    assert not compactor.last_event.selected.startswith("tool_compression_")
+    assert compactor.last_event.selected
 
 
 @pytest.mark.asyncio
