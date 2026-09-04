@@ -86,8 +86,18 @@ def _spill_can_recover(spill: Callable[[str, str], str | None] | None) -> bool:
 
 
 _FULL_TEXT_PREFIX = "[Full text] "
+
+# Defaults sized for a handle rendered as a filesystem path (60+ chars each), so
+# an unbounded index would itself become a context cost. A product whose handle
+# is a short content-addressed id pays ~17 chars each and can raise or remove the
+# cap — see ``manifest_max_paths`` / ``manifest_max_chars`` on ``TieredCompactor``.
+#
+# The cap is charged against the RENDERED characters, not a handle count, because
+# that is the only quantity the two handle shapes share. This is why the cap and
+# the handle shape cannot be chosen independently.
 _SPILL_MANIFEST_MAX_PATHS = 20
 _SPILL_MANIFEST_MAX_CHARS = 3_000
+_SPILL_MANIFEST_MIN_CHARS = len(_SPILL_MANIFEST_HEADER) + len("\n- x")
 
 
 class InputTokenGauge(BaseObserver):
@@ -205,9 +215,21 @@ class TieredCompactor:
         summary_retries: int = 2,
         summary_retry_timeout_s: float | None = None,
         prompt_builder: SummaryPromptBuilder = compaction_prompt,
+        manifest_max_paths: int | None = _SPILL_MANIFEST_MAX_PATHS,
+        manifest_max_chars: int | None = _SPILL_MANIFEST_MAX_CHARS,
     ) -> None:
         if spill is not None and spill_store is not None:
             raise ValueError("pass spill or spill_store, not both")
+        if manifest_max_paths is not None and manifest_max_paths < 1:
+            raise ValueError("manifest_max_paths must be >= 1 or None")
+        if (
+            manifest_max_chars is not None
+            and manifest_max_chars < _SPILL_MANIFEST_MIN_CHARS
+        ):
+            raise ValueError(
+                "manifest_max_chars must fit the manifest header and one handle "
+                f"(>= {_SPILL_MANIFEST_MIN_CHARS}) or be None"
+            )
         spill_callback = spill or (
             spill_store.spill_compacted_body if spill_store is not None else None
         )
@@ -263,6 +285,13 @@ class TieredCompactor:
         #: What the most recent ``compact`` selected. Read by the agent loop to
         #: notify ``on_compaction`` observers; ``None`` until the first call.
         self.last_event: CompactionEvent | None = None
+        # ``None`` on either knob removes that bound. Dropping the OLDEST handles
+        # is not a neutral trim: a product measured the decisive early evidence
+        # becoming unrecoverable after a long unrelated detour, precisely because
+        # the handle naming it had aged out. A product whose rendered handles are
+        # short should say so here rather than inherit a cap sized for paths.
+        self._manifest_max_paths = manifest_max_paths
+        self._manifest_max_chars = manifest_max_chars
         self._relief_target = relief_target
         # Optional: the same gauge that drives the trigger. When present, the
         # relief check is expressed in REAL tokens instead of the raw estimate.
@@ -381,45 +410,65 @@ class TieredCompactor:
                 refs.append(path)
         return refs
 
-    @staticmethod
     def _with_spill_manifest(
-        messages: list[Message], refs: list[str],
+        self, messages: list[Message], refs: list[str],
     ) -> list[Message]:
-        """Keep a bounded session-local recovery index when Tier 1 is replaced.
+        """Keep a session-local recovery index when Tier 1 is replaced.
 
-        The index is its own message, carrying the paths in ``spill_refs`` and
+        The index is its own message, carrying the handles in ``spill_refs`` and
         rendering them as text for the model. Keeping it separate from the
         summary is what removes a whole class of bug: it used to be appended into
         the summary message, so replacing it meant finding where the index
         started inside prose the summarizer wrote — and the summarizer sees the
         previous index and quotes its header.
+
+        Bounded by ``manifest_max_paths`` / ``manifest_max_chars``, either of
+        which may be ``None`` to remove that bound. When a bound does apply the
+        NEWEST handles are kept, which is the lesser of two bad options rather
+        than a good one — see the note on those knobs in ``__init__``.
         """
         if not refs:
             return messages
+        max_paths = self._manifest_max_paths
+        max_chars = self._manifest_max_chars
         selected: list[str] = []
-        used = 0
+        # The configured cap applies to the exact model-visible text. Each item
+        # adds a newline, the bullet marker, and the handle itself.
+        used = len(_SPILL_MANIFEST_HEADER)
         for path in reversed(refs):
             cost = len(path) + 3
-            if len(selected) >= _SPILL_MANIFEST_MAX_PATHS or used + cost > _SPILL_MANIFEST_MAX_CHARS:
+            if max_paths is not None and len(selected) >= max_paths:
+                break
+            if max_chars is not None and used + cost > max_chars:
                 break
             selected.append(path)
             used += cost
         selected.reverse()
-        index: Message = user_msg(
-            _SPILL_MANIFEST_HEADER + "\n" + "\n".join(f"- {path}" for path in selected),
-        )
-        index["spill_refs"] = selected
+        index: Message | None = None
+        if selected:
+            index = user_msg(
+                _SPILL_MANIFEST_HEADER + "\n" + "\n".join(f"- {path}" for path in selected),
+            )
+            index["spill_refs"] = selected
 
         out: list[Message] = []
         replaced = False
         for message in messages:
-            # Exactly one message can be the index: the one that says it is.
-            if not replaced and message.get("role") == "user" and message.get("spill_refs"):
-                out.append(index)
+            # The data field is authoritative; the header recognises a legacy
+            # checkpoint. Remove duplicate or now-empty indices while here.
+            is_index = message.get("role") == "user" and (
+                "spill_refs" in message
+                or text_of(message.get("content")).startswith(_SPILL_MANIFEST_HEADER)
+            )
+            if is_index:
+                if not replaced and index is not None:
+                    out.append(index)
                 replaced = True
                 continue
             out.append(message)
         if replaced:
+            return out
+        if index is None:
             return out
 
         insert_at = 0

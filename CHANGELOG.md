@@ -7,7 +7,93 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.7.0] - 2026-09-04
+
+### Changed
+
+- Tier 1 deterministic compaction (`KeepLastNToolResultsCompactor`) no longer
+  leaves a bare placeholder where it drops a tool body. It now appends a bounded
+  card naming the call (tool name + a single-line, 120-char arguments preview)
+  and up to three source URLs found in the discarded body, above the existing
+  recovery pointer. Both fields already existed in the history and in the body,
+  so this adds no LLM call, no storage, and no second model-visible recovery
+  route. Measured cost is ~+220 characters per elided result, hard-capped at 400.
+
+  Rationale: Tier 2's summary preserves arguments and URLs, but Tier 2 only fires
+  when Tier 1 did not free enough, so on a Tier1-only turn the model lost exactly
+  the two things it needs in order not to re-issue a query it already ran.
+
+  A card that would not be shorter than the body it replaces is skipped and the
+  body kept verbatim — but only when no spill callback is configured. With a
+  recovery pointer the body is always replaced even if the card is longer: the
+  pointer reaches the model only through `spill_refs` → the Tier 2 recovery
+  index, and such a body is itself already an upstream-truncated preview, so
+  keeping it would strand the spilled full text as unrecoverable.
+
+- `KeepLastNToolResultsCompactor` now resolves an existing recovery handle with
+  `spill_refs` taking precedence over `result_store_ref`. A ref pinned by an
+  earlier compaction pass describes the content still on the message, while the
+  loop-cap handle describes the pre-truncation body upstream shed; reading the
+  latter first re-spilled a body that was already stored and pinned the wrong
+  handle into the recovery index.
+
+### Added
+
+- `TieredCompactor` takes `manifest_max_paths` and `manifest_max_chars`, either
+  of which may be `None` to remove that bound. The defaults are unchanged (20 /
+  3,000) and are sized for a handle rendered as a filesystem path. A product
+  whose handles are short content-addressed ids pays a fraction of that per entry
+  and should raise or remove the cap: when a cap binds, the OLDEST handles are
+  dropped, and a product measured decisive early evidence becoming unrecoverable
+  after a long unrelated detour for exactly that reason. The cap is charged
+  against rendered characters, which is the only quantity the two handle shapes
+  share — cap and handle shape are therefore not independent choices. The
+  character cap covers the complete rendered index, including its header and
+  list syntax. Non-`None` bounds must be large enough to retain at least one
+  entry; invalid zero or header-only bounds fail at construction time.
+- `ToolResult.host_metadata` carries whatever `ToolExecutionHooks.result_metadata`
+  returned, verbatim, through to `AgentLoopHooks.render_tool_result`. This is the
+  seam for a product that words its own note about a repeated call: whether a call
+  *counts* as a repeat is per-tool product policy (`repeat_count`), while whether
+  the body came back byte-identical is a separate observed fact with no typed
+  field, and both are needed to avoid asserting "identical output" for a body that
+  differs. The pass-through is verbatim rather than filtered to unrecognised keys,
+  so adopting a new reserved key here cannot silently remove something a product
+  already reads.
+
+### Consumer action
+
+- This changes text the model reads and is therefore a compaction-decision
+  change under `docs/versioning.md`. A consumer asserting equality against
+  `OMITTED_TOOL_RESULT_PLACEHOLDER` must switch to `startswith`; the placeholder
+  remains the first line precisely so that check keeps working.
+- No API change for the card. No configuration flag for it either: it has no
+  failure mode of its own, and a switch would be one more configuration dimension
+  to maintain.
+- A product that words a note from `repeat_count`, `repeat_recovery_id`,
+  `result_id` or `error_kind` in its own loop copy **must port that note into
+  `render_tool_result` before adopting `run_agent_loop`**. AgentCore reads none of
+  those fields, so nothing fails if the note is forgotten — it just stops reaching
+  the model. `docs/agent-loop-boundary.md` records why, and
+  `scripts/check_unconsumed_fields.py` now fails CI on a new field in that state.
+
+### Documented
+
+- `docs/agent-loop-boundary.md` now records that `ToolResult.repeat_count`,
+  `repeat_recovery_id`, `result_id` and `error_kind` have no consumer inside
+  AgentCore, that this is by construction, and that a product moving onto
+  `run_agent_loop` therefore loses any note it words from them *silently*. The
+  two ways to close it are stated, with `host_metadata` as the chosen route.
+- `scripts/check_unconsumed_fields.py` runs in CI: a field on a watched model with
+  no attribute read anywhere in `agent_core/` must be named in a boundary
+  document. Deciding not to consume a field is a boundary decision, and an
+  undocumented one is indistinguishable from an oversight — which is how four
+  fields reached 0.4.0 with no consumer and no note.
+
 ## [0.6.0] - 2026-09-04
+
+**Never published.** Merged to `main` but never tagged; its contents ship in
+0.7.0. Nothing pins it.
 
 ### Added
 

@@ -359,6 +359,7 @@ async def execute_tools(
                 result_id=str(metadata.get("result_id") or ""),
                 repeat_count=repeat_count,
                 repeat_recovery_id=str(metadata.get("repeat_recovery_id") or ""),
+                host_metadata=dict(metadata),
             )
         except TimeoutError:
             elapsed = int((time.monotonic() - start) * 1000)

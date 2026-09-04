@@ -18,6 +18,10 @@ jobs:
       - run: uv sync --frozen --extra dev
       - run: uv run ruff check agent_core tests scripts
       - run: uv run pyright agent_core
+      # A host-supplied field that agent_core/ never reads is invisible to every
+      # other check here and to a canary merge: it types, it tests, and the note
+      # a product worded from it vanishes on adoption. See the script's docstring.
+      - run: python3 scripts/check_unconsumed_fields.py
       - run: uv run pytest -q
       - run: uv build
 

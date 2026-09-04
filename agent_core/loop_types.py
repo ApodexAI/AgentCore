@@ -315,6 +315,21 @@ class ToolResult:
     # Host-provided repeated-invocation metadata. Execution is never skipped.
     repeat_count: int = 1
     repeat_recovery_id: str = ""
+    # Whatever ``ToolExecutionHooks.result_metadata`` returned, verbatim.
+    #
+    # Passed through rather than filtered down to "the keys AgentCore did not
+    # recognise": a residue-based rule silently changes what the host can see
+    # whenever AgentCore adopts a new reserved key, which is exactly the class of
+    # quiet breakage this field exists to avoid. The reserved keys are also
+    # promoted to the typed fields above; seeing them twice costs nothing.
+    #
+    # The immediate reason it exists: a product wording a note about a repeated
+    # call needs both whether the call COUNTS as a repeat (its own per-tool
+    # policy, reported through ``repeat_count``) and whether the body came back
+    # byte-identical (a separate observed fact with no field of its own). Without
+    # a pass-through it has to keep a side table keyed by ``tool_call_id``. See
+    # ``docs/agent-loop-boundary.md``.
+    host_metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass

@@ -9,10 +9,11 @@ import pytest
 
 from agent_core.llm import LLMResponse
 from agent_core.loop_types import LoopConfig, TurnContext
-from agent_core.messages import system_msg, tool_msg
+from agent_core.messages import system_msg, tool_msg, user_msg
 from agent_core.runtime.loop.agent_loop import run_agent_loop
 from agent_core.runtime.loop.compact import (
     OMITTED_TOOL_RESULT_PLACEHOLDER,
+    SPILL_MANIFEST_HEADER,
     KeepLastNToolResultsCompactor,
     estimate_tokens,
 )
@@ -174,3 +175,96 @@ async def test_gauge_feeds_policy_inside_run_agent_loop():
     # Only the threshold policy can fire → compaction running proves the gauge
     # was fed (step 6) before the policy read it (step 10) within the live loop.
     assert spy.calls >= 1
+
+
+def _manifest_of(messages: list[dict]) -> str:
+    return next(
+        m["content"] for m in messages
+        if m.get("role") == "user" and m.get("spill_refs")
+    )
+
+
+def test_manifest_caps_are_configurable_and_removable():
+    """The cap and the handle shape cannot be chosen independently.
+
+    Defaults are sized for a handle rendered as a filesystem path. A product
+    whose handles are short content-addressed ids pays a fraction of that per
+    entry, and dropping the OLDEST handle is what makes decisive early evidence
+    unrecoverable after a long unrelated detour — so it must be able to say so.
+    """
+    refs = [f"/spill/{i:03d}" for i in range(40)]
+    messages = [system_msg("S"), tool_msg("BODY", "c1")]
+
+    capped = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=5,
+    )._with_spill_manifest(messages, refs)
+    assert len(_manifest_of(capped).splitlines()) == 6  # header + 5
+
+    uncapped = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=None, manifest_max_chars=None,
+    )._with_spill_manifest(messages, refs)
+    assert len(_manifest_of(uncapped).splitlines()) == 41  # header + all 40
+
+    # A char cap still binds independently of the path cap and includes the
+    # complete model-visible rendering, not only the handle payloads.
+    char_cap = len(SPILL_MANIFEST_HEADER) + sum(len(ref) + 3 for ref in refs[-2:])
+    char_capped = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=None, manifest_max_chars=char_cap,
+    )._with_spill_manifest(messages, refs)
+    manifest = _manifest_of(char_capped)
+    assert len(manifest) == char_cap
+    assert manifest.splitlines() == [SPILL_MANIFEST_HEADER, "- /spill/038", "- /spill/039"]
+
+
+def test_capped_manifest_keeps_the_newest_handles():
+    refs = ["/spill/old", "/spill/mid", "/spill/new"]
+    out = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=2,
+    )._with_spill_manifest([system_msg("S"), tool_msg("BODY", "c1")], refs)
+    manifest = _manifest_of(out)
+    assert "/spill/new" in manifest
+    assert "/spill/mid" in manifest
+    assert "/spill/old" not in manifest
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"manifest_max_paths": 0}, "manifest_max_paths must be >= 1 or None"),
+        ({"manifest_max_chars": len(SPILL_MANIFEST_HEADER)}, "manifest_max_chars must fit"),
+    ],
+)
+def test_manifest_caps_reject_values_that_cannot_hold_an_index(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        TieredCompactor(
+            keep_tool_result=1,
+            summary_llm=_FakeLLM(),
+            relief_target=10**9,
+            **kwargs,
+        )
+
+
+def test_overlong_handle_removes_an_old_index_without_inserting_an_empty_one():
+    cap = len(SPILL_MANIFEST_HEADER) + len("\n- x")
+    old_index = user_msg(f"{SPILL_MANIFEST_HEADER}\n- /spill/old")
+    old_index["spill_refs"] = ["/spill/old"]
+    messages = [system_msg("S"), old_index, tool_msg("BODY", "c1")]
+    compactor = TieredCompactor(
+        keep_tool_result=1,
+        summary_llm=_FakeLLM(),
+        relief_target=10**9,
+        manifest_max_chars=cap,
+    )
+
+    once = compactor._with_spill_manifest(messages, ["/spill/" + "x" * 100])
+    twice = compactor._with_spill_manifest(once, ["/spill/" + "x" * 100])
+
+    assert not any(
+        m.get("role") == "user" and "spill_refs" in m
+        for m in twice
+    )
+    assert not any(SPILL_MANIFEST_HEADER in str(m.get("content")) for m in twice)
