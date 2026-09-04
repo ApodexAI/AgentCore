@@ -48,7 +48,7 @@ class LLMCallContext:
     role_id: str = ""
     phase_id: str = ""
     call_index: int = 0
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 # ── Protocol ─────────────────────────────────────────────────────────────

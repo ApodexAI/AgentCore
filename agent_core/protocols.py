@@ -212,9 +212,55 @@ class SkillLoader(Protocol):
     def reload(self) -> None: ...
 
 
+@runtime_checkable
+class CostSink(Protocol):
+    """Per-task cost accounting in USD.
+
+    Deliberately synchronous: ``record`` is called from middleware on the LLM
+    hot path, and an await there would put an event-loop hop between a
+    provider response and the accounting that must not be able to lose it.
+    Returns the incremental cost so a caller can log or emit it without a
+    second lookup.
+    """
+
+    def record(
+        self,
+        task_id: str,
+        model_name: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> float: ...
+
+
+@runtime_checkable
+class CostPersister(Protocol):
+    """Durable sink for a task's final cost summary.
+
+    Separate from :class:`CostSink` because the two have different lifetimes
+    and different failure tolerances: ``CostSink.record`` runs per LLM call and
+    may live purely in memory, while ``persist`` runs once at completion and is
+    the only path that reaches a database. Keeping it behind a Protocol is what
+    lets the token-accounting middleware live here at all -- the schema, the
+    column names and the session handling are all host concerns.
+
+    ``summary`` is whatever the host's ``CostSink`` returns from its own
+    ``get_summary``; AgentCore forwards it without inspecting it beyond passing
+    it through, so a host is free to evolve that shape without a core release.
+    """
+
+    async def persist(
+        self,
+        task_id: str,
+        summary: Mapping[str, Any],
+        model: str,
+    ) -> None: ...
+
+
 __all__ = [
     "BLOCKED_KEY",
     "BLOCK_REASON_KEY",
+    "CostPersister",
+    "CostSink",
     "EventReader",
     "EventSink",
     "ExecutionMiddleware",
