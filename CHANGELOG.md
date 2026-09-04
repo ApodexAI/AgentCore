@@ -47,7 +47,10 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   dropped, and a product measured decisive early evidence becoming unrecoverable
   after a long unrelated detour for exactly that reason. The cap is charged
   against rendered characters, which is the only quantity the two handle shapes
-  share — cap and handle shape are therefore not independent choices.
+  share — cap and handle shape are therefore not independent choices. The
+  character cap covers the complete rendered index, including its header and
+  list syntax. Non-`None` bounds must be large enough to retain at least one
+  entry; invalid zero or header-only bounds fail at construction time.
 - `ToolResult.host_metadata` carries whatever `ToolExecutionHooks.result_metadata`
   returned, verbatim, through to `AgentLoopHooks.render_tool_result`. This is the
   seam for a product that words its own note about a repeated call: whether a call

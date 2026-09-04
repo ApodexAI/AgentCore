@@ -153,7 +153,7 @@ def _args_preview(raw: object) -> str:
     collapsed = _WHITESPACE_RE.sub(" ", rendered).strip()
     if len(collapsed) <= _MINI_CARD_ARGS_MAX_CHARS:
         return collapsed
-    return collapsed[:_MINI_CARD_ARGS_MAX_CHARS] + "\u2026"
+    return collapsed[: _MINI_CARD_ARGS_MAX_CHARS - 1] + "\u2026"
 
 
 def _tool_args_by_call_id(messages: list[Message]) -> dict[str, str]:
@@ -193,7 +193,6 @@ def _elided_tool_card(tool_name: str, args_preview: str, content: str) -> str:
     URLs), so the caller falls back to the bare placeholder rather than emitting
     an empty line.
     """
-    budget = _MINI_CARD_BODY_MAX_CHARS
     lines: list[str] = []
     if tool_name or args_preview:
         call_line = (
@@ -201,8 +200,9 @@ def _elided_tool_card(tool_name: str, args_preview: str, content: str) -> str:
             if args_preview
             else f"[Called: {tool_name}]"
         )
+        if len(call_line) > _MINI_CARD_BODY_MAX_CHARS:
+            call_line = call_line[: _MINI_CARD_BODY_MAX_CHARS - 1] + "\u2026"
         lines.append(call_line)
-        budget -= len(call_line)
 
     urls: list[str] = []
     for url in dict.fromkeys(URL_RE.findall(content)):
@@ -211,11 +211,11 @@ def _elided_tool_card(tool_name: str, args_preview: str, content: str) -> str:
         # A web_fetch card would otherwise print its own url twice.
         if url in args_preview:
             continue
-        cost = len(url) + 3  # " | " separator
-        if cost > budget:
+        candidate_urls = [*urls, url]
+        candidate_lines = [*lines, "[Source URLs] " + " | ".join(candidate_urls)]
+        if len("\n".join(candidate_lines)) > _MINI_CARD_BODY_MAX_CHARS:
             break
-        urls.append(url)
-        budget -= cost
+        urls = candidate_urls
     if urls:
         lines.append("[Source URLs] " + " | ".join(urls))
     return "\n".join(lines)

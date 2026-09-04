@@ -17,6 +17,7 @@ from agent_core.runtime.loop.compact import (
     _MINI_CARD_MAX_URLS,
     OMITTED_TOOL_RESULT_PLACEHOLDER,
     KeepLastNToolResultsCompactor,
+    _args_preview,
 )
 
 
@@ -84,12 +85,22 @@ def test_url_heavy_body_stays_within_the_card_budget():
     assert sum(card.count(u) for u in urls) <= _MINI_CARD_MAX_URLS
 
 
+def test_exact_rendered_card_stays_within_budget():
+    # The header and newline are part of the model-visible card too. Choose URL
+    # lengths that made the old per-URL accounting overshoot the cap.
+    urls = [f"https://e.com/{letter * 68}" for letter in "abc"]
+    args = "x" * _MINI_CARD_ARGS_MAX_CHARS
+    content = _blanked(_one_call("web_search", args, " ".join(urls) + " " + "x" * 2_000))
+    assert len(_card_of(content)) <= _MINI_CARD_BODY_MAX_CHARS
+
+
 def test_overlong_arguments_are_truncated():
     args = '{"command": "' + "a" * 500 + '"}'
     content = _blanked(_one_call("bash", args, "OUT " + "x" * 2_000))
     call_line = _card_of(content).splitlines()[0]
     assert "…" in call_line
     assert len(call_line) < _MINI_CARD_ARGS_MAX_CHARS + 60
+    assert len(_args_preview(args)) == _MINI_CARD_ARGS_MAX_CHARS
 
 
 def test_multiline_arguments_are_flattened_to_one_line():

@@ -42,7 +42,8 @@ of discarding its collected work.
 
 ## Repeated-invocation metadata has no core-side consumer, by construction
 
-`ToolResult.repeat_count`, `repeat_recovery_id`, `result_id` and `error_kind` are
+`ToolResult.repeat_count`, `ToolResult.repeat_recovery_id`, `ToolResult.result_id`
+and `ToolResult.error_kind` are
 populated from `ToolExecutionHooks.result_metadata` and then read by **nothing
 inside AgentCore**. That is deliberate — AgentCore owns the *facts* about a tool
 result, while what to say to the model about them is prompt policy, which varies

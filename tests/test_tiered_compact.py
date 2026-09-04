@@ -9,10 +9,11 @@ import pytest
 
 from agent_core.llm import LLMResponse
 from agent_core.loop_types import LoopConfig, TurnContext
-from agent_core.messages import system_msg, tool_msg
+from agent_core.messages import system_msg, tool_msg, user_msg
 from agent_core.runtime.loop.agent_loop import run_agent_loop
 from agent_core.runtime.loop.compact import (
     OMITTED_TOOL_RESULT_PLACEHOLDER,
+    SPILL_MANIFEST_HEADER,
     KeepLastNToolResultsCompactor,
     estimate_tokens,
 )
@@ -206,12 +207,16 @@ def test_manifest_caps_are_configurable_and_removable():
     )._with_spill_manifest(messages, refs)
     assert len(_manifest_of(uncapped).splitlines()) == 41  # header + all 40
 
-    # A char cap still binds independently of the path cap.
+    # A char cap still binds independently of the path cap and includes the
+    # complete model-visible rendering, not only the handle payloads.
+    char_cap = len(SPILL_MANIFEST_HEADER) + sum(len(ref) + 3 for ref in refs[-2:])
     char_capped = TieredCompactor(
         keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
-        manifest_max_paths=None, manifest_max_chars=60,
+        manifest_max_paths=None, manifest_max_chars=char_cap,
     )._with_spill_manifest(messages, refs)
-    assert 1 < len(_manifest_of(char_capped).splitlines()) < 41
+    manifest = _manifest_of(char_capped)
+    assert len(manifest) == char_cap
+    assert manifest.splitlines() == [SPILL_MANIFEST_HEADER, "- /spill/038", "- /spill/039"]
 
 
 def test_capped_manifest_keeps_the_newest_handles():
@@ -224,3 +229,42 @@ def test_capped_manifest_keeps_the_newest_handles():
     assert "/spill/new" in manifest
     assert "/spill/mid" in manifest
     assert "/spill/old" not in manifest
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"manifest_max_paths": 0}, "manifest_max_paths must be >= 1 or None"),
+        ({"manifest_max_chars": len(SPILL_MANIFEST_HEADER)}, "manifest_max_chars must fit"),
+    ],
+)
+def test_manifest_caps_reject_values_that_cannot_hold_an_index(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        TieredCompactor(
+            keep_tool_result=1,
+            summary_llm=_FakeLLM(),
+            relief_target=10**9,
+            **kwargs,
+        )
+
+
+def test_overlong_handle_removes_an_old_index_without_inserting_an_empty_one():
+    cap = len(SPILL_MANIFEST_HEADER) + len("\n- x")
+    old_index = user_msg(f"{SPILL_MANIFEST_HEADER}\n- /spill/old")
+    old_index["spill_refs"] = ["/spill/old"]
+    messages = [system_msg("S"), old_index, tool_msg("BODY", "c1")]
+    compactor = TieredCompactor(
+        keep_tool_result=1,
+        summary_llm=_FakeLLM(),
+        relief_target=10**9,
+        manifest_max_chars=cap,
+    )
+
+    once = compactor._with_spill_manifest(messages, ["/spill/" + "x" * 100])
+    twice = compactor._with_spill_manifest(once, ["/spill/" + "x" * 100])
+
+    assert not any(
+        m.get("role") == "user" and "spill_refs" in m
+        for m in twice
+    )
+    assert not any(SPILL_MANIFEST_HEADER in str(m.get("content")) for m in twice)

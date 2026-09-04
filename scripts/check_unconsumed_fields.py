@@ -45,31 +45,39 @@ def declared_fields(class_name: str, module: Path) -> list[str]:
     raise SystemExit(f"{class_name} not found in {module.relative_to(ROOT)}")
 
 
-def consumer_count(field: str, declared_in: Path) -> int:
-    """Attribute reads of *field* anywhere in the package but its own module.
+def consumer_count(field: str) -> int:
+    """Count real attribute reads of *field* anywhere in the package.
 
     Attribute access is the whole signal: a keyword argument at the construction
     site (``repeat_count=repeat_count``) is the field being FILLED, which is
     exactly the state this check exists to catch, so it must not count.
     """
-    pattern = re.compile(rf"\.{re.escape(field)}\b")
     total = 0
     for path in PACKAGE.rglob("*.py"):
-        if path == declared_in:
-            continue
-        total += len(pattern.findall(path.read_text()))
+        tree = ast.parse(path.read_text())
+        total += sum(
+            1
+            for node in ast.walk(tree)
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and node.attr == field
+            )
+        )
     return total
 
 
-def documented(field: str) -> bool:
-    return any(field in doc.read_text() for doc in DOCS.glob("*-boundary.md"))
+def documented(class_name: str, field: str) -> bool:
+    """Require the qualified model field, not an unrelated substring match."""
+    pattern = re.compile(rf"\b{re.escape(class_name)}\.{re.escape(field)}\b")
+    return any(pattern.search(doc.read_text()) for doc in DOCS.glob("*-boundary.md"))
 
 
 def main() -> int:
     undocumented: list[str] = []
     for class_name, module in WATCHED.items():
         for field in declared_fields(class_name, module):
-            if consumer_count(field, module) or documented(field):
+            if consumer_count(field) or documented(class_name, field):
                 continue
             undocumented.append(f"{class_name}.{field}")
 

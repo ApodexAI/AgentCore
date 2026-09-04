@@ -97,6 +97,7 @@ _FULL_TEXT_PREFIX = "[Full text] "
 # the handle shape cannot be chosen independently.
 _SPILL_MANIFEST_MAX_PATHS = 20
 _SPILL_MANIFEST_MAX_CHARS = 3_000
+_SPILL_MANIFEST_MIN_CHARS = len(_SPILL_MANIFEST_HEADER) + len("\n- x")
 
 
 class InputTokenGauge(BaseObserver):
@@ -219,6 +220,16 @@ class TieredCompactor:
     ) -> None:
         if spill is not None and spill_store is not None:
             raise ValueError("pass spill or spill_store, not both")
+        if manifest_max_paths is not None and manifest_max_paths < 1:
+            raise ValueError("manifest_max_paths must be >= 1 or None")
+        if (
+            manifest_max_chars is not None
+            and manifest_max_chars < _SPILL_MANIFEST_MIN_CHARS
+        ):
+            raise ValueError(
+                "manifest_max_chars must fit the manifest header and one handle "
+                f"(>= {_SPILL_MANIFEST_MIN_CHARS}) or be None"
+            )
         spill_callback = spill or (
             spill_store.spill_compacted_body if spill_store is not None else None
         )
@@ -421,7 +432,9 @@ class TieredCompactor:
         max_paths = self._manifest_max_paths
         max_chars = self._manifest_max_chars
         selected: list[str] = []
-        used = 0
+        # The configured cap applies to the exact model-visible text. Each item
+        # adds a newline, the bullet marker, and the handle itself.
+        used = len(_SPILL_MANIFEST_HEADER)
         for path in reversed(refs):
             cost = len(path) + 3
             if max_paths is not None and len(selected) >= max_paths:
@@ -431,21 +444,31 @@ class TieredCompactor:
             selected.append(path)
             used += cost
         selected.reverse()
-        index: Message = user_msg(
-            _SPILL_MANIFEST_HEADER + "\n" + "\n".join(f"- {path}" for path in selected),
-        )
-        index["spill_refs"] = selected
+        index: Message | None = None
+        if selected:
+            index = user_msg(
+                _SPILL_MANIFEST_HEADER + "\n" + "\n".join(f"- {path}" for path in selected),
+            )
+            index["spill_refs"] = selected
 
         out: list[Message] = []
         replaced = False
         for message in messages:
-            # Exactly one message can be the index: the one that says it is.
-            if not replaced and message.get("role") == "user" and message.get("spill_refs"):
-                out.append(index)
+            # The data field is authoritative; the header recognises a legacy
+            # checkpoint. Remove duplicate or now-empty indices while here.
+            is_index = message.get("role") == "user" and (
+                "spill_refs" in message
+                or text_of(message.get("content")).startswith(_SPILL_MANIFEST_HEADER)
+            )
+            if is_index:
+                if not replaced and index is not None:
+                    out.append(index)
                 replaced = True
                 continue
             out.append(message)
         if replaced:
+            return out
+        if index is None:
             return out
 
         insert_at = 0
