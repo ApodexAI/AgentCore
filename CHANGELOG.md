@@ -61,6 +61,40 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   so adopting a new reserved key here cannot silently remove something a product
   already reads.
 
+- `agent_core.components.deliverables`: deliverable reconciliation, extracted
+  from ApodexHarness `workflows/agent_team/publication.py` so every consumer
+  shares one definition of "delivered" instead of inferring it from `stopped_by`.
+  A run is complete only if the loop ended on a stop reason the caller counts as
+  completing AND the answer made good on every deliverable it claimed. Judging on
+  `stopped_by` alone mis-reported in both directions: a publisher that emitted
+  its write as a fenced bash block never ran the tool yet reported the deliverable
+  as shipped, while a model that answered in plain text after writing its file was
+  reported incomplete because it stopped on `no_tool`.
+
+  Delivery is decided on content identity — a path holding non-empty bytes whose
+  `(relpath, size, sha256)` is new relative to this round's baseline. `/outputs`
+  persists across rounds, so the baseline is what separates "delivered this
+  round" from "a previous round's file is still there"; `touch` and symlinks
+  deliver nothing. Both host-specific concerns are injected rather than imported,
+  which is what lets the module live in the portable library: `host_root` (where
+  the sandbox's `/outputs` really is — core has no mount-resolver fallback,
+  because a guessed root reconciles against the wrong tree) and `ignore_matcher`
+  (the host's `.outputsignore` policy). Every filesystem entry point has an
+  `_async` twin, since hashing a large tree on the event loop stalls every
+  concurrent sub-agent while the caller holds the publication lock.
+
+  Claim scanning treats paths as non-whitespace runs rather than an ASCII
+  allowlist: an allowlist read `/outputs/报告.pdf` as no claim at all and turned
+  `/outputs/résumé.pdf` into `/outputs/r`, so a non-ASCII deliverable was both
+  waved through when missing and flagged as unverified when correctly delivered.
+  Full-width punctuation terminates a match because Chinese prose leaves no space
+  after it. Space-bearing paths are recognised only where the prose delimits them
+  unambiguously (backtick span or markdown link target), and where the scan still
+  truncates at a space a declared manifest entry outranks the guess.
+
+  New surface only — no existing behaviour changes. See
+  [docs/deliverables-boundary.md](docs/deliverables-boundary.md).
+
 ### Consumer action
 
 - This changes text the model reads and is therefore a compaction-decision
@@ -79,6 +113,10 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 ### Documented
 
+- `docs/deliverables-boundary.md` states the deliverable-reconciliation split:
+  what core decides (the three verdicts, baseline semantics, what it refuses to
+  count) and what the host still owns (`host_root`, `.outputsignore` matching,
+  which stop reasons complete a run, quarantine of anything refused).
 - `docs/agent-loop-boundary.md` now records that `ToolResult.repeat_count`,
   `repeat_recovery_id`, `result_id` and `error_kind` have no consumer inside
   AgentCore, that this is by construction, and that a product moving onto
