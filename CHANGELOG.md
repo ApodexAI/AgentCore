@@ -7,7 +7,91 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- `agent_core.components.middleware.base.MiddlewareChain` — the phase/tool
+  middleware runner for the `ExecutionMiddleware` contract that
+  `agent_core.protocols` already declared. Core previously shipped the contract
+  and the structural `PhaseMiddlewareChain` without a runner.
+- Portable middlewares, extracted from ApodexHarness:
+  `middleware.rate_limit` (token-bucket RPM/TPM), `middleware.tool_audit`
+  (pattern-based bash / web_fetch risk classification with veto),
+  `middleware.status_report` (sub-agent phase heartbeat over the agent bus),
+  `middleware.todo` (task-progress injection), and under `middleware.llm`:
+  `retry`, `tracing`, `loop_detection`, `output_repair`, `api_key_rotation`,
+  `compaction`, `token_accounting`.
+- `agent_core.components.memory` — `WorkingMemory` and its snapshot
+  recovery, which `middleware.todo` reads.
+- `agent_core.protocols.CostSink` and `agent_core.protocols.CostPersister`.
+  `CostSink.record` is synchronous and runs per call; `CostPersister.persist`
+  runs once at completion and is the only path that reaches durable storage.
+
+See [docs/middleware-boundary.md](docs/middleware-boundary.md) for what stays
+with the host — the composition root, chain ordering, trace/event sinks, and any
+phase middleware that needs host services.
+
+### Changed
+
+- `LLMCallContext.metadata`'s field factory is now parametrised. No behavioral
+  change; it stopped every consumer of `ctx.metadata` from type-checking as
+  unknown.
+- `CostSink` now states its full contract: `record(...)` plus
+  `get_summary(task_id)`. Configuring a `CostPersister` with a record-only sink
+  fails immediately instead of silently skipping final persistence.
+- `StatusReportMiddleware` no longer knows the research result schema. Hosts can
+  pass `result_summarizer(result)` to add their own status fields.
+- `TodoMiddleware` obtains domain-specific progress through
+  `WorkingMemory.one_line_summary()`, which subclasses can override.
+- `ToolAuditMiddleware` accepts an optional host-owned `bash_classifier`. Its
+  built-in regex classifier is a conservative defense-in-depth fallback, not a
+  replacement for a sandbox or a host filesystem policy.
+
+### Fixed
+
+- `TokenBucket.acquire` now rechecks and reserves capacity atomically after
+  sleeping, so concurrent waiters cannot spend the same refill and drive the
+  bucket negative.
+- `LoopDetectionMiddleware` isolates history and pending hints by task/session,
+  role, and phase, and bounds retained scopes. One task can no longer inject a
+  loop warning into another.
+- Recursive-force `rm` classification recognizes split, reordered, and long
+  flags, including `--no-preserve-root`.
+- `LLMTracingMiddleware` keeps its start time on `LLMCallContext`; a terminal
+  chat failure can no longer leak an entry in a process-long timer dictionary.
+
+### Consumer action
+
+**`TokenAccountingMiddleware` no longer takes `session_factory`.** It takes
+`cost_persister: CostPersister | None` instead, and `persist_cost` forwards the
+summary rather than writing a table itself. A host that passed a SQLAlchemy
+session factory must now pass an object with
+`async persist(task_id, summary, model)`; the table name, the column names and
+the transaction boundary move with it. Passing neither seam leaves `persist_cost`
+a no-op, unchanged.
+
+When `cost_persister` is configured, `cost_sink` must implement both
+`record(...)` and `get_summary(task_id)`. Record-only sinks remain valid when
+durable persistence is not configured.
+
+Hosts that want research-specific status fields should construct
+`StatusReportMiddleware(result_summarizer=...)`; AgentCore no longer reads
+`evidence_cards` or `assertions` directly.
+
+Everything else only adds modules. A product adopting these should replace its
+own copies with import aliases rather than keeping both.
+
+Note for anyone carrying a private fork of the compaction prompt:
+`agent_core.runtime.loop.summary_prompt` has moved on — it now offers
+`RESEARCH_COMPACTION_PROMPT`, `HANDOFF_COMPACTION_PROMPT` and a
+`compaction_prompt()` selector, with `COMPACTION_PROMPT` aliasing the research
+shape. `middleware.llm.compaction` uses it directly.
+
 ## [0.5.0] - 2026-09-04
+
+**Never published.** Merged to `main` but never tagged; its contents ship in
+0.6.0. Nothing pins it.
 
 ### Added
 
