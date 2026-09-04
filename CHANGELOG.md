@@ -7,6 +7,48 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.5.0] - 2026-09-04
+
+### Added
+
+- `agent_core.components.cycle` — the product-neutral write → audit → feedback →
+  re-write loop, extracted from ApodexHarness. `WriteAuditCycle` owns max-rounds,
+  the wall-clock budget with between-round estimation, the missing-artifact
+  output check, writer-exception and missing-output capture as synthetic audits,
+  per-round persistence of the audit trail, and failure-isolated round-observer
+  dispatch. Ships the `AuditReport` / `WriterOutput` / `AuditFinding` /
+  `CycleOutput` contracts with JSON round-trip, `DefaultFeedbackRenderer`,
+  `SessionBackedWriter` / `SessionBackedAuditor`, `ScoreThresholdAuditor`,
+  `MajorityVoteAuditor`, `select_best_attempt`, `select_by_answer_consensus`, and
+  the `BestSoFarObserver` / `PlateauAbortObserver` / `MetricsObserver` built-ins.
+- `agent_core.components.verifier` — the `Verifier` and `Generator` protocols,
+  the `Verdict` model with nesting, `GroundTruth` / `VerifierContext` with
+  automatic oracle-field stripping at runtime, the six composers (Pipeline,
+  Ensemble, Fallback, Cascade, Parallel, ConsensusVerifier), and the
+  `AuditReport` ↔ `Verdict` bridge so a `Verifier` can stand in for a
+  `CycleAuditor`.
+- `agent_core.components.observers.conclude_phase_observer.ConcludePhaseObserver`
+  — nudges a session toward emitting its structured output once it crosses a
+  ratio of its turn budget, instead of exploring until `max_turns` kills it and
+  returning empty content. `cycle.builders` depends on it.
+
+Scoring vocabularies stay free-form strings by design, and concrete writers and
+auditors stay in the product. See
+[docs/cycle-verifier-boundary.md](docs/cycle-verifier-boundary.md).
+
+### Fixed
+
+- `SessionBackedWriter._ensure_session` declared `-> str` while returning the
+  `str | None` attribute it caches into. Behavior is unchanged — the bus does
+  return an id — but the annotation no longer overstates what was proven.
+
+### Consumer action
+
+None required. This release only adds modules; nothing existing changed shape.
+A product adopting these should replace its own copies with import aliases
+rather than keeping both, since divergence is the failure this package exists to
+prevent.
+
 ## [0.4.0] - 2026-09-03
 
 ### Added
