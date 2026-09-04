@@ -118,6 +118,125 @@ def tool_names_by_call_id(messages: list[Message]) -> dict[str, str]:
 _tool_names_by_call_id = tool_names_by_call_id
 
 
+# ---------------------------------------------------------------------------
+# Elided-tool-result mini card
+#
+# Tier 1 used to leave ONLY ``OMITTED_TOOL_RESULT_PLACEHOLDER``, dropping the
+# call's arguments and every source URL — precisely the two things a later turn
+# needs in order not to re-issue a query it already ran. Tier 2's summary does
+# preserve both, but Tier 2 only fires when Tier 1 did not free enough, so on a
+# Tier1-only turn the model saw strictly less than it had to.
+#
+# Both fields are free: the arguments are on the requesting assistant message,
+# the URLs are in the body about to be discarded. No LLM call, no extra storage,
+# and no second model-visible index — the card names the call, it does not offer
+# a way to fetch anything (that stays with the recovery footnote below it).
+#
+# The budget matters: a single web_search body can carry dozens of URLs, and an
+# unbounded card would hand back the context Tier 1 just freed. Fill args first
+# (they identify the call), then URLs until the budget runs out.
+# ---------------------------------------------------------------------------
+
+_MINI_CARD_ARGS_MAX_CHARS = 120
+_MINI_CARD_BODY_MAX_CHARS = 400
+_MINI_CARD_MAX_URLS = 3
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _args_preview(raw: object) -> str:
+    """Collapse a tool call's arguments to one short single-line preview.
+
+    ``bash`` commands and ``web_fetch`` payloads carry newlines and heredocs; a
+    multi-line card would cost more rows than the body it replaces.
+    """
+    rendered = raw if isinstance(raw, str) else str(raw or "")
+    collapsed = _WHITESPACE_RE.sub(" ", rendered).strip()
+    if len(collapsed) <= _MINI_CARD_ARGS_MAX_CHARS:
+        return collapsed
+    return collapsed[:_MINI_CARD_ARGS_MAX_CHARS] + "\u2026"
+
+
+def _tool_args_by_call_id(messages: list[Message]) -> dict[str, str]:
+    """Map ``tool_call_id`` → bounded preview of the arguments it was sent.
+
+    Kept private, unlike :func:`tool_names_by_call_id`: no product facade
+    resolves arguments by call id, so there is no older spelling to honour.
+    """
+    out: dict[str, str] = {}
+    for msg in messages:
+        if not is_assistant_msg(msg):
+            continue
+        for tc_value in cast(list[Any], msg.get("tool_calls") or []):
+            if not isinstance(tc_value, dict):
+                continue
+            tc = cast(dict[str, Any], tc_value)
+            fn_value = tc.get("function")
+            fn = cast(dict[str, Any], fn_value) if isinstance(fn_value, dict) else None
+            raw = (
+                fn.get("arguments", tc.get("args", ""))
+                if fn is not None
+                else tc.get("arguments", tc.get("args", ""))
+            )
+            tid = tc.get("id") or (fn.get("id") if fn is not None else None)
+            if not isinstance(tid, str) or not tid:
+                continue
+            preview = _args_preview(raw)
+            if preview:
+                out[tid] = preview
+    return out
+
+
+def _elided_tool_card(tool_name: str, args_preview: str, content: str) -> str:
+    """Render the card lines that stand in for a discarded tool body.
+
+    Returns ``""`` when there is nothing worth saying (no name, no arguments, no
+    URLs), so the caller falls back to the bare placeholder rather than emitting
+    an empty line.
+    """
+    budget = _MINI_CARD_BODY_MAX_CHARS
+    lines: list[str] = []
+    if tool_name or args_preview:
+        call_line = (
+            f"[Called: {tool_name}({args_preview})]"
+            if args_preview
+            else f"[Called: {tool_name}]"
+        )
+        lines.append(call_line)
+        budget -= len(call_line)
+
+    urls: list[str] = []
+    for url in dict.fromkeys(URL_RE.findall(content)):
+        if len(urls) >= _MINI_CARD_MAX_URLS:
+            break
+        # A web_fetch card would otherwise print its own url twice.
+        if url in args_preview:
+            continue
+        cost = len(url) + 3  # " | " separator
+        if cost > budget:
+            break
+        urls.append(url)
+        budget -= cost
+    if urls:
+        lines.append("[Source URLs] " + " | ".join(urls))
+    return "\n".join(lines)
+
+
+def _message_recovery_ref(message: Message) -> str:
+    """Return a handle that already backs this body, so we never store it twice.
+
+    ``spill_refs`` wins over ``result_store_ref``: a ref pinned by an EARLIER
+    compaction pass describes the content that is actually still on the message,
+    whereas the loop-cap handle describes the pre-truncation body upstream shed.
+    Reading the latter first would re-spill a body that is already stored, and —
+    worse — would pin the wrong handle into the recovery index.
+    """
+    refs = [r for r in (message.get("spill_refs") or []) if r]
+    canonical = str(message.get("result_store_ref") or "")
+    if canonical and canonical not in refs:
+        refs.append(canonical)
+    return refs[0] if refs else ""
+
+
 def _condense(content: str, max_chars: int) -> str:
     """Head + tail + URLs of *content*, never longer than the original."""
     prefix = f"[Compressed tool result: {len(content):,} characters]\n"
@@ -434,10 +553,17 @@ class DefaultCompactionPolicy:
 
 
 class KeepLastNToolResultsCompactor:
-    """Replace older ``ToolMessage`` bodies with a short placeholder.
+    """Replace older ``ToolMessage`` bodies with a short mini card.
 
-    Keeps the last ``keep_tool_result`` tool results verbatim and replaces
-    the content of every earlier one with :data:`OMITTED_TOOL_RESULT_PLACEHOLDER`.
+    Keeps the last ``keep_tool_result`` tool results verbatim and replaces the
+    content of every earlier one with :data:`OMITTED_TOOL_RESULT_PLACEHOLDER`
+    followed by a bounded card naming the call (tool + arguments preview) and up
+    to :data:`_MINI_CARD_MAX_URLS` source URLs found in the discarded body, then
+    the recovery pointer when the body was spilled. The card is free — both
+    fields already exist in the history and in the body — and it is what keeps a
+    later turn from re-issuing a query whose result it can no longer see. When no
+    spill is configured and the card would not be shorter than the body it
+    replaces, the body is kept verbatim instead.
     ``SystemMessage``, ``HumanMessage``, and every ``AIMessage`` (including
     its thinking trace) are left intact, so the model retains its full
     chain of reasoning and tool-call metadata while dropping the bulk of
@@ -489,7 +615,10 @@ class KeepLastNToolResultsCompactor:
         if len(keep_set) == len(tool_indices):
             return messages
 
+        # Names and arguments are needed unconditionally now: the mini card names
+        # the call it replaced even when nothing is protected and nothing spills.
         id_to_name = tool_names_by_call_id(messages)
+        id_to_args = _tool_args_by_call_id(messages)
 
         out: list[Message] = []
         for idx, msg in enumerate(messages):
@@ -505,12 +634,12 @@ class KeepLastNToolResultsCompactor:
             ):
                 out.append(msg)
                 continue
+            call_id = msg.get("tool_call_id", "")
             placeholder = OMITTED_TOOL_RESULT_PLACEHOLDER
-            spill_path = str(msg.get("result_store_ref") or "")
+            spill_path = _message_recovery_ref(msg)
             if not spill_path and self._spill is not None:
-                tool_name = id_to_name.get(msg.get("tool_call_id", ""), "tool")
                 try:
-                    spill_path = self._spill(tool_name, content)
+                    spill_path = self._spill(id_to_name.get(call_id, "tool"), content)
                 except Exception:
                     spill_path = None
             # A configured spill callback is a promise that discarded content
@@ -520,9 +649,28 @@ class KeepLastNToolResultsCompactor:
             if self._spill is not None and not spill_path:
                 out.append(msg)
                 continue
+            card = _elided_tool_card(
+                id_to_name.get(call_id, ""), id_to_args.get(call_id, ""), content,
+            )
+            if card:
+                placeholder += "\n" + card
             if spill_path:
                 placeholder += f"\n[Full text] {spill_path}"
-            replacement = tool_msg(placeholder, msg.get("tool_call_id", ""))
+            # Without a pointer, replacing the body DESTROYS it, so a card that
+            # is not even shorter is a pure loss and we keep the body. With one
+            # we always replace, even when the card is longer: the pointer only
+            # reaches the model through ``spill_refs`` → the Tier 2 recovery
+            # index, so keeping the body here would strand the spilled full text
+            # as unrecoverable — and such a body is itself already a truncated
+            # preview, not the full content.
+            #
+            # Reachable only when NO spill callback is configured: a configured
+            # one that declined already returned the body verbatim above, at any
+            # size. That is why this needs no minimum-size threshold of its own.
+            if not spill_path and len(placeholder) >= len(content):
+                out.append(msg)
+                continue
+            replacement = tool_msg(placeholder, call_id)
             if spill_path:
                 # The text is for the model; this is for us. ``TieredCompactor``
                 # collects refs from the field, so nothing has to recognise a

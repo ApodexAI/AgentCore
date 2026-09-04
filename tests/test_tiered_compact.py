@@ -174,3 +174,53 @@ async def test_gauge_feeds_policy_inside_run_agent_loop():
     # Only the threshold policy can fire → compaction running proves the gauge
     # was fed (step 6) before the policy read it (step 10) within the live loop.
     assert spy.calls >= 1
+
+
+def _manifest_of(messages: list[dict]) -> str:
+    return next(
+        m["content"] for m in messages
+        if m.get("role") == "user" and m.get("spill_refs")
+    )
+
+
+def test_manifest_caps_are_configurable_and_removable():
+    """The cap and the handle shape cannot be chosen independently.
+
+    Defaults are sized for a handle rendered as a filesystem path. A product
+    whose handles are short content-addressed ids pays a fraction of that per
+    entry, and dropping the OLDEST handle is what makes decisive early evidence
+    unrecoverable after a long unrelated detour — so it must be able to say so.
+    """
+    refs = [f"/spill/{i:03d}" for i in range(40)]
+    messages = [system_msg("S"), tool_msg("BODY", "c1")]
+
+    capped = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=5,
+    )._with_spill_manifest(messages, refs)
+    assert len(_manifest_of(capped).splitlines()) == 6  # header + 5
+
+    uncapped = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=None, manifest_max_chars=None,
+    )._with_spill_manifest(messages, refs)
+    assert len(_manifest_of(uncapped).splitlines()) == 41  # header + all 40
+
+    # A char cap still binds independently of the path cap.
+    char_capped = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=None, manifest_max_chars=60,
+    )._with_spill_manifest(messages, refs)
+    assert 1 < len(_manifest_of(char_capped).splitlines()) < 41
+
+
+def test_capped_manifest_keeps_the_newest_handles():
+    refs = ["/spill/old", "/spill/mid", "/spill/new"]
+    out = TieredCompactor(
+        keep_tool_result=1, summary_llm=_FakeLLM(), relief_target=10**9,
+        manifest_max_paths=2,
+    )._with_spill_manifest([system_msg("S"), tool_msg("BODY", "c1")], refs)
+    manifest = _manifest_of(out)
+    assert "/spill/new" in manifest
+    assert "/spill/mid" in manifest
+    assert "/spill/old" not in manifest

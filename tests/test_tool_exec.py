@@ -93,6 +93,58 @@ async def test_host_hooks_own_timeout_context_and_result_policies() -> None:
     assert results[0].repeat_count == 2
     assert results[0].repeat_recovery_id == "spill-0"
     assert events == ["meter:echo", "enter:tc:12", "await:echo:3:12", "exit"]
+    # Reserved keys are promoted to typed fields AND left in host_metadata: the
+    # pass-through is verbatim so that adopting a new reserved key here cannot
+    # silently remove something a product was already reading.
+    assert results[0].host_metadata == {
+        "error_kind": "command_exit",
+        "result_id": "spill-1",
+        "repeat_count": 2,
+        "repeat_recovery_id": "spill-0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_metadata_carries_keys_agent_core_does_not_know() -> None:
+    """The seam a product needs to word its own note about a repeated call.
+
+    ``identical_body`` has no typed field: whether a call COUNTS as a repeat is
+    per-tool product policy, while whether the body came back byte-identical is a
+    separate observed fact. A product wording a note needs both, and this is how
+    the second one reaches ``render_tool_result``.
+    """
+    hooks = ToolExecutionHooks(
+        result_metadata=lambda _name, _args, _raw, _rendered: {
+            "repeat_count": 3,
+            "identical_body": False,
+        },
+    )
+    results = await execute_tools(
+        [{"name": "echo", "args": {"x": 1}, "id": "tc"}],
+        {"echo": FakeTool("echo", "value")},
+        timeout=5,
+        turn=1,
+        count_offset=0,
+        hooks=hooks,
+    )
+    assert results[0].repeat_count == 3
+    assert results[0].host_metadata["identical_body"] is False
+
+
+@pytest.mark.asyncio
+async def test_host_metadata_defaults_to_empty_and_is_not_shared() -> None:
+    results = await execute_tools(
+        [
+            {"name": "echo", "args": {"x": 1}, "id": "a"},
+            {"name": "echo", "args": {"x": 2}, "id": "b"},
+        ],
+        {"echo": FakeTool("echo", "value")},
+        timeout=5,
+        turn=1,
+        count_offset=0,
+    )
+    assert results[0].host_metadata == {}
+    assert results[0].host_metadata is not results[1].host_metadata
 
 
 @pytest.mark.asyncio
