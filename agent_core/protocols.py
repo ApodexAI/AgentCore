@@ -231,6 +231,10 @@ class CostSink(Protocol):
         output_tokens: int,
     ) -> float: ...
 
+    def get_summary(self, task_id: str) -> Mapping[str, Any]:
+        """Return the final per-task summary forwarded to ``CostPersister``."""
+        ...
+
 
 @runtime_checkable
 class CostPersister(Protocol):

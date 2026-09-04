@@ -37,6 +37,29 @@ phase middleware that needs host services.
 - `LLMCallContext.metadata`'s field factory is now parametrised. No behavioral
   change; it stopped every consumer of `ctx.metadata` from type-checking as
   unknown.
+- `CostSink` now states its full contract: `record(...)` plus
+  `get_summary(task_id)`. Configuring a `CostPersister` with a record-only sink
+  fails immediately instead of silently skipping final persistence.
+- `StatusReportMiddleware` no longer knows the research result schema. Hosts can
+  pass `result_summarizer(result)` to add their own status fields.
+- `TodoMiddleware` obtains domain-specific progress through
+  `WorkingMemory.one_line_summary()`, which subclasses can override.
+- `ToolAuditMiddleware` accepts an optional host-owned `bash_classifier`. Its
+  built-in regex classifier is a conservative defense-in-depth fallback, not a
+  replacement for a sandbox or a host filesystem policy.
+
+### Fixed
+
+- `TokenBucket.acquire` now rechecks and reserves capacity atomically after
+  sleeping, so concurrent waiters cannot spend the same refill and drive the
+  bucket negative.
+- `LoopDetectionMiddleware` isolates history and pending hints by task/session,
+  role, and phase, and bounds retained scopes. One task can no longer inject a
+  loop warning into another.
+- Recursive-force `rm` classification recognizes split, reordered, and long
+  flags, including `--no-preserve-root`.
+- `LLMTracingMiddleware` keeps its start time on `LLMCallContext`; a terminal
+  chat failure can no longer leak an entry in a process-long timer dictionary.
 
 ### Consumer action
 
@@ -47,6 +70,14 @@ session factory must now pass an object with
 `async persist(task_id, summary, model)`; the table name, the column names and
 the transaction boundary move with it. Passing neither seam leaves `persist_cost`
 a no-op, unchanged.
+
+When `cost_persister` is configured, `cost_sink` must implement both
+`record(...)` and `get_summary(task_id)`. Record-only sinks remain valid when
+durable persistence is not configured.
+
+Hosts that want research-specific status fields should construct
+`StatusReportMiddleware(result_summarizer=...)`; AgentCore no longer reads
+`evidence_cards` or `assertions` directly.
 
 Everything else only adds modules. A product adopting these should replace its
 own copies with import aliases rather than keeping both.

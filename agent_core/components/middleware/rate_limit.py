@@ -32,6 +32,10 @@ class TokenBucket:
         requests_per_min: int = 60,
         tokens_per_min: int = 100_000,
     ) -> None:
+        if requests_per_min <= 0:
+            raise ValueError("requests_per_min must be positive")
+        if tokens_per_min <= 0:
+            raise ValueError("tokens_per_min must be positive")
         self._rpm = float(requests_per_min)
         self._tpm = float(tokens_per_min)
 
@@ -61,43 +65,41 @@ class TokenBucket:
         If bucket is empty, calculates required wait time and sleeps.
         Returns the time spent waiting (0 if no wait was needed).
         """
-        wait_time = 0.0
+        total_wait = 0.0
+        # A single request cannot reserve more than a full minute's token
+        # capacity. Capping avoids an infinite wait for an oversized prompt;
+        # the provider remains the authority on whether that request is valid.
+        requested_tokens = min(max(estimated_tokens, 0), int(self._tpm))
 
-        async with self._lock:
-            self._refill()
+        while True:
+            async with self._lock:
+                self._refill()
 
-            # Check request bucket
-            req_wait = 0.0
-            if self._request_tokens < 1.0:
-                deficit = 1.0 - self._request_tokens
-                req_wait = (deficit / self._rpm) * 60.0
+                req_wait = 0.0
+                if self._request_tokens < 1.0:
+                    deficit = 1.0 - self._request_tokens
+                    req_wait = (deficit / self._rpm) * 60.0
 
-            # Check token bucket
-            tok_wait = 0.0
-            if estimated_tokens > 0 and self._token_tokens < estimated_tokens:
-                deficit = estimated_tokens - self._token_tokens
-                tok_wait = (deficit / self._tpm) * 60.0
+                tok_wait = 0.0
+                if requested_tokens > 0 and self._token_tokens < requested_tokens:
+                    deficit = requested_tokens - self._token_tokens
+                    tok_wait = (deficit / self._tpm) * 60.0
 
-            wait_time = max(req_wait, tok_wait)
+                wait_time = max(req_wait, tok_wait)
+                if wait_time <= 0:
+                    # Capacity is checked and reserved in one critical section;
+                    # no other waiter can consume the refill between them.
+                    self._request_tokens -= 1.0
+                    if requested_tokens > 0:
+                        self._token_tokens -= requested_tokens
+                    return total_wait
 
-        if wait_time > 0:
             logger.info(
                 "RateLimit: queuing %.1fs (req_wait=%.1f, tok_wait=%.1f)",
                 wait_time, req_wait, tok_wait,
             )
             await asyncio.sleep(wait_time)
-
-            # Re-acquire after sleep
-            async with self._lock:
-                self._refill()
-
-        # Consume
-        async with self._lock:
-            self._request_tokens -= 1.0
-            if estimated_tokens > 0:
-                self._token_tokens -= estimated_tokens
-
-        return wait_time
+            total_wait += wait_time
 
     def adjust(self, actual_tokens: int, estimated_tokens: int) -> None:
         """Correct token bucket with actual usage.

@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from agent_core.protocols import ExecutionMiddleware, PhaseContext
 
 logger = logging.getLogger(__name__)
+
+PhaseResultSummarizer = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 
 
 class StatusReportMiddleware(ExecutionMiddleware):
@@ -24,6 +27,18 @@ class StatusReportMiddleware(ExecutionMiddleware):
     Uses AgentComm with QUEUE delivery (parent polls when ready).
     Only active for sub-agent tasks (parent_agent_id in execution_context).
     """
+
+    def __init__(
+        self,
+        result_summarizer: PhaseResultSummarizer | None = None,
+    ) -> None:
+        """Create a status reporter.
+
+        ``result_summarizer`` is host-owned: it may add domain-specific fields
+        to the message content without teaching AgentCore about a workflow's
+        result schema.
+        """
+        self._result_summarizer = result_summarizer
 
     async def before_phase(self, ctx: PhaseContext) -> PhaseContext:
         """Record phase start time."""
@@ -56,9 +71,15 @@ class StatusReportMiddleware(ExecutionMiddleware):
             )
             duration_ms = int((time.monotonic() - start) * 1000)
 
-            # Build status report
-            evidence_count = len(result.get("evidence_cards", []))
-            assertion_count = len(result.get("assertions", []))
+            details: dict[str, Any] = {}
+            if self._result_summarizer is not None:
+                try:
+                    details.update(self._result_summarizer(result))
+                except Exception:
+                    logger.debug(
+                        "StatusReport result summarizer failed",
+                        exc_info=True,
+                    )
 
             report = AgentMessage(
                 task_id=ctx.task_id,
@@ -66,13 +87,12 @@ class StatusReportMiddleware(ExecutionMiddleware):
                 to_agent=parent_id,
                 message_type="status_report",
                 content={
+                    **details,
                     "agent_id": ctx.role_id,
                     "task_id": ctx.task_id,
                     "phase": ctx.phase_id,
                     "status": "phase_completed",
                     "duration_ms": duration_ms,
-                    "evidence_count": evidence_count,
-                    "assertion_count": assertion_count,
                 },
             )
             await agent_comm.send(report, mode=DeliveryMode.QUEUE)
@@ -85,3 +105,6 @@ class StatusReportMiddleware(ExecutionMiddleware):
             logger.debug("StatusReportMiddleware failed: %s", e)
 
         return result
+
+
+__all__ = ["PhaseResultSummarizer", "StatusReportMiddleware"]

@@ -5,8 +5,11 @@ Covers: RateLimitMiddleware, ToolAuditMiddleware, block mechanism.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+import agent_core.components.middleware.rate_limit as rate_limit_module
 from agent_core.components.middleware.llm.base import LLMCallContext
 from agent_core.components.middleware.rate_limit import (
     RateLimitMiddleware,
@@ -44,6 +47,53 @@ async def test_token_bucket_queues_when_exhausted():
     for _ in range(10):
         await bucket2.acquire()
     # Should not hang
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_rechecks_capacity_after_concurrent_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One refill must release only one request when waiters wake together."""
+    bucket = TokenBucket(requests_per_min=60, tokens_per_min=100_000)
+    bucket._request_tokens = 0.0
+
+    clock = [0.0]
+    arrivals = [0]
+    initial_waiters = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    monkeypatch.setattr(rate_limit_module.time, "monotonic", lambda: clock[0])
+    bucket._last_refill = 0.0
+
+    async def advance_clock(delay: float) -> None:
+        arrivals[0] += 1
+        if arrivals[0] <= 3:
+            if arrivals[0] == 3:
+                clock[0] = delay
+                initial_waiters.set()
+            await initial_waiters.wait()
+            return
+        clock[0] += delay
+        await real_sleep(0)
+
+    monkeypatch.setattr(rate_limit_module.asyncio, "sleep", advance_clock)
+
+    waits = await asyncio.gather(*(bucket.acquire() for _ in range(3)))
+
+    assert all(wait >= 1.0 for wait in waits)
+    assert bucket._request_tokens >= 0.0
+
+
+@pytest.mark.parametrize(
+    ("requests_per_min", "tokens_per_min"),
+    [(0, 100), (-1, 100), (1, 0), (1, -1)],
+)
+def test_token_bucket_rejects_non_positive_limits(
+    requests_per_min: int,
+    tokens_per_min: int,
+) -> None:
+    with pytest.raises(ValueError):
+        TokenBucket(requests_per_min, tokens_per_min)
 
 
 def test_token_bucket_adjust_overestimate():
@@ -118,6 +168,52 @@ async def test_audit_blocks_rm_rf():
     assert result.metadata["blocked"] is True
     assert result.metadata["audit_risk"] == "block"
     assert "high-risk bash" in result.metadata["block_reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -r -f --no-preserve-root /",
+        "rm --recursive --force --no-preserve-root /",
+    ],
+)
+async def test_audit_blocks_equivalent_recursive_force_rm(command: str) -> None:
+    mw = ToolAuditMiddleware()
+    ctx = ToolCallContext(
+        task_id="t",
+        phase_id="react_solve",
+        role_id="solver",
+        tool_name="bash",
+        tool_args={"command": command},
+    )
+
+    result = await mw.before_tool_call(ctx)
+
+    assert result.is_blocked
+    assert result.metadata["audit_risk"] == "block"
+
+
+@pytest.mark.asyncio
+async def test_audit_uses_host_classifier_when_provided() -> None:
+    seen: list[str] = []
+
+    def classify(command: str):
+        seen.append(command)
+        return "warn", "host policy"
+
+    mw = ToolAuditMiddleware(bash_classifier=classify)
+    ctx = ToolCallContext(
+        task_id="t",
+        phase_id="phase",
+        tool_name="bash",
+        tool_args={"command": "rm -rf /"},
+    )
+
+    result = await mw.before_tool_call(ctx)
+
+    assert seen == ["rm -rf /"]
+    assert result.metadata == {"audit_risk": "warn", "audit_reason": "host policy"}
 
 
 @pytest.mark.asyncio

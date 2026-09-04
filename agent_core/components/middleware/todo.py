@@ -11,7 +11,6 @@ reminder from PlanSnapshot + WorkingMemory.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from agent_core.components.middleware.llm.base import LLMCallContext, LLMMiddleware
 from agent_core.messages import Message, text_of, user_msg
@@ -124,9 +123,8 @@ class TodoMiddleware(LLMMiddleware):
     def _get_wm_summary(self) -> str:
         """Extract compact summary from WorkingMemory.
 
-        ``evidence_cards`` is research-specific (lives on
-        ``ResearchWorkingMemory``); use ``getattr`` so this generic
-        middleware works against any subclass.
+        Domain subclasses can override ``one_line_summary`` to surface their
+        own progress vocabulary without coupling this middleware to it.
         """
         try:
             from agent_core.components.memory import (
@@ -137,12 +135,7 @@ class TodoMiddleware(LLMMiddleware):
             if wm is None:
                 return ""
 
-            lines: list[str] = []
-            evidence_cards: Any = getattr(wm, "evidence_cards", None) or []
-            if evidence_cards:
-                lines.append(
-                    f"Evidence collected: {len(evidence_cards)} cards"
-                )
+            lines: list[str] = [wm.one_line_summary()]
             if wm.key_findings:
                 lines.append("Key findings:")
                 for f in wm.key_findings[-5:]:

@@ -12,6 +12,7 @@ from agent_core.llm import LLMResponse
 from agent_core.messages import Message, text_of
 
 logger = logging.getLogger(__name__)
+_START_TIME_KEY = "_llm_tracing_start_monotonic"
 
 
 class LLMTracingMiddleware(LLMMiddleware):
@@ -19,7 +20,6 @@ class LLMTracingMiddleware(LLMMiddleware):
 
     def __init__(self, trace_logger: Any = None) -> None:
         self._trace = trace_logger
-        self._timers: dict[int, float] = {}
 
     @property
     def name(self) -> str:
@@ -28,17 +28,21 @@ class LLMTracingMiddleware(LLMMiddleware):
     async def before_llm(
         self, ctx: LLMCallContext, messages: list[Message]
     ) -> list[Message]:
-        self._timers[id(ctx)] = time.time()
+        # Keep call-local state on the call context. If chat ultimately raises,
+        # the context and timer are released together without a separate error
+        # hook or middleware-owned cleanup table.
+        ctx.metadata[_START_TIME_KEY] = time.monotonic()
         return messages
 
     async def after_llm(
         self, ctx: LLMCallContext, response: LLMResponse
     ) -> LLMResponse:
-        start = self._timers.pop(id(ctx), time.time())
+        raw_start = ctx.metadata.pop(_START_TIME_KEY, None)
         # Use duration from metadata (stream) if available, otherwise calculate
         duration_ms = ctx.metadata.get("duration_ms")
         if duration_ms is None:
-            duration_ms = int((time.time() - start) * 1000)
+            start = raw_start if isinstance(raw_start, float) else time.monotonic()
+            duration_ms = int((time.monotonic() - start) * 1000)
 
         if self._trace:
             try:

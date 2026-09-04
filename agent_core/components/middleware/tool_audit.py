@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from typing import Any, Literal
 
 from agent_core.protocols import ExecutionMiddleware, ToolCallContext
@@ -20,10 +21,12 @@ from agent_core.protocols import ExecutionMiddleware, ToolCallContext
 logger = logging.getLogger(__name__)
 
 RiskLevel = Literal["block", "warn", "pass"]
+BashClassifier = Callable[[str], tuple[RiskLevel, str]]
 
 # ── Bash high-risk patterns ─────────────────────────────────────────────
 
 _BASH_BLOCK_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\brm\b[^\n]*(?:--no-preserve-root)"), "rm --no-preserve-root"),
     (re.compile(r"\brm\s+(-[rf]+\s+)?/"), "rm on root path"),
     (re.compile(r"\brm\s+-rf\b"), "rm -rf"),
     (re.compile(r"\bmkfs\b"), "mkfs (format disk)"),
@@ -63,9 +66,14 @@ class ToolAuditMiddleware(ExecutionMiddleware):
         self,
         block_high_risk_bash: bool = True,
         audit_log_enabled: bool = True,
+        bash_classifier: BashClassifier | None = None,
     ) -> None:
         self._block_bash = block_high_risk_bash
         self._audit_enabled = audit_log_enabled
+        # Shell safety is host-specific: filesystem allowlists, sandboxing and
+        # command parsing belong to the host. The built-in classifier remains a
+        # conservative defense-in-depth fallback, not a security boundary.
+        self._bash_classifier = bash_classifier
 
     async def before_tool_call(
         self, ctx: ToolCallContext,
@@ -126,6 +134,24 @@ class ToolAuditMiddleware(ExecutionMiddleware):
         """Classify bash command risk."""
         cmd_lower = command.lower().strip()
 
+        if self._bash_classifier is not None:
+            return self._bash_classifier(command)
+
+        # Match recursive+force deletion even when flags are split, reordered,
+        # or written in long form. The old ``rm -rf`` literal check let obvious
+        # equivalents such as ``rm -r -f --no-preserve-root /`` pass.
+        if re.search(r"\brm\b", cmd_lower):
+            has_recursive = bool(
+                re.search(r"(?:^|\s)--recursive(?:\s|=|$)", cmd_lower)
+                or re.search(r"(?:^|\s)-[a-z]*r[a-z]*(?:\s|$)", cmd_lower)
+            )
+            has_force = bool(
+                re.search(r"(?:^|\s)--force(?:\s|=|$)", cmd_lower)
+                or re.search(r"(?:^|\s)-[a-z]*f[a-z]*(?:\s|$)", cmd_lower)
+            )
+            if has_recursive and has_force:
+                return "block", "high-risk bash: rm recursive+force"
+
         for pattern, reason in _BASH_BLOCK_PATTERNS:
             if pattern.search(cmd_lower):
                 return "block", f"high-risk bash: {reason}"
@@ -173,3 +199,6 @@ def _truncate_args(args: dict[str, Any], max_len: int = 100) -> str:
     """Truncate tool args for logging."""
     s = str(args)
     return s[:max_len] + "..." if len(s) > max_len else s
+
+
+__all__ = ["BashClassifier", "RiskLevel", "ToolAuditMiddleware"]

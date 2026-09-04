@@ -43,6 +43,16 @@ class TokenAccountingMiddleware(LLMMiddleware):
         scene: str = "",
         usage_aggregator: Any = None,
     ) -> None:
+        raw_cost_sink: object = cost_sink
+        if (
+            cost_persister is not None
+            and cost_sink is not None
+            and not isinstance(raw_cost_sink, CostSink)
+        ):
+            raise TypeError(
+                "cost_sink must implement CostSink.record and CostSink.get_summary "
+                "when cost_persister is configured"
+            )
         self._event_store = event_store
         # Per-task cumulative counters: task_id → {input, output, total, llm_calls}
         self._usage: dict[str, dict[str, int]] = {}
@@ -272,15 +282,12 @@ class TokenAccountingMiddleware(LLMMiddleware):
         a database that is down must not fail the task whose cost it describes.
         The traceback is kept at debug level.
         """
-        if not self._cost_tracker or self._cost_persister is None:
+        if self._cost_tracker is None or self._cost_persister is None:
             return
         try:
-            get_summary = getattr(self._cost_tracker, "get_summary", None)
-            if get_summary is None:
-                return
             await self._cost_persister.persist(
                 task_id,
-                get_summary(task_id),
+                self._cost_tracker.get_summary(task_id),
                 self._primary_model.get(task_id, ""),
             )
         except Exception:

@@ -23,6 +23,7 @@ from agent_core.components.middleware.llm.token_accounting import (
 from agent_core.components.middleware.llm.tracing import LLMTracingMiddleware
 from agent_core.llm import LLMResponse
 from agent_core.messages import user_msg
+from agent_core.protocols import CostSink
 
 # ── LLMRetryMiddleware ───────────────────────────────────────────────────
 
@@ -196,6 +197,18 @@ async def test_tracing_without_a_backend_is_a_no_op() -> None:
     assert await mw.after_llm(ctx, response) is response
 
 
+@pytest.mark.asyncio
+async def test_tracing_retains_no_instance_state_when_chat_fails() -> None:
+    """A terminal chat error must not leave a timer on the shared middleware."""
+    mw = LLMTracingMiddleware()
+    ctx = LLMCallContext(task_id="t1")
+
+    await mw.before_llm(ctx, [user_msg("hi")])
+
+    assert set(vars(mw)) == {"_trace"}
+    assert any(key.startswith("_llm_tracing_start") for key in ctx.metadata)
+
+
 # ── TokenAccountingMiddleware.persist_cost / CostPersister ───────────────
 
 
@@ -281,8 +294,8 @@ async def test_persist_cost_swallows_a_failing_persister() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_cost_skips_a_sink_that_cannot_summarise() -> None:
-    """``get_summary`` is beyond the ``CostSink`` Protocol, so it may be absent."""
+async def test_persist_cost_rejects_a_sink_that_cannot_summarise() -> None:
+    """Configuring persistence with an incomplete sink must fail loudly."""
 
     class _RecordOnly:
         def record(
@@ -295,9 +308,9 @@ async def test_persist_cost_skips_a_sink_that_cannot_summarise() -> None:
             return 0.0
 
     persister = _Persister()
-    mw = TokenAccountingMiddleware(
-        cost_sink=_RecordOnly(), cost_persister=persister,
-    )
-    await mw.persist_cost("task-7")
-
-    assert persister.persisted == []
+    assert not isinstance(_RecordOnly(), CostSink)
+    with pytest.raises(TypeError, match=r"CostSink\.get_summary"):
+        TokenAccountingMiddleware(
+            cost_sink=_RecordOnly(),  # type: ignore[arg-type]
+            cost_persister=persister,
+        )

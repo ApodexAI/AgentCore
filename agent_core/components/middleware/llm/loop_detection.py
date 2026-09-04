@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 
 from agent_core.components.middleware.llm.base import (
     LLMCallContext,
@@ -22,11 +22,23 @@ class LoopDetectionMiddleware(LLMMiddleware):
     asking the LLM to try a different approach.
     """
 
-    def __init__(self, pattern_window: int = 10, trigger_count: int = 3) -> None:
+    def __init__(
+        self,
+        pattern_window: int = 10,
+        trigger_count: int = 3,
+        max_scopes: int = 1024,
+    ) -> None:
+        if pattern_window <= 0:
+            raise ValueError("pattern_window must be positive")
+        if trigger_count <= 0:
+            raise ValueError("trigger_count must be positive")
+        if max_scopes <= 0:
+            raise ValueError("max_scopes must be positive")
         self._window = pattern_window
         self._trigger = trigger_count
-        self._history: deque[str] = deque(maxlen=pattern_window)
-        self._injected: bool = False
+        self._max_scopes = max_scopes
+        self._histories: OrderedDict[tuple[str, str, str], deque[str]] = OrderedDict()
+        self._pending_hints: set[tuple[str, str, str]] = set()
 
     @property
     def name(self) -> str:
@@ -44,22 +56,48 @@ class LoopDetectionMiddleware(LLMMiddleware):
             return None
         sig = "|".join(
             f"{(tc.get('function') or {}).get('name', '')}:"
-            f"{hashlib.md5(str((tc.get('function') or {}).get('arguments', '')).encode()).hexdigest()[:8]}"
+            f"{hashlib.md5(str((tc.get('function') or {}).get('arguments', '')).encode(), usedforsecurity=False).hexdigest()[:8]}"
             for tc in tool_calls
         )
         return sig
 
+    @staticmethod
+    def _scope_key(ctx: LLMCallContext) -> tuple[str, str, str] | None:
+        """Return a stable per-conversation key, or None when none exists."""
+        task_or_session = ctx.task_id or str(ctx.metadata.get("session_id") or "")
+        if not task_or_session:
+            # Sharing anonymous history is worse than disabling the heuristic:
+            # it would let unrelated callers contaminate one another.
+            return None
+        return task_or_session, ctx.role_id, ctx.phase_id
+
+    def _history_for(self, key: tuple[str, str, str]) -> deque[str]:
+        history = self._histories.get(key)
+        if history is None:
+            history = deque[str](maxlen=self._window)
+            self._histories[key] = history
+            if len(self._histories) > self._max_scopes:
+                evicted, _ = self._histories.popitem(last=False)
+                self._pending_hints.discard(evicted)
+        else:
+            self._histories.move_to_end(key)
+        return history
+
     async def after_llm(
         self, ctx: LLMCallContext, response: LLMResponse
     ) -> LLMResponse:
+        key = self._scope_key(ctx)
+        if key is None:
+            return response
         sig = self._hash_tool_calls(response)
         if sig:
-            self._history.append(sig)
+            history = self._history_for(key)
+            history.append(sig)
             # Check for consecutive repetition
-            if len(self._history) >= self._trigger:
-                recent = list(self._history)[-self._trigger:]
+            if len(history) >= self._trigger:
+                recent = list(history)[-self._trigger:]
                 if len(set(recent)) == 1:
-                    self._injected = True
+                    self._pending_hints.add(key)
                     logger.warning(
                         "LoopDetectionMiddleware: detected %d consecutive identical tool calls: %s",
                         self._trigger, sig,
@@ -69,9 +107,12 @@ class LoopDetectionMiddleware(LLMMiddleware):
     async def before_llm(
         self, ctx: LLMCallContext, messages: list[Message]
     ) -> list[Message]:
-        if self._injected:
-            self._injected = False
-            self._history.clear()
+        key = self._scope_key(ctx)
+        if key is not None and key in self._pending_hints:
+            self._pending_hints.discard(key)
+            history = self._histories.get(key)
+            if history is not None:
+                history.clear()
             hint_text = (
                 "\n\n[Loop detected] You have been repeating the same "
                 "tool calls. Please try a different approach: use "
@@ -90,3 +131,10 @@ class LoopDetectionMiddleware(LLMMiddleware):
             # No system message found — prepend as a system message
             return [system_msg(hint_text.strip()), *messages]
         return messages
+
+    def cleanup_task(self, task_id: str) -> None:
+        """Release all loop-detection state retained for ``task_id``."""
+        keys = [key for key in self._histories if key[0] == task_id]
+        for key in keys:
+            self._histories.pop(key, None)
+            self._pending_hints.discard(key)
