@@ -18,6 +18,7 @@ from agent_core.runtime.loop.compact import (
     OMITTED_TOOL_RESULT_PLACEHOLDER,
     KeepLastNToolResultsCompactor,
     _args_preview,
+    default_recovery_footer,
 )
 
 
@@ -218,3 +219,85 @@ def test_loop_cap_handle_is_used_when_no_spill_ref_is_pinned():
     )
     tool_out = next(m for m in out if m.get("role") == "tool")
     assert tool_out["spill_refs"] == ["/spill/loop-cap"]
+
+
+# --- the recovery footer hook ----------------------------------------------
+
+
+def test_the_default_footer_names_no_tool():
+    """A card is the whole message, so a wrong tool name here has no antidote.
+
+    This module cannot know what a host calls its recovery tool, or whether that
+    tool is bound for the agent whose history this is. Carrying only the handle
+    is the one rendering that is correct in every host, which is why it is the
+    default rather than a guess at the common case.
+    """
+    body = "see https://example.com/a " + "x" * 2_000
+    content = _blanked(
+        _one_call("web_search", '{"query": "x"}', body),
+        spill=lambda _n, _c: "/spill/xyz",
+    )
+    assert content.splitlines()[-1] == default_recovery_footer("/spill/xyz")
+    assert "recover" not in content.splitlines()[-1].lower()
+
+
+def test_a_host_footer_replaces_the_last_line_and_nothing_else():
+    body = "see https://example.com/a " + "x" * 2_000
+    messages = _one_call("web_search", '{"query": "x"}', body)
+    default = _blanked(messages, spill=lambda _n, _c: "/spill/xyz")
+    hosted = _blanked(
+        messages,
+        spill=lambda _n, _c: "/spill/xyz",
+        recovery_footer=lambda ref: f"[Saved. Fetch it with fetch_body id {ref}.]",
+    )
+
+    assert hosted.splitlines()[-1] == "[Saved. Fetch it with fetch_body id /spill/xyz.]"
+    # The card above the footer — call line and source URLs — is untouched, so a
+    # host swapping the footer cannot silently change the card's token budget.
+    assert hosted.splitlines()[:-1] == default.splitlines()[:-1]
+
+
+def test_a_host_footer_still_reaches_the_model_only_when_a_body_spilled():
+    """No handle, no footer — a host renderer must not invent one.
+
+    The card is emitted for unspilled bodies too (that is the whole point of the
+    args + URLs lines). Calling the footer there would have it render a pointer
+    to nothing.
+    """
+    calls: list[str] = []
+
+    def footer(ref: str) -> str:
+        calls.append(ref)
+        return f"[Saved: {ref}]"
+
+    content = _blanked(
+        _one_call("web_search", '{"query": "x"}', "see https://example.com/a " + "x" * 2_000),
+        recovery_footer=footer,
+    )
+    assert calls == []
+    assert "[Saved:" not in content
+
+
+def test_a_host_footer_survives_a_second_pass_unnested():
+    """Idempotency is anchored on the placeholder, not the footer's wording.
+
+    A host footer is free to be longer than the default, which is exactly the
+    case where a second pass re-carding the message would compound. The
+    already-placeheld check has to catch it regardless of what the last line says.
+    """
+    body = "see https://example.com/a " + "x" * 2_000
+    messages = _one_call("web_search", '{"query": "x"}', body)
+    compactor = KeepLastNToolResultsCompactor(
+        keep_tool_result=0,
+        spill=lambda _n, _c: "/spill/xyz",
+        recovery_footer=lambda ref: (
+            "[Full text saved. Recovery id: " + ref + " — use the recover_result tool "
+            "(a tool call, not a shell command) with that spill id.]"
+        ),
+    )
+    once = compactor.compact(messages, 0)
+    twice = compactor.compact(once, 0)
+    first = next(m["content"] for m in once if m.get("role") == "tool")
+    second = next(m["content"] for m in twice if m.get("role") == "tool")
+    assert first == second
+    assert second.count("Recovery id:") == 1
