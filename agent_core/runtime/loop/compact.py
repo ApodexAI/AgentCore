@@ -30,6 +30,7 @@ __all__ = [
     "StringSliceCompactor",
     "compact_messages",
     "compress_tool_results",
+    "default_recovery_footer",
     "estimate_tokens",
     "partition_for_compaction",
     "tool_names_by_call_id",
@@ -76,6 +77,28 @@ _LEGACY_OMITTED_TOOL_RESULT_PLACEHOLDERS = ("Tool result is omitted to save toke
 
 URL_RE = re.compile(r'https?://[^\s\)>"\'<]+')
 _TOOL_RESULT_COMPACT_MAX_CHARS = 1_200
+
+
+def default_recovery_footer(spill_path: str) -> str:
+    """Render the last line of a mini card: the handle that fetches the body back.
+
+    Deliberately says nothing about HOW to fetch it. A host's recovery tool is
+    the host's own — it may be named anything, take different arguments, or not
+    be bound for this agent at all — and a footer naming a tool the agent cannot
+    call is worse than no footer (see ``_spill_footer``, which gates its own
+    prose on the tool being in the tool map for exactly that reason). This
+    default therefore carries only the handle, which is correct everywhere.
+
+    Hosts that DO bind a recovery tool, and know it is bound for this agent,
+    should pass ``recovery_footer`` to say so in prose: a card is the only thing
+    left on the message, so unlike ``_spill_footer``'s site there is no
+    surviving instruction next to it telling the model what the handle is for.
+    Write that prose as prose. ``recover_result(spill_id="...")`` renders to the
+    model as source code, and it responds in kind — on a live run it reproduced
+    such a footer inside a ```bash block instead of emitting a tool call, and
+    ``LeakedToolCallRetryObserver`` fired twice.
+    """
+    return f"[Full text] {spill_path}"
 
 # Header of the spill recovery index. This is presentation only — the text the
 # MODEL reads above the paths — since the index is identified by
@@ -574,6 +597,11 @@ class KeepLastNToolResultsCompactor:
 
     ``keep_tool_result == -1`` disables filtering entirely.
 
+    ``recovery_footer`` renders that last line. The default carries the handle
+    and nothing else, because this module cannot know what a host's recovery tool
+    is called or whether it is bound; a host that does know should pass prose
+    naming it. See :func:`default_recovery_footer`.
+
     Caveat: only ``ToolMessage`` content is redacted. Workflows that
     inject large content as ``HumanMessage`` (e.g. an observer that
     splices fan-in reports between turns) bypass this compactor; pair
@@ -586,6 +614,7 @@ class KeepLastNToolResultsCompactor:
         keep_tool_result: int,
         protect_tool_names: frozenset[str] = frozenset(),
         spill: Callable[[str, str], str | None] | None = None,
+        recovery_footer: Callable[[str], str] = default_recovery_footer,
     ) -> None:
         if keep_tool_result < -1:
             raise ValueError(f"keep_tool_result must be >= -1 (got {keep_tool_result})")
@@ -597,6 +626,7 @@ class KeepLastNToolResultsCompactor:
         # age only, so existing callers are unaffected.
         self._protect = frozenset(protect_tool_names)
         self._spill = spill
+        self._recovery_footer = recovery_footer
 
     def compact(
         self,
@@ -655,7 +685,7 @@ class KeepLastNToolResultsCompactor:
             if card:
                 placeholder += "\n" + card
             if spill_path:
-                placeholder += f"\n[Full text] {spill_path}"
+                placeholder += "\n" + self._recovery_footer(spill_path)
             # Without a pointer, replacing the body DESTROYS it, so a card that
             # is not even shorter is a pure loss and we keep the body. With one
             # we always replace, even when the card is longer: the pointer only

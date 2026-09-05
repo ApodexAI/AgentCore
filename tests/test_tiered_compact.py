@@ -15,6 +15,7 @@ from agent_core.runtime.loop.compact import (
     OMITTED_TOOL_RESULT_PLACEHOLDER,
     SPILL_MANIFEST_HEADER,
     KeepLastNToolResultsCompactor,
+    default_recovery_footer,
     estimate_tokens,
 )
 from agent_core.runtime.loop.tiered_compact import (
@@ -268,3 +269,56 @@ def test_overlong_handle_removes_an_old_index_without_inserting_an_empty_one():
         for m in twice
     )
     assert not any(SPILL_MANIFEST_HEADER in str(m.get("content")) for m in twice)
+
+
+def test_tiered_forwards_the_recovery_footer_to_its_tier1():
+    """A host that worded the footer must not get two wordings in one run.
+
+    Tier 1 is a winning candidate in its own right, so its card reaches the model
+    from inside ``TieredCompactor`` exactly as it does from the standalone
+    compactor. If this constructor swallowed ``recovery_footer``, a workflow whose
+    primary path is tiered and whose fallback path is standalone would render the
+    handle-only default on every production turn and the host's prose only in the
+    fallback — the harder failure to notice of the two.
+    """
+    async def run():
+        footer = lambda ref: f"[Saved. Ask fetch_body for {ref}.]"  # noqa: E731
+        tiered = TieredCompactor(
+            keep_tool_result=1,
+            summary_llm=_FakeLLM(),
+            relief_target=10**9,
+            spill=lambda _n, _c: "/spill/xyz",
+            recovery_footer=footer,
+        )
+        out = await tiered.compact(_msgs(), 1)
+        carded = [
+            m.get("content") or ""
+            for m in out
+            if (m.get("content") or "").startswith(OMITTED_TOOL_RESULT_PLACEHOLDER)
+        ]
+        assert carded, "expected Tier 1 to card at least one tool body"
+        for content in carded:
+            assert content.splitlines()[-1] == "[Saved. Ask fetch_body for /spill/xyz.]"
+
+    asyncio.run(run())
+
+
+def test_tiered_default_footer_is_unchanged():
+    async def run():
+        tiered = TieredCompactor(
+            keep_tool_result=1,
+            summary_llm=_FakeLLM(),
+            relief_target=10**9,
+            spill=lambda _n, _c: "/spill/xyz",
+        )
+        out = await tiered.compact(_msgs(), 1)
+        carded = [
+            m.get("content") or ""
+            for m in out
+            if (m.get("content") or "").startswith(OMITTED_TOOL_RESULT_PLACEHOLDER)
+        ]
+        assert carded
+        for content in carded:
+            assert content.splitlines()[-1] == default_recovery_footer("/spill/xyz")
+
+    asyncio.run(run())

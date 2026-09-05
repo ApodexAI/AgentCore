@@ -18,6 +18,7 @@ from agent_core.runtime.loop.compact import (
     INPUT_ESTIMATE_KEY,
     KeepLastNToolResultsCompactor,
     compress_tool_results,
+    default_recovery_footer,
     estimate_tokens,
     tool_names_by_call_id,
 )
@@ -215,6 +216,7 @@ class TieredCompactor:
         summary_retries: int = 2,
         summary_retry_timeout_s: float | None = None,
         prompt_builder: SummaryPromptBuilder = compaction_prompt,
+        recovery_footer: Callable[[str], str] = default_recovery_footer,
         manifest_max_paths: int | None = _SPILL_MANIFEST_MAX_PATHS,
         manifest_max_chars: int | None = _SPILL_MANIFEST_MAX_CHARS,
     ) -> None:
@@ -233,10 +235,16 @@ class TieredCompactor:
         spill_callback = spill or (
             spill_store.spill_compacted_body if spill_store is not None else None
         )
+        # Forwarded, not defaulted here: Tier 1's card is the ONLY thing left on
+        # a message it rewrites, and Tier 1 is a winning candidate in its own
+        # right (``best_label == "tier1"``), so a host that worded the footer for
+        # the standalone compactor must get the same wording through this one or
+        # the same run renders two different footers.
         self._tier1 = KeepLastNToolResultsCompactor(
             keep_tool_result=keep_tool_result,
             protect_tool_names=protect_tool_names,
             spill=spill_callback,
+            recovery_footer=recovery_footer,
         )
         # Tier 1 is not the only candidate that can win, and the others rewrite
         # the SAME protected results — which Tier 1 also keeps out of its spill

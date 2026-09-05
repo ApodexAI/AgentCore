@@ -7,6 +7,46 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.8.0] - 2026-09-05
+
+### Added
+
+- `KeepLastNToolResultsCompactor` takes a `recovery_footer` callable that renders
+  the last line of a Tier 1 mini card — the handle that fetches the discarded body
+  back. The default, `default_recovery_footer`, is the existing
+  `[Full text] <handle>`, so no consumer changes behaviour by upgrading.
+
+  Rationale: a Tier 1 card *replaces* the whole tool message, so unlike the
+  loop's own truncation footer (`_spill_footer`, which appends to a surviving
+  body) there is nothing left beside the handle to tell the model what it is for.
+  On a Tier1-only turn — Tier 2 fires only when Tier 1 did not free enough — the
+  model therefore sees bare handles and is never told they are recoverable at all.
+
+  The default cannot fix that itself: this module knows neither what a host calls
+  its recovery tool nor whether that tool is bound for the agent whose history it
+  is compacting, and a footer naming a tool the agent cannot call is worse than no
+  footer (the same reason `_spill_footer` gates its prose on the tool map). A host
+  that does know both should pass `recovery_footer`.
+
+  Write host prose as prose. `recover_result(spill_id="...")` renders to the model
+  as source code and it answers in kind: on a live run a model reproduced such a
+  footer inside a ```bash block instead of emitting a tool call, and
+  `LeakedToolCallRetryObserver` fired twice. Name the tool and its argument in
+  words.
+
+  Idempotency is unaffected — the already-carded check keys on
+  `OMITTED_TOOL_RESULT_PLACEHOLDER`, not on the footer's wording — and the footer
+  is called only when a body actually spilled, so a host renderer is never asked
+  to point at nothing.
+
+- `TieredCompactor` takes and forwards the same `recovery_footer` to the Tier 1
+  compactor it builds internally. Tier 1 is a winning candidate in its own right,
+  so its card reaches the model from the tiered path exactly as from the
+  standalone one. Without the forward, a workflow whose primary path is tiered and
+  whose fallback is standalone would render the handle-only default on every
+  production turn and the host's prose only in the fallback — the harder of the
+  two failures to notice.
+
 ## [0.7.0] - 2026-09-04
 
 ### Changed
