@@ -7,6 +7,42 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.8.1] - 2026-09-05
+
+### Fixed
+
+- `runtime/loop/tokenizer.py` no longer runs `import tiktoken` on the daemon
+  thread it spawns. The import is hoisted to the calling thread; only
+  `tiktoken.get_encoding()` stays on the thread. An `atexit` hook now joins an
+  in-flight load (1 s cap), following `providers/nonblocking_stream.py`.
+
+  Rationale: `tiktoken._tiktoken` is a Rust extension, so the import `dlopen`s a
+  shared object, and CPython kills daemon threads mid-flight at finalization
+  (`pthread_exit` at the next GIL acquisition). Killed inside the dynamic linker
+  that is not survivable — losing glibc's `_dl_load_lock` surfaces as a later
+  SIGSEGV, unwinding through a Rust / `extern "C"` frame calls `abort()`. A
+  2026-09-05 investigation in ApodexHarness found the thread parked inside that
+  import at interpreter exit on *every* short run (the import takes 24-29 ms and
+  the first `get_encoding_nonblocking()` call lands late in a run), with two
+  observed deaths *after* a fully correct protocol stream: `-11` in
+  `test_stateless_across_invocations`, `-6` in `test_serve_subprocess_e2e`. The
+  window is wider wherever `TIKTOKEN_CACHE_DIR` is unset, because the load then
+  takes the no-timeout network path.
+
+  The module's loop-protection intent is unchanged: what it defends against is a
+  minutes-long, no-timeout HTTP fetch inside `get_encoding()`, and that is still
+  on the daemon thread. The import is local and needs no network.
+
+### Consumer action
+
+None required — `get_encoding_nonblocking()` keeps its signature and its
+contract (returns `None` while loading; callers still fall back to a heuristic).
+One timing difference worth knowing: the *first* call for an encoding name now
+spends 24-29 ms importing tiktoken on the calling thread, where before it
+returned instantly. In exchange the encoder becomes available sooner, which
+shortens the heuristic-fallback window `tokens.py` documents as the opening
+turns of every process.
+
 ## [0.8.0] - 2026-09-05
 
 ### Added
