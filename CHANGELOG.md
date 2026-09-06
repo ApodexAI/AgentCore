@@ -7,7 +7,7 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
-## [0.9.0] - 2026-09-06
+## [0.8.2] - 2026-09-06
 
 ### Changed
 
