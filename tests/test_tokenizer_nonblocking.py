@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
+import re
 import sys
 import threading
 import types
@@ -353,3 +355,45 @@ def test_unrecognised_opt_in_values_keep_the_gate_closed(
     monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path / "gone"))
     monkeypatch.setenv("AGENT_CORE_TIKTOKEN_FETCH", value)
     assert tokenizer._network_fetch_allowed() is False
+
+
+def test_pinned_cache_metadata_matches_tiktokens_own_declaration() -> None:
+    """The pinned cache key and content hash must be tiktoken's actual ones.
+
+    ``_CACHE_SPECS`` is otherwise unfalsifiable. Every test above monkeypatches
+    it and writes a payload whose hash it just computed, so a typo in either
+    constant — or a tiktoken release that re-publishes a vocab — leaves the gate
+    permanently closed with nothing going red. That failure is silent by
+    construction: exact token counts become heuristic ones and the one WARNING
+    blames the host's cache for a directory that is in fact correctly warmed.
+
+    Read the truth out of ``tiktoken_ext.openai_public`` *without* calling the
+    constructor, because calling it is the fetch this whole module exists to
+    avoid. The cache key is ``sha1(blobpath)`` (tiktoken's ``read_file_cached``)
+    and the content hash is the ``expected_hash`` its loader validates against.
+    """
+    pub = pytest.importorskip(
+        "tiktoken_ext.openai_public",
+        reason="tiktoken is the optional `tokenizer` extra; install it to check these pins",
+    )
+    for name, (cache_key, expected_hash) in tokenizer._CACHE_SPECS.items():
+        constructor = getattr(pub, name, None)
+        assert constructor is not None, (
+            f"tiktoken no longer defines a {name!r} constructor, so _CACHE_SPECS pins a "
+            "vocab upstream does not publish under that name"
+        )
+        source = inspect.getsource(constructor)
+        blobpath = re.search(r'"(https://\S+?\.tiktoken)"', source)
+        declared = re.search(r'expected_hash\s*=\s*"([0-9a-f]{64})"', source)
+        assert blobpath and declared, (
+            f"cannot read {name!r}'s blobpath and expected_hash out of tiktoken's source; "
+            "its shape changed, so verify _CACHE_SPECS by hand and repair this test"
+        )
+        assert hashlib.sha1(blobpath.group(1).encode()).hexdigest() == cache_key, (
+            f"{name!r} cache key is stale: tiktoken caches {blobpath.group(1)} under a "
+            "different name now, so the gate can never find a warm cache"
+        )
+        assert declared.group(1) == expected_hash, (
+            f"{name!r} content hash is stale: tiktoken expects {declared.group(1)}, so a "
+            "correctly warmed cache reads as invalid and exact counts stay off"
+        )

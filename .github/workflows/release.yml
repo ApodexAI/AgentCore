@@ -34,6 +34,12 @@ jobs:
       - run: uv run ruff check agent_core tests scripts
       - run: uv run pyright agent_core
       - run: uv run pytest -q
+      # The gate pins tiktoken's own cache key and content hash, and only a real
+      # tiktoken can falsify them. It is NOT added to the shared environment: the
+      # rest of the suite is calibrated against the heuristic estimator, so an
+      # importable tiktoken changes the token maths in test_agent_loop_engine.py.
+      # An overlay gives this one check the dependency it needs and nothing else.
+      - run: uv run --frozen --extra dev --with tiktoken pytest -q tests/test_tokenizer_nonblocking.py::test_pinned_cache_metadata_matches_tiktokens_own_declaration
       - run: uv build
 
       # A PyPI version number can never be reused, not even after deleting the
