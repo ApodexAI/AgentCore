@@ -37,12 +37,33 @@ Belt and braces: an ``atexit`` hook joins any in-flight init, following
 ``providers/nonblocking_stream.py``. CPython runs ``atexit`` callbacks
 before it starts killing daemon threads, so that is the last point at
 which the load can be drained cleanly.
+
+That join has a 1 s budget, which covers a cache *hit* (~140 ms) and
+nothing else. On a cache **miss** ``get_encoding`` does an unbounded
+``requests.get`` (tiktoken's ``load.py`` passes no timeout) plus a BPE
+parse, so it is still mid-flight when the budget expires and the thread
+is killed anyway — no longer inside the dynamic linker, but plausibly
+inside ``malloc``. Reproduced 2026-09-06 on
+``test_serve_subprocess_e2e``: with the vocab cache guaranteed empty,
+1 of 90 runs died with ``double free or corruption (fasttop)`` and
+``-6`` after a fully correct protocol stream, while 60/60 warm runs and
+400 warm/blocked-egress micro-probes were clean. So the previous fix
+covered only the warm half.
+
+Hence the third layer: when a load could only be served over the
+network — no cache directory, or an empty one — no thread is started at
+all and the name stays on the chars/4 heuristic. There is then nothing
+to kill, at the cost of approximate token counts on a host that never
+warmed the cache. A host that wants the fetch anyway sets
+``AGENT_CORE_TIKTOKEN_FETCH=1`` and accepts the window.
 """
 
 from __future__ import annotations
 
 import atexit
 import logging
+import os
+import tempfile
 import threading
 import time
 from typing import Any
@@ -72,6 +93,52 @@ _atexit_registered = False
 # touches the dynamic linker, which is what made the mid-flight kill
 # dangerous in the first place.
 _JOIN_TIMEOUT_S = 1.0
+
+# Opt back in to the unbounded network fetch (and its exit-time window).
+_FETCH_ENV = "AGENT_CORE_TIKTOKEN_FETCH"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# The "no cache, staying on the heuristic" warning is worth saying once.
+_warned_uncached = False
+
+
+def _cache_dir() -> str:
+    """Where tiktoken would look for a cached vocab.
+
+    Mirrors ``tiktoken.load.read_file_cached``: ``TIKTOKEN_CACHE_DIR``,
+    else ``DATA_GYM_CACHE_DIR``, else ``<tmp>/data-gym-cache``. An empty
+    string is tiktoken's way of disabling the cache entirely.
+    """
+    for var in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR"):
+        value = os.environ.get(var)
+        if value is not None:
+            return value
+    return os.path.join(tempfile.gettempdir(), "data-gym-cache")
+
+
+def _fetch_is_certain() -> bool:
+    """True when a load could only be served over the network.
+
+    Deliberately coarse: tiktoken keys cache files by
+    ``sha1(blobpath)``, and the blobpath only exists inside the
+    constructor we are trying not to call, so this cannot ask about one
+    encoding. "The cache holds nothing at all" is the state that
+    actually occurs — a fresh checkout, an image built without the
+    warm-up, a test with ``TMPDIR`` pointed somewhere empty — and it is
+    answerable with one ``scandir``.
+    """
+    directory = _cache_dir()
+    if not directory:
+        return True
+    try:
+        with os.scandir(directory) as entries:
+            return not any(entry.is_file() for entry in entries)
+    except OSError:  # missing, or unreadable
+        return True
+
+
+def _network_fetch_allowed() -> bool:
+    return os.environ.get(_FETCH_ENV, "").strip().lower() in _TRUTHY
 
 
 def _join_pending() -> None:
@@ -110,14 +177,36 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
     local dlopen, no network), schedules the encoder init on a daemon
     thread and returns ``None``; later calls return the encoder once it
     has loaded, or ``None`` while it is still loading. Returns ``None``
-    permanently when tiktoken is unavailable — callers MUST fall back to
-    a heuristic on ``None``.
+    permanently when tiktoken is unavailable, and permanently when the
+    vocab cache is empty so the init could only be served by an
+    unbounded network fetch (``AGENT_CORE_TIKTOKEN_FETCH=1`` opts back
+    in) — callers MUST fall back to a heuristic on ``None``.
     """
-    global _atexit_registered
+    global _atexit_registered, _warned_uncached
 
     enc = _encoders.get(name, _MISSING)
     if enc is not _MISSING:
         return enc or None  # None (loading) and False (failed) both collapse to None
+
+    # A load that can only be served over the network is not worth a
+    # thread: it cannot finish inside the exit-time join budget, and
+    # being killed mid-fetch is what corrupts the heap.
+    if _fetch_is_certain() and not _network_fetch_allowed():
+        with _lock:
+            _encoders[name] = False
+        if not _warned_uncached:
+            _warned_uncached = True
+            logger.warning(
+                "tiktoken vocab cache %r is empty; token counts stay approximate "
+                "(chars/4). Warm it once with "
+                "`python -c 'import tiktoken; tiktoken.get_encoding(\"%s\")'` "
+                "(or bake TIKTOKEN_CACHE_DIR into the image); set %s=1 to fetch "
+                "it at runtime instead.",
+                _cache_dir(),
+                name,
+                _FETCH_ENV,
+            )
+        return None
 
     # On the caller thread, deliberately — never on the daemon thread.
     try:

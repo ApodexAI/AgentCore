@@ -7,6 +7,70 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.9.0] - 2026-09-06
+
+### Fixed
+
+- The tiktoken encoder init no longer starts a background load that can only be
+  served over the network. When the vocab cache holds nothing — no cache
+  directory, an empty one, or caching disabled with `TIKTOKEN_CACHE_DIR=""` — the
+  encoding is marked unavailable, one WARNING says how to fix it, and callers stay
+  on the chars/4 heuristic. No thread is started, so finalization has nothing to
+  kill.
+
+  0.8.1 moved `import tiktoken` to the caller thread and added a 1 s `atexit`
+  join. That budget covers a cache *hit* (~140 ms) and nothing else: on a miss
+  `get_encoding` does an unbounded `requests.get` (tiktoken's `load.py` passes no
+  timeout) plus a BPE parse, so the thread is still mid-flight when the budget
+  expires and gets `pthread_exit`ed anyway — out of the dynamic linker now, but
+  plausibly inside `malloc`. **The 0.8.1 fix covered only the warm half**, which
+  is exactly the half every CI job sees, because warming the cache is the standard
+  mitigation.
+
+  Reproduced 2026-09-06 in ApodexHarness, repeating the two `serve` protocol
+  tests with the cache guaranteed empty (`TMPDIR` redirected to a fresh directory
+  each iteration, `TIKTOKEN_CACHE_DIR` unset):
+
+  | arm | runs | negative exit codes |
+  |---|---|---|
+  | cold cache, `test_serve_subprocess_e2e` | 90 | **1** (`-6`) |
+  | cold cache, `test_stateless_across_invocations` | 30 | 0 |
+  | warm cache, both tests | 60 | 0 |
+  | warm cache, exit micro-probe | 200 | 0 |
+  | cold cache + unroutable proxy, micro-probe and both tests | 260 | 0 |
+
+  The death: `double free or corruption (fasttop)`, `serve exited -6`, after a
+  fully correct protocol stream — stdout was complete and valid, the process
+  simply did not survive its own exit. Two details worth keeping. The failure is
+  ~1%, so a passing run proves nothing and only repetition at a fixed cache state
+  measures anything. And blocking egress instead of emptying the cache does *not*
+  reproduce it: a thread parked in a TCP connect allocates nothing and dies
+  harmlessly, so the dangerous window is a fetch that is *succeeding* and parsing
+  — the opposite of what the wedge history would suggest.
+
+### Changed
+
+- **Consumer impact: a host that never warmed the tiktoken cache now gets
+  approximate token counts instead of exact ones**, where it previously got a
+  one-time runtime fetch that populated the cache for later processes. Anything
+  built from `docker/stateful-agent.Dockerfile` (or any image baking
+  `TIKTOKEN_CACHE_DIR`) is unaffected — that cache is warm, the load runs, counts
+  stay exact. Fresh checkouts, CI jobs without the warm-up step, and images built
+  without it change behaviour.
+
+  Two ways back to exact counts, in preference order: warm the cache once as a
+  build or setup step (`python -c "import tiktoken;
+  tiktoken.get_encoding('cl100k_base')"`), or set
+  `AGENT_CORE_TIKTOKEN_FETCH=1` to allow the runtime fetch and accept the
+  exit-time window it reopens.
+
+  The gate is deliberately coarse — it asks "is this cache empty?", not "is
+  *this* encoding cached". tiktoken keys cache files by `sha1(blobpath)` and the
+  blobpath only exists inside the constructor being avoided, so a per-encoding
+  answer would mean pinning a private URL table. The residual case is a cache
+  holding some other encoding but not the requested one: rare in practice, and it
+  still takes the old network path.
+
 ## [0.8.2] - 2026-09-06
 
 ### Changed

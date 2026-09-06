@@ -8,6 +8,15 @@ with it (later SIGSEGV) or unwinds through an ``extern "C"`` frame
 caller thread and only ``get_encoding`` on the daemon thread — these
 tests pin which thread runs which, and that the exit hook drains the
 load.
+
+The load itself is only started when the vocab cache can serve it. A
+cache miss means an unbounded fetch that outlives the exit-time join, so
+the thread gets killed mid-``malloc`` instead — reproduced as
+``double free or corruption (fasttop)`` / ``-6``. The gate around that,
+and its ``AGENT_CORE_TIKTOKEN_FETCH`` escape hatch, are pinned below.
+Every test therefore has to be explicit about the cache state; the
+fixture points ``TIKTOKEN_CACHE_DIR`` at a warm directory so the host's
+own ``/tmp`` cannot decide which branch runs.
 """
 
 from __future__ import annotations
@@ -54,11 +63,24 @@ class _RecordingLoader:
 
 
 @pytest.fixture
-def clean_tokenizer():
+def warm_cache_dir(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A vocab cache that looks populated, so the fetch gate lets loads run."""
+    cache = tmp_path / "data-gym-cache"
+    cache.mkdir()
+    (cache / "9b5ad71b2ce5302211f9c61530b329a4922fc6a4").write_bytes(b"ranks")
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(cache))
+    monkeypatch.delenv("AGENT_CORE_TIKTOKEN_FETCH", raising=False)
+    return cache
+
+
+@pytest.fixture
+def clean_tokenizer(warm_cache_dir):
     """Reset the module cache and unhook any real/fake tiktoken."""
     saved_module = sys.modules.pop("tiktoken", None)
     saved_meta = list(sys.meta_path)
     saved_atexit_registered = tokenizer._atexit_registered
+    saved_warned = tokenizer._warned_uncached
+    tokenizer._warned_uncached = False  # the warning is once-per-process
     tokenizer._encoders.clear()
     tokenizer._threads.clear()
     tokenizer._atexit_registered = True  # don't leak a real atexit hook per test
@@ -69,6 +91,7 @@ def clean_tokenizer():
         tokenizer._encoders.clear()
         tokenizer._threads.clear()
         tokenizer._atexit_registered = saved_atexit_registered
+        tokenizer._warned_uncached = saved_warned
         sys.meta_path[:] = saved_meta
         sys.modules.pop("tiktoken", None)
         if saved_module is not None:
@@ -191,3 +214,83 @@ def test_concurrent_callers_spawn_one_thread(clean_tokenizer) -> None:
         assert len(tokenizer._threads) == 1
     finally:
         gate.set()
+
+
+# -- the cold-cache fetch gate ------------------------------------------------
+
+
+def test_empty_cache_dir_stays_on_the_heuristic_and_spawns_no_thread(
+    clean_tokenizer, tmp_path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """No thread means nothing for finalization to kill mid-fetch."""
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(empty))
+
+    with caplog.at_level("WARNING", logger=tokenizer.logger.name):
+        assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+
+    assert tokenizer._threads == {}
+    assert loader.import_thread is None  # not even imported
+    assert tokenizer._encoders["cl100k_base"] is False  # terminal
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+    assert "TIKTOKEN_CACHE_DIR" in caplog.text
+    assert "AGENT_CORE_TIKTOKEN_FETCH" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "cache_dir",
+    ["", "does/not/exist"],
+    ids=["caching-disabled", "missing-directory"],
+)
+def test_fetch_is_certain_without_a_usable_cache(
+    clean_tokenizer, tmp_path, monkeypatch: pytest.MonkeyPatch, cache_dir: str
+) -> None:
+    target = "" if cache_dir == "" else str(tmp_path / cache_dir)
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", target)
+    assert tokenizer._fetch_is_certain() is True
+
+
+def test_populated_cache_lets_the_load_run(clean_tokenizer) -> None:
+    assert tokenizer._fetch_is_certain() is False
+
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+    tokenizer._join_pending()
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is loader.encoder
+
+
+def test_data_gym_cache_dir_is_the_second_choice(
+    clean_tokenizer, warm_cache_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TIKTOKEN_CACHE_DIR", raising=False)
+    monkeypatch.setenv("DATA_GYM_CACHE_DIR", str(warm_cache_dir))
+    assert tokenizer._cache_dir() == str(warm_cache_dir)
+    assert tokenizer._fetch_is_certain() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", " on "])
+def test_explicit_opt_in_restores_the_network_fetch(
+    clean_tokenizer, tmp_path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path / "gone"))
+    monkeypatch.setenv("AGENT_CORE_TIKTOKEN_FETCH", value)
+
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+    assert loader.import_thread == threading.current_thread().name
+    tokenizer._join_pending()
+    assert tokenizer._encoders["cl100k_base"] is loader.encoder
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no"])
+def test_unrecognised_opt_in_values_keep_the_gate_closed(
+    clean_tokenizer, tmp_path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path / "gone"))
+    monkeypatch.setenv("AGENT_CORE_TIKTOKEN_FETCH", value)
+    assert tokenizer._network_fetch_allowed() is False
