@@ -163,11 +163,11 @@ _tool_names_by_call_id = tool_names_by_call_id
 _MINI_CARD_ARGS_MAX_CHARS = 120
 _MINI_CARD_BODY_MAX_CHARS = 400
 # ONE url, not three. Measured over 12 real long-running trials of a research
-# agent (1337 carded results, 13.5k source URLs in the bodies being discarded):
+# agent (1295 carded results, 13.5k source URLs in the bodies being discarded):
 # keeping 3 URLs retained 16.5% of all URLs, but the quantity anything downstream
 # consumes is whether a retrieval left behind *one* traceable source — and the
 # first URL alone covers 769/775 (99.2%) of the carded results that had any URL.
-# Dropping to 1 took total retention to 7.8% and left that 99.2% unchanged, i.e.
+# Dropping to 1 took total retention to 8.9% and left that 99.2% unchanged, i.e.
 # the extra two URLs per card were spending ~120 chars each on a percentage with
 # no reader. A host that needs several independent sources per claim should raise
 # this deliberately rather than inherit it.
