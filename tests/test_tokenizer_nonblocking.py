@@ -21,6 +21,7 @@ own ``/tmp`` cannot decide which branch runs.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 import threading
@@ -64,10 +65,17 @@ class _RecordingLoader:
 
 @pytest.fixture
 def warm_cache_dir(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """A vocab cache that looks populated, so the fetch gate lets loads run."""
+    """A valid target vocab cache, so the fetch gate lets loads run."""
     cache = tmp_path / "data-gym-cache"
     cache.mkdir()
-    (cache / "9b5ad71b2ce5302211f9c61530b329a4922fc6a4").write_bytes(b"ranks")
+    cache_key, _ = tokenizer._CACHE_SPECS["cl100k_base"]
+    payload = b"ranks"
+    monkeypatch.setitem(
+        tokenizer._CACHE_SPECS,
+        "cl100k_base",
+        (cache_key, hashlib.sha256(payload).hexdigest()),
+    )
+    (cache / cache_key).write_bytes(payload)
     monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(cache))
     monkeypatch.delenv("AGENT_CORE_TIKTOKEN_FETCH", raising=False)
     return cache
@@ -245,16 +253,16 @@ def test_empty_cache_dir_stays_on_the_heuristic_and_spawns_no_thread(
     ["", "does/not/exist"],
     ids=["caching-disabled", "missing-directory"],
 )
-def test_fetch_is_certain_without_a_usable_cache(
+def test_cache_problem_without_a_usable_cache(
     clean_tokenizer, tmp_path, monkeypatch: pytest.MonkeyPatch, cache_dir: str
 ) -> None:
     target = "" if cache_dir == "" else str(tmp_path / cache_dir)
     monkeypatch.setenv("TIKTOKEN_CACHE_DIR", target)
-    assert tokenizer._fetch_is_certain() is True
+    assert tokenizer._cache_problem("cl100k_base") is not None
 
 
 def test_populated_cache_lets_the_load_run(clean_tokenizer) -> None:
-    assert tokenizer._fetch_is_certain() is False
+    assert tokenizer._cache_problem("cl100k_base") is None
 
     loader = _RecordingLoader()
     sys.meta_path.insert(0, loader)
@@ -263,13 +271,64 @@ def test_populated_cache_lets_the_load_run(clean_tokenizer) -> None:
     assert tokenizer.get_encoding_nonblocking("cl100k_base") is loader.encoder
 
 
+def test_unrelated_cache_file_spawns_no_thread(
+    clean_tokenizer, warm_cache_dir
+) -> None:
+    cache_key, _ = tokenizer._CACHE_SPECS["cl100k_base"]
+    (warm_cache_dir / cache_key).unlink()
+    (warm_cache_dir / "another-encoding").write_bytes(b"valid for something else")
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+
+    assert tokenizer._cache_problem("cl100k_base") is not None
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+    assert tokenizer._threads == {}
+    assert loader.import_thread is None
+
+
+def test_corrupt_target_cache_file_spawns_no_thread(
+    clean_tokenizer, warm_cache_dir
+) -> None:
+    cache_key, _ = tokenizer._CACHE_SPECS["cl100k_base"]
+    (warm_cache_dir / cache_key).write_bytes(b"corrupt")
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+
+    assert tokenizer._cache_problem("cl100k_base") is not None
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+    assert tokenizer._threads == {}
+    assert loader.import_thread is None
+
+
+def test_unknown_encoding_fails_closed(clean_tokenizer) -> None:
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+
+    assert tokenizer._cache_problem("future_encoding") is not None
+    assert tokenizer.get_encoding_nonblocking("future_encoding") is None
+    assert tokenizer._threads == {}
+    assert loader.import_thread is None
+
+
 def test_data_gym_cache_dir_is_the_second_choice(
     clean_tokenizer, warm_cache_dir, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TIKTOKEN_CACHE_DIR", raising=False)
     monkeypatch.setenv("DATA_GYM_CACHE_DIR", str(warm_cache_dir))
     assert tokenizer._cache_dir() == str(warm_cache_dir)
-    assert tokenizer._fetch_is_certain() is False
+    assert tokenizer._cache_problem("cl100k_base") is None
+
+
+def test_disabled_cache_warning_requires_a_writable_directory(
+    clean_tokenizer, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", "")
+
+    with caplog.at_level("WARNING", logger=tokenizer.logger.name):
+        assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+
+    assert "caching is disabled" in caplog.text
+    assert "writable directory" in caplog.text
 
 
 @pytest.mark.parametrize("value", ["1", "true", "YES", " on "])

@@ -11,12 +11,13 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 ### Fixed
 
-- The tiktoken encoder init no longer starts a background load that can only be
-  served over the network. When the vocab cache holds nothing — no cache
-  directory, an empty one, or caching disabled with `TIKTOKEN_CACHE_DIR=""` — the
-  encoding is marked unavailable, one WARNING says how to fix it, and callers stay
-  on the chars/4 heuristic. No thread is started, so finalization has nothing to
-  kill.
+- The tiktoken encoder init no longer starts a background load that may need the
+  network. The requested `cl100k_base` cache artifact must exist and pass
+  tiktoken's expected SHA-256; an empty directory, another encoding's cache, or a
+  corrupt target file therefore cannot reopen the unsafe fetch path. Otherwise
+  the encoding is marked unavailable, one WARNING says how to fix it, and callers
+  stay on the chars/4 heuristic. No thread is started, so finalization has nothing
+  to kill.
 
   0.8.1 moved `import tiktoken` to the caller thread and added a 1 s `atexit`
   join. That budget covers a cache *hit* (~140 ms) and nothing else: on a miss
@@ -62,7 +63,8 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   build or setup step (`python -c "import tiktoken;
   tiktoken.get_encoding('cl100k_base')"`), or set
   `AGENT_CORE_TIKTOKEN_FETCH=1` to allow the runtime fetch and accept the
-  exit-time window it reopens.
+  exit-time window it reopens. If `TIKTOKEN_CACHE_DIR=""` currently disables
+  caching, set it to a writable directory before running the warm-up command.
 
   **A consumer test that fakes `tiktoken` now takes the gate branch** if the real
   cache directory happens to be empty, because the gate looks at the filesystem
@@ -71,17 +73,17 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   branch with `TIKTOKEN_CACHE_DIR` pointed at an empty directory:
   `test_first_call_is_nonblocking_even_if_load_is_slow` installs a deliberately
   slow fake `get_encoding` and asserts the encoder eventually lands, which it now
-  never does. Such a test should pin `TIKTOKEN_CACHE_DIR` at a directory holding
-  any file (that is what the tests here do, via the `warm_cache_dir` fixture) or
-  set `AGENT_CORE_TIKTOKEN_FETCH=1`. Note the same suite is fully green with a
-  warm cache, so this is invisible until a host runs cold.
+  never does. Such a test should set `AGENT_CORE_TIKTOKEN_FETCH=1`; a placeholder
+  cache file is deliberately insufficient because production must not mistake it
+  for a usable vocabulary. Note the same suite is fully green with a valid warm
+  cache, so this is invisible until a host runs cold.
 
-  The gate is deliberately coarse — it asks "is this cache empty?", not "is
-  *this* encoding cached". tiktoken keys cache files by `sha1(blobpath)` and the
-  blobpath only exists inside the constructor being avoided, so a per-encoding
-  answer would mean pinning a private URL table. The residual case is a cache
-  holding some other encoding but not the requested one: rare in practice, and it
-  still takes the old network path.
+  The gate pins tiktoken's cache key and expected content hash for
+  `cl100k_base`, the only encoding AgentCore requests. Other encoding names fail
+  closed unless runtime fetching is explicitly enabled. If a future tiktoken
+  release changes its artifact, exact counts remain disabled rather than silently
+  reopening a network-capable daemon thread; update the pinned metadata as part of
+  that dependency upgrade.
 
 ## [0.8.2] - 2026-09-06
 

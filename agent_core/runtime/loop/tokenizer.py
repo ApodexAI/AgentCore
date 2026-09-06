@@ -50,17 +50,18 @@ inside ``malloc``. Reproduced 2026-09-06 on
 400 warm/blocked-egress micro-probes were clean. So the previous fix
 covered only the warm half.
 
-Hence the third layer: when a load could only be served over the
-network — no cache directory, or an empty one — no thread is started at
-all and the name stays on the chars/4 heuristic. There is then nothing
-to kill, at the cost of approximate token counts on a host that never
-warmed the cache. A host that wants the fetch anyway sets
-``AGENT_CORE_TIKTOKEN_FETCH=1`` and accepts the window.
+Hence the third layer: no thread is started unless the requested vocab's
+exact cache artifact exists and passes the hash tiktoken itself expects.
+An unrelated or corrupt cache file cannot accidentally reopen the fetch
+path. There is then nothing to kill, at the cost of approximate token
+counts on a host that never warmed the cache. A host that wants the
+fetch anyway sets ``AGENT_CORE_TIKTOKEN_FETCH=1`` and accepts the window.
 """
 
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import os
 import tempfile
@@ -98,7 +99,20 @@ _JOIN_TIMEOUT_S = 1.0
 _FETCH_ENV = "AGENT_CORE_TIKTOKEN_FETCH"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
-# The "no cache, staying on the heuristic" warning is worth saying once.
+# tiktoken caches the downloaded bytes under ``sha1(blobpath)`` and validates
+# them against the constructor's expected SHA-256 before parsing. All AgentCore
+# callers currently request cl100k_base. Keeping both values here lets us prove
+# that this exact load is local without invoking tiktoken's constructor (which
+# is the operation that may fetch). If tiktoken changes either value, this gate
+# fails closed until the table is updated.
+_CACHE_SPECS: dict[str, tuple[str, str]] = {
+    "cl100k_base": (
+        "9b5ad71b2ce5302211f9c61530b329a4922fc6a4",
+        "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+    ),
+}
+
+# The "no valid target cache, staying on the heuristic" warning is worth once.
 _warned_uncached = False
 
 
@@ -116,25 +130,26 @@ def _cache_dir() -> str:
     return os.path.join(tempfile.gettempdir(), "data-gym-cache")
 
 
-def _fetch_is_certain() -> bool:
-    """True when a load could only be served over the network.
-
-    Deliberately coarse: tiktoken keys cache files by
-    ``sha1(blobpath)``, and the blobpath only exists inside the
-    constructor we are trying not to call, so this cannot ask about one
-    encoding. "The cache holds nothing at all" is the state that
-    actually occurs — a fresh checkout, an image built without the
-    warm-up, a test with ``TMPDIR`` pointed somewhere empty — and it is
-    answerable with one ``scandir``.
-    """
+def _cache_problem(name: str) -> str | None:
+    """Why ``name`` cannot be proved to load locally, or ``None`` if it can."""
     directory = _cache_dir()
     if not directory:
-        return True
+        return "disabled"
+
+    spec = _CACHE_SPECS.get(name)
+    if spec is None:
+        return "unverified encoding"
+
+    cache_key, expected_hash = spec
+    path = os.path.join(directory, cache_key)
     try:
-        with os.scandir(directory) as entries:
-            return not any(entry.is_file() for entry in entries)
-    except OSError:  # missing, or unreadable
-        return True
+        with open(path, "rb") as cache_file:
+            actual_hash = hashlib.file_digest(cache_file, "sha256").hexdigest()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    return None if actual_hash == expected_hash else "invalid"
 
 
 def _network_fetch_allowed() -> bool:
@@ -178,9 +193,9 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
     thread and returns ``None``; later calls return the encoder once it
     has loaded, or ``None`` while it is still loading. Returns ``None``
     permanently when tiktoken is unavailable, and permanently when the
-    vocab cache is empty so the init could only be served by an
-    unbounded network fetch (``AGENT_CORE_TIKTOKEN_FETCH=1`` opts back
-    in) — callers MUST fall back to a heuristic on ``None``.
+    requested vocab has no valid cache artifact so the init could issue
+    an unbounded network fetch (``AGENT_CORE_TIKTOKEN_FETCH=1`` opts
+    back in) — callers MUST fall back to a heuristic on ``None``.
     """
     global _atexit_registered, _warned_uncached
 
@@ -191,21 +206,35 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
     # A load that can only be served over the network is not worth a
     # thread: it cannot finish inside the exit-time join budget, and
     # being killed mid-fetch is what corrupts the heap.
-    if _fetch_is_certain() and not _network_fetch_allowed():
+    cache_problem = _cache_problem(name)
+    if cache_problem is not None and not _network_fetch_allowed():
         with _lock:
             _encoders[name] = False
         if not _warned_uncached:
             _warned_uncached = True
-            logger.warning(
-                "tiktoken vocab cache %r is empty; token counts stay approximate "
-                "(chars/4). Warm it once with "
-                "`python -c 'import tiktoken; tiktoken.get_encoding(\"%s\")'` "
-                "(or bake TIKTOKEN_CACHE_DIR into the image); set %s=1 to fetch "
-                "it at runtime instead.",
-                _cache_dir(),
-                name,
-                _FETCH_ENV,
-            )
+            directory = _cache_dir()
+            if cache_problem == "disabled":
+                logger.warning(
+                    "tiktoken caching is disabled by TIKTOKEN_CACHE_DIR=''; "
+                    "token counts stay approximate (chars/4). Set "
+                    "TIKTOKEN_CACHE_DIR to a writable directory, warm %s there, "
+                    "or set %s=1 to fetch it at runtime.",
+                    name,
+                    _FETCH_ENV,
+                )
+            else:
+                logger.warning(
+                    "tiktoken vocab cache %r has no valid %s artifact (%s); "
+                    "token counts stay approximate (chars/4). Warm it once with "
+                    "`python -c 'import tiktoken; tiktoken.get_encoding(\"%s\")'` "
+                    "after ensuring TIKTOKEN_CACHE_DIR points to a readable and "
+                    "writable cache; set %s=1 to fetch it at runtime instead.",
+                    directory,
+                    name,
+                    cache_problem,
+                    name,
+                    _FETCH_ENV,
+                )
         return None
 
     # On the caller thread, deliberately — never on the daemon thread.
