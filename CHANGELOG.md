@@ -53,6 +53,14 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 ### Changed
 
+- `KeepLastNToolResultsCompactor(max_card_urls=...)` now exposes the Tier 1 mini
+  card's per-card URL budget, which 0.8.2 narrowed from 3 to 1 as a module
+  constant. The default is unchanged, so behaviour is identical unless a host
+  passes the argument. A host that genuinely needs several independent sources per
+  claim raises it (~120 chars per extra URL per card); 0 drops the card's source
+  line entirely, keeping the call and any argument URL. 0.8.2's entry told hosts
+  to raise the constant, which was not something a consumer could do.
+
 - **Consumer impact: a host that never warmed the tiktoken cache now gets
   approximate token counts instead of exact ones**, where it previously got a
   one-time runtime fetch that populated the cache for later processes. Measured
@@ -117,7 +125,9 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   gets `[Called: <tool>]` alone instead of a 120-char argument preview.
 
   **Consumer impact:** a host that needs several independent sources per claim
-  should now raise `_MINI_CARD_MAX_URLS` deliberately rather than inherit 3.
+  loses the 2nd and 3rd URL it used to inherit; the first URL alone covered 99.2%
+  of carded results that had any. 0.9.0 turns this into a constructor argument
+  (`max_card_urls`) for hosts that want the old width back.
   Nothing else changes: cards still carry the call, still carry a source when one
   exists, and the placeholder/footer contract is untouched.
 

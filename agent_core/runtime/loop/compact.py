@@ -169,8 +169,9 @@ _MINI_CARD_BODY_MAX_CHARS = 400
 # first URL alone covers 769/775 (99.2%) of the carded results that had any URL.
 # Dropping to 1 took total retention to 8.9% and left that 99.2% unchanged, i.e.
 # the extra two URLs per card were spending ~120 chars each on a percentage with
-# no reader. A host that needs several independent sources per claim should raise
-# this deliberately rather than inherit it.
+# no reader. A host that needs several independent sources per claim raises it
+# through ``KeepLastNToolResultsCompactor(max_card_urls=...)`` rather than
+# inheriting this default.
 _MINI_CARD_MAX_URLS = 1
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -234,6 +235,7 @@ def _elided_tool_card(
     args_preview: str,
     args_source_url: str,
     content: str,
+    max_urls: int = _MINI_CARD_MAX_URLS,
 ) -> str:
     """Render the card lines that stand in for a discarded tool body.
 
@@ -269,7 +271,7 @@ def _elided_tool_card(
 
     urls: list[str] = []
     for url in dict.fromkeys(URL_RE.findall(content)):
-        if len(urls) >= _MINI_CARD_MAX_URLS:
+        if len(urls) >= max_urls:
             break
         # A web_fetch card would otherwise print its own url twice.
         if url in args_preview:
@@ -628,7 +630,7 @@ class KeepLastNToolResultsCompactor:
     Keeps the last ``keep_tool_result`` tool results verbatim and replaces the
     content of every earlier one with :data:`OMITTED_TOOL_RESULT_PLACEHOLDER`
     followed by a bounded card naming the call (tool + arguments preview) and up
-    to :data:`_MINI_CARD_MAX_URLS` source URLs found in the discarded body (a
+    to ``max_card_urls`` source URLs found in the discarded body (a
     result with no source anywhere gets the tool name alone), then
     the recovery pointer when the body was spilled. The card is free — both
     fields already exist in the history and in the body — and it is what keeps a
@@ -663,9 +665,12 @@ class KeepLastNToolResultsCompactor:
         protect_tool_names: frozenset[str] = frozenset(),
         spill: Callable[[str, str], str | None] | None = None,
         recovery_footer: Callable[[str], str] = default_recovery_footer,
+        max_card_urls: int = _MINI_CARD_MAX_URLS,
     ) -> None:
         if keep_tool_result < -1:
             raise ValueError(f"keep_tool_result must be >= -1 (got {keep_tool_result})")
+        if max_card_urls < 0:
+            raise ValueError(f"max_card_urls must be >= 0 (got {max_card_urls})")
         self._keep = keep_tool_result
         # Tool names whose results are NEVER blanked regardless of age (e.g.
         # agent-team fan-in: collect_reports / assign_task / submit_report).
@@ -675,6 +680,13 @@ class KeepLastNToolResultsCompactor:
         self._protect = frozenset(protect_tool_names)
         self._spill = spill
         self._recovery_footer = recovery_footer
+        # How many source URLs a card may carry. The default of 1 is measured
+        # (the first URL alone covers 99.2% of carded results that had any), so
+        # raising it costs ~120 chars per extra URL per card for a completeness
+        # nothing downstream was reading. A host that genuinely needs several
+        # independent sources per claim sets it deliberately; 0 drops the body's
+        # URL line entirely, keeping only the call and any argument URL.
+        self._max_card_urls = max_card_urls
 
     def compact(
         self,
@@ -732,6 +744,7 @@ class KeepLastNToolResultsCompactor:
                 id_to_args.get(call_id, ""),
                 id_to_arg_url.get(call_id, ""),
                 content,
+                self._max_card_urls,
             )
             if card:
                 placeholder += "\n" + card
