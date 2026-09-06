@@ -14,8 +14,9 @@ Two layers of defense protect the loop:
    local file read — see ``docker/stateful-agent.Dockerfile``.
 2. **This module**: the first request for an encoding kicks the
    (potentially network-fetching) init onto a daemon thread and returns
-   ``None``; callers fall back to a chars/4 heuristic until the encoder
-   lands. The loop thread NEVER blocks on tiktoken, cache-baked or not.
+   ``None``; callers fall back to the CJK-aware heuristic in
+   ``context_budget.estimate_tokens`` until the encoder lands. The loop
+   thread NEVER blocks on tiktoken, cache-baked or not.
 
 What is deliberately NOT on that daemon thread is ``import tiktoken``.
 ``tiktoken._tiktoken`` is a Rust extension, so the import ``dlopen``s a
@@ -56,6 +57,15 @@ An unrelated or corrupt cache file cannot accidentally reopen the fetch
 path. There is then nothing to kill, at the cost of approximate token
 counts on a host that never warmed the cache. A host that wants the
 fetch anyway sets ``AGENT_CORE_TIKTOKEN_FETCH=1`` and accepts the window.
+
+Proving the load is local costs a SHA-256 over the cached vocab — ~1.7 MB
+for ``cl100k_base``, single-digit milliseconds — and it runs on the
+calling thread, like the import above it. Same reasoning: a bounded local
+read is not what the network defense above exists for, and it happens
+once per encoding per process (the ``_encoders`` entry is written either
+way, so a gated name is never re-hashed). Verifying with tiktoken's own
+constructor instead would mean *calling the thing that may fetch*, which
+is the operation being avoided.
 """
 
 from __future__ import annotations
@@ -216,7 +226,7 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
             if cache_problem == "disabled":
                 logger.warning(
                     "tiktoken caching is disabled by TIKTOKEN_CACHE_DIR=''; "
-                    "token counts stay approximate (chars/4). Set "
+                    "token counts stay approximate (CJK-aware heuristic). Set "
                     "TIKTOKEN_CACHE_DIR to a writable directory, warm %s there, "
                     "or set %s=1 to fetch it at runtime.",
                     name,
@@ -225,7 +235,8 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
             else:
                 logger.warning(
                     "tiktoken vocab cache %r has no valid %s artifact (%s); "
-                    "token counts stay approximate (chars/4). Warm it once with "
+                    "token counts stay approximate (CJK-aware heuristic). Warm it "
+                    "once with "
                     "`python -c 'import tiktoken; tiktoken.get_encoding(\"%s\")'` "
                     "after ensuring TIKTOKEN_CACHE_DIR points to a readable and "
                     "writable cache; set %s=1 to fetch it at runtime instead.",
