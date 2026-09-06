@@ -246,8 +246,8 @@ def _elided_tool_card(
     premise needs a source: for a body with no URL — a shell command, a task-board
     update, a file write — repeating the call is usually legitimate, because the
     state it reads has changed. Such arguments are not decision information and do
-    not earn a 120-char preview. Measured over the same 12 trials, 435 of 1337
-    carded results (33%) had no source and were charging roughly a third of the
+    not earn a 120-char preview. Measured over the same 12 trials, 306 of 1295
+    carded results (24%) had no source and were charging roughly a quarter of the
     feature's cost for none of its benefit.
     """
     # A source can live in the arguments rather than the body: web_fetch's argument
