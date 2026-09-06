@@ -338,6 +338,17 @@ def test_source_in_the_arguments_still_earns_a_full_card():
     assert content.count(url) == 1
 
 
+def test_source_after_the_argument_preview_limit_is_still_retained():
+    """Source detection must inspect raw arguments, not the truncated preview."""
+    url = "https://example.com/source-after-long-metadata"
+    args = '{"metadata": "' + "x" * 140 + f'", "url": "{url}"}}'
+    body = "page text with no links whatsoever " + "x" * 2_000
+    content = _blanked(_one_call("web_fetch", args, body))
+    assert "[Called: web_fetch(" in content
+    assert f"[Source URLs] {url}" in content
+    assert content.count(url) == 1
+
+
 def test_sourceless_card_costs_far_less_than_a_sourced_one():
     """The cost reduction is the point of the narrowing, so assert it directly."""
     long_args = '{"q": "' + "a" * 300 + '"}'
