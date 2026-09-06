@@ -22,11 +22,14 @@ own ``/tmp`` cannot decide which branch runs.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import inspect
+import os
 import re
 import sys
 import threading
+import time
 import types
 from typing import Any
 
@@ -204,10 +207,21 @@ def test_missing_tiktoken_is_terminal_and_spawns_no_thread(clean_tokenizer) -> N
     assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
 
 
-def test_concurrent_callers_spawn_one_thread(clean_tokenizer) -> None:
+def test_concurrent_callers_validate_once_and_spawn_one_thread(
+    clean_tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
     gate = threading.Event()
     loader = _RecordingLoader(gate=gate)
     sys.meta_path.insert(0, loader)
+    real_cache_problem = tokenizer._cache_problem
+    cache_checks = 0
+
+    def counted_cache_problem(name: str) -> str | None:
+        nonlocal cache_checks
+        cache_checks += 1
+        return real_cache_problem(name)
+
+    monkeypatch.setattr(tokenizer, "_cache_problem", counted_cache_problem)
     try:
         start = threading.Barrier(4)
 
@@ -222,6 +236,7 @@ def test_concurrent_callers_spawn_one_thread(clean_tokenizer) -> None:
             t.join(timeout=5.0)
 
         assert len(tokenizer._threads) == 1
+        assert cache_checks == 1
     finally:
         gate.set()
 
@@ -302,6 +317,40 @@ def test_corrupt_target_cache_file_spawns_no_thread(
     assert loader.import_thread is None
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO probe requires POSIX")
+def test_fifo_at_target_cache_path_does_not_block_or_spawn_a_thread(
+    clean_tokenizer, warm_cache_dir
+) -> None:
+    cache_key, _ = tokenizer._CACHE_SPECS["cl100k_base"]
+    target = warm_cache_dir / cache_key
+    target.unlink()
+    os.mkfifo(target)
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+
+    started = time.monotonic()
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+
+    assert time.monotonic() - started < 0.5
+    assert tokenizer._threads == {}
+    assert loader.import_thread is None
+    assert tokenizer._encoders["cl100k_base"] is False
+
+
+def test_oversized_target_cache_file_spawns_no_thread(
+    clean_tokenizer, warm_cache_dir
+) -> None:
+    cache_key, _ = tokenizer._CACHE_SPECS["cl100k_base"]
+    with (warm_cache_dir / cache_key).open("wb") as cache_file:
+        cache_file.truncate(tokenizer._MAX_CACHE_BYTES + 1)
+    loader = _RecordingLoader()
+    sys.meta_path.insert(0, loader)
+
+    assert tokenizer.get_encoding_nonblocking("cl100k_base") is None
+    assert tokenizer._threads == {}
+    assert loader.import_thread is None
+
+
 def test_unknown_encoding_fails_closed(clean_tokenizer) -> None:
     loader = _RecordingLoader()
     sys.meta_path.insert(0, loader)
@@ -357,7 +406,9 @@ def test_unrecognised_opt_in_values_keep_the_gate_closed(
     assert tokenizer._network_fetch_allowed() is False
 
 
-def test_pinned_cache_metadata_matches_tiktokens_own_declaration() -> None:
+def test_pinned_cache_metadata_matches_tiktokens_own_declaration(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The pinned cache key and content hash must be tiktoken's actual ones.
 
     ``_CACHE_SPECS`` is otherwise unfalsifiable. Every test above monkeypatches
@@ -372,10 +423,12 @@ def test_pinned_cache_metadata_matches_tiktokens_own_declaration() -> None:
     avoid. The cache key is ``sha1(blobpath)`` (tiktoken's ``read_file_cached``)
     and the content hash is the ``expected_hash`` its loader validates against.
     """
-    pub = pytest.importorskip(
-        "tiktoken_ext.openai_public",
-        reason="tiktoken is the optional `tokenizer` extra; install it to check these pins",
-    )
+    if importlib.util.find_spec("tiktoken") is None:
+        pytest.skip("tiktoken is the optional `tokenizer` extra; install it to check these pins")
+    # Once tiktoken itself is present, a moved/removed declaration module must
+    # fail this test rather than quietly turn the dedicated CI check into a skip.
+    pub = importlib.import_module("tiktoken_ext.openai_public")
+    load = importlib.import_module("tiktoken.load")
     for name, (cache_key, expected_hash) in tokenizer._CACHE_SPECS.items():
         constructor = getattr(pub, name, None)
         assert constructor is not None, (
@@ -397,3 +450,18 @@ def test_pinned_cache_metadata_matches_tiktokens_own_declaration() -> None:
             f"{name!r} content hash is stale: tiktoken expects {declared.group(1)}, so a "
             "correctly warmed cache reads as invalid and exact counts stay off"
         )
+
+        # Exercise tiktoken's real cache lookup without allowing a network read.
+        # This catches a change away from sha1(blobpath), which comparing the
+        # constructor literals alone cannot detect.
+        cache = tmp_path / name
+        cache.mkdir()
+        payload = b"cache-key-probe"
+        (cache / cache_key).write_bytes(payload)
+        monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(cache))
+
+        def reject_network(path: str) -> bytes:
+            pytest.fail(f"tiktoken ignored the pinned cache key and tried to read {path}")
+
+        monkeypatch.setattr(load, "read_file", reject_network)
+        assert load.read_file_cached(blobpath.group(1), expected_hash=None) == payload

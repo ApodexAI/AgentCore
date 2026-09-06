@@ -16,8 +16,10 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   tiktoken's expected SHA-256; an empty directory, another encoding's cache, or a
   corrupt target file therefore cannot reopen the unsafe fetch path. Otherwise
   the encoding is marked unavailable, one WARNING says how to fix it, and callers
-  stay on the CJK-aware heuristic in `context_budget.estimate_tokens`. No thread is
-  started, so finalization has nothing to kill.
+  stay on their CJK-aware heuristics. Cache validation rejects non-regular files,
+  caps the synchronous read at 4 MiB, and is claimed once per encoding so
+  concurrent callers do not repeat it. No thread is started, so finalization has
+  nothing to kill.
 
   0.8.1 moved `import tiktoken` to the caller thread and added a 1 s `atexit`
   join. That budget covers a cache *hit* (~140 ms) and nothing else: on a miss
@@ -56,13 +58,14 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   one-time runtime fetch that populated the cache for later processes. Measured
   against cl100k_base, the heuristic lands at 0.84x of the real count on pure
   Chinese, 0.88x on mixed Chinese/Latin, 1.14x on English prose, and 0.72x on
-  JSON tool arguments — so it errs *low* exactly where a context guard matters
-  most, and the guard's 1.5x buffer is what still covers it. A host sizing a
-  request against a hard gateway limit should warm the cache rather than lean on
-  the estimate. Anything built from `docker/stateful-agent.Dockerfile` (or any
-  image baking `TIKTOKEN_CACHE_DIR`) is unaffected — that cache is warm, the load
-  runs, counts stay exact. Fresh checkouts, CI jobs without the warm-up step, and
-  images built without it change behaviour.
+  JSON tool arguments. Those are measurements, not an error bound: emoji-heavy
+  samples measured only 0.10-0.125x, and the context guard's 1.5x buffer does not
+  cover that case. A host sizing a request against a hard gateway limit must warm
+  the cache rather than rely on the estimate. Anything built from
+  `docker/stateful-agent.Dockerfile` (or any image baking `TIKTOKEN_CACHE_DIR`) is
+  unaffected — that cache is warm, the load runs, counts stay exact. Fresh
+  checkouts, CI jobs without the warm-up step, and images built without it change
+  behaviour.
 
   Two ways back to exact counts, in preference order: warm the cache once as a
   build or setup step (`python -c "import tiktoken;
@@ -90,18 +93,20 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   reopening a network-capable daemon thread; update the pinned metadata as part of
   that dependency upgrade. Those two pins are now checked against tiktoken's own
   declaration (`tiktoken_ext.openai_public`, read without calling the constructor
-  that fetches) by `test_pinned_cache_metadata_matches_tiktokens_own_declaration`,
-  so a stale pin fails a build instead of silently disabling exact counts. CI
-  gives that one test tiktoken through an overlay rather than the shared
-  environment, for the reason in the next paragraph.
+  that fetches) by `test_pinned_cache_metadata_matches_tiktokens_own_declaration`.
+  The test also exercises tiktoken's real cache lookup with network access stubbed
+  out, so a cache-key algorithm change fails the build. CI runs it with the
+  lockfile's tokenizer extra in an isolated environment, for the reason in the
+  next paragraph.
 
   **A host test calibrated against the heuristic changes answer once the cache is
   warm**, because the cache state now decides which estimator runs. Found here:
   installing tiktoken across this repo's own suite turned
   `test_agent_loop_engine.py`'s context-guard arithmetic red, since a 4000-char
-  filler string is ~1000 heuristic tokens but far fewer real ones. Tests that
-  assert on token totals should pin their estimator rather than inherit whichever
-  one the machine's cache happens to select.
+  filler string is ~1000 heuristic tokens but far fewer real ones. That test now
+  pins the heuristic explicitly. Consumer tests that assert on token totals should
+  do the same rather than inherit whichever estimator the machine's cache happens
+  to select.
 
 ## [0.8.2] - 2026-09-06
 

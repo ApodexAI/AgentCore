@@ -688,7 +688,9 @@ async def test_loop_config_cap_overrides_the_policy_default() -> None:
 
 
 @pytest.mark.asyncio
-async def test_synthesised_zero_usage_does_not_reset_the_token_estimate() -> None:
+async def test_synthesised_zero_usage_does_not_reset_the_token_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A gateway that omits usage must not silently disable the overflow guard.
 
     The zero-filled fallback exists for cost attribution only; letting its
@@ -704,6 +706,12 @@ async def test_synthesised_zero_usage_does_not_reset_the_token_estimate() -> Non
         turn 2, zeros     :   0 + 1506 + 1000 = 2506  < 3000  (guard misses)
         turn 2, preserved : 950 + 1506 + 1000 = 3456 >= 3000  (guard fires)
     """
+    # This test's arithmetic deliberately targets the fallback estimator. Pin
+    # that dependency so a warm host cache cannot switch it to exact tiktoken
+    # counts and change the premise being tested.
+    from agent_core.runtime.loop import context_budget
+
+    monkeypatch.setattr(context_budget, "_get_tokenizer", lambda: None)
 
     class SizedTool:
         name = "echo"
