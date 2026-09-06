@@ -55,7 +55,7 @@ def _card_of(content: str) -> str:
 
 
 def test_card_names_the_call_and_its_arguments():
-    body = "RESULT " + "x" * 2_000
+    body = "RESULT https://example.com/nvda " + "x" * 2_000
     args = '{"query": "NVIDIA H100 market share 2025"}'
     content = _blanked(_one_call("web_search", args, body))
     assert "[Called: web_search(" in content
@@ -66,8 +66,10 @@ def test_card_carries_source_urls_from_the_discarded_body():
     body = "see https://nvidianews.nvidia.com/q3 and https://tomshardware.com/h100 " + "x" * 2_000
     content = _blanked(_one_call("web_search", '{"query": "h100"}', body))
     assert "[Source URLs]" in content
+    # One traceable source per retrieval is the whole requirement, so the first
+    # URL is kept and extras are not bought (see _MINI_CARD_MAX_URLS).
     assert "https://nvidianews.nvidia.com/q3" in content
-    assert "https://tomshardware.com/h100" in content
+    assert content.count("https://") == 1
 
 
 def test_url_already_in_the_arguments_is_not_repeated():
@@ -96,8 +98,10 @@ def test_exact_rendered_card_stays_within_budget():
 
 
 def test_overlong_arguments_are_truncated():
-    args = '{"command": "' + "a" * 500 + '"}'
-    content = _blanked(_one_call("bash", args, "OUT " + "x" * 2_000))
+    args = '{"query": "' + "a" * 500 + '"}'
+    content = _blanked(
+        _one_call("web_search", args, "OUT https://example.com/x " + "x" * 2_000)
+    )
     call_line = _card_of(content).splitlines()[0]
     assert "…" in call_line
     assert len(call_line) < _MINI_CARD_ARGS_MAX_CHARS + 60
@@ -105,12 +109,18 @@ def test_overlong_arguments_are_truncated():
 
 
 def test_multiline_arguments_are_flattened_to_one_line():
-    args = '{"command": "cat <<EOF\\nline one\\nline two\\nEOF"}'
-    content = _blanked(_one_call("bash", args, "OUT " + "x" * 2_000))
+    args = '{"query": "cat <<EOF\\nline one\\nline two\\nEOF"}'
+    content = _blanked(
+        _one_call("web_search", args, "OUT https://example.com/x " + "x" * 2_000)
+    )
     card = _card_of(content)
-    assert card.splitlines()[0].startswith("[Called: bash(")
-    # No URLs in this body, so the whole card must be the single call line.
-    assert len(card.splitlines()) == 1
+    lines = card.splitlines()
+    # Flattening means the whole argument preview fits on the call line: the
+    # newlines inside it must not become extra card rows.
+    assert lines[0].startswith("[Called: web_search(")
+    assert lines[0].endswith(")]")
+    assert sum(1 for line in lines if line.startswith("[Called:")) == 1
+    assert "\n" not in _args_preview(args)
 
 
 # --- when the card is skipped ---------------------------------------------
@@ -301,3 +311,59 @@ def test_a_host_footer_survives_a_second_pass_unnested():
     second = next(m["content"] for m in twice if m.get("role") == "tool")
     assert first == second
     assert second.count("Recovery id:") == 1
+
+
+# ── a result with no source anywhere gets the tool name alone ────────────────
+
+
+def test_sourceless_result_gets_tool_name_only():
+    """The card exists so a later turn does not redo work whose provenance it can
+    still see, and that premise needs a source. A shell command's output carries
+    none, and repeating it is usually legitimate because the state it reads has
+    changed — so its arguments are not decision information worth 120 chars."""
+    args = '{"command": "ls -la /workspace/some/deep/path"}'
+    content = _blanked(_one_call("bash", args, "total 48 drwxr-xr-x " + "x" * 2_000))
+    assert _card_of(content) == "[Called: bash]"
+    assert "ls -la" not in content
+    assert "[Source URLs]" not in content
+
+
+def test_source_in_the_arguments_still_earns_a_full_card():
+    """A source can live in the arguments rather than the body: web_fetch's
+    argument IS the url. "No URL in the body" must not be read as "no source"."""
+    url = "https://example.com/the-page-that-matters"
+    body = "page text with no links whatsoever " + "x" * 2_000
+    content = _blanked(_one_call("web_fetch", f'{{"url": "{url}"}}', body))
+    assert url in content
+    assert content.count(url) == 1
+
+
+def test_source_after_the_argument_preview_limit_is_still_retained():
+    """Source detection must inspect raw arguments, not the truncated preview."""
+    url = "https://example.com/source-after-long-metadata"
+    args = '{"metadata": "' + "x" * 140 + f'", "url": "{url}"}}'
+    body = "page text with no links whatsoever " + "x" * 2_000
+    content = _blanked(_one_call("web_fetch", args, body))
+    assert "[Called: web_fetch(" in content
+    assert f"[Source URLs] {url}" in content
+    assert content.count(url) == 1
+
+
+def test_sourceless_card_costs_far_less_than_a_sourced_one():
+    """The cost reduction is the point of the narrowing, so assert it directly."""
+    long_args = '{"q": "' + "a" * 300 + '"}'
+    sourceless = _card_of(
+        _blanked(_one_call("bash", long_args, "OUT " + "x" * 2_000))
+    )
+    sourced = _card_of(
+        _blanked(
+            _one_call("web_search", long_args, "OUT https://example.com/a " + "x" * 2_000)
+        )
+    )
+    assert len(sourceless) < len(sourced) / 2
+
+
+def test_at_most_one_url_even_in_a_url_heavy_body():
+    body = " ".join(f"https://example.com/r{i}" for i in range(50)) + "x" * 2_000
+    content = _blanked(_one_call("web_search", '{"query": "q"}', body))
+    assert content.count("https://example.com/r") == _MINI_CARD_MAX_URLS
