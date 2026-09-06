@@ -44,6 +44,7 @@ from __future__ import annotations
 import atexit
 import logging
 import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -77,8 +78,12 @@ def _join_pending() -> None:
     """atexit: drain in-flight inits before the interpreter kills them."""
     with _lock:
         pending = list(_threads.values())
+    deadline = time.monotonic() + _JOIN_TIMEOUT_S
     for thread in pending:
-        thread.join(timeout=_JOIN_TIMEOUT_S)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
 
 
 def _load(name: str, tiktoken: Any) -> None:

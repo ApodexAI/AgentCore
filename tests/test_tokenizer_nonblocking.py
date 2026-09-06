@@ -58,6 +58,7 @@ def clean_tokenizer():
     """Reset the module cache and unhook any real/fake tiktoken."""
     saved_module = sys.modules.pop("tiktoken", None)
     saved_meta = list(sys.meta_path)
+    saved_atexit_registered = tokenizer._atexit_registered
     tokenizer._encoders.clear()
     tokenizer._threads.clear()
     tokenizer._atexit_registered = True  # don't leak a real atexit hook per test
@@ -67,6 +68,7 @@ def clean_tokenizer():
         tokenizer._join_pending()
         tokenizer._encoders.clear()
         tokenizer._threads.clear()
+        tokenizer._atexit_registered = saved_atexit_registered
         sys.meta_path[:] = saved_meta
         sys.modules.pop("tiktoken", None)
         if saved_module is not None:
@@ -87,16 +89,59 @@ def test_import_runs_on_caller_thread_get_encoding_on_daemon(clean_tokenizer) ->
     assert tokenizer.get_encoding_nonblocking("cl100k_base") is loader.encoder
 
 
-def test_atexit_hook_drains_the_in_flight_load(clean_tokenizer) -> None:
-    loader = _RecordingLoader()
+def test_atexit_hook_registers_once_and_drains_the_in_flight_load(
+    clean_tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = threading.Event()
+    loader = _RecordingLoader(gate=gate)
     sys.meta_path.insert(0, loader)
+    registered: list[Any] = []
+    monkeypatch.setattr(tokenizer.atexit, "register", registered.append)
+    tokenizer._atexit_registered = False
 
     tokenizer.get_encoding_nonblocking("cl100k_base")
+    tokenizer.get_encoding_nonblocking("o200k_base")
     assert "cl100k_base" in tokenizer._threads  # in flight
+    assert registered == [tokenizer._join_pending]
 
-    tokenizer._join_pending()
+    gate.set()
+    registered[0]()
     assert tokenizer._threads == {}  # thread finished and deregistered itself
     assert tokenizer._encoders["cl100k_base"] is loader.encoder
+
+
+def test_atexit_join_timeout_is_shared_across_threads(
+    clean_tokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Clock:
+        now = 10.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    class _PendingThread:
+        def __init__(self, clock: _Clock) -> None:
+            self.clock = clock
+            self.timeouts: list[float] = []
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout is not None
+            self.timeouts.append(timeout)
+            self.clock.now += 0.4
+
+    clock = _Clock()
+    pending = [_PendingThread(clock) for _ in range(4)]
+    tokenizer._threads.update({str(i): thread for i, thread in enumerate(pending)})  # type: ignore[arg-type]
+    monkeypatch.setattr(tokenizer.time, "monotonic", clock.monotonic)
+
+    tokenizer._join_pending()
+
+    assert [thread.timeouts for thread in pending] == [
+        [pytest.approx(1.0)],
+        [pytest.approx(0.6)],
+        [pytest.approx(0.2)],
+        [],
+    ]
 
 
 def test_caller_never_blocks_on_a_wedged_get_encoding(clean_tokenizer) -> None:
