@@ -7,6 +7,115 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.9.0] - 2026-09-06
+
+### Fixed
+
+- The tiktoken encoder init no longer starts a background load that may need the
+  network. The requested `cl100k_base` cache artifact must exist and pass
+  tiktoken's expected SHA-256; an empty directory, another encoding's cache, or a
+  corrupt target file therefore cannot reopen the unsafe fetch path. Otherwise
+  the encoding is marked unavailable, one WARNING says how to fix it, and callers
+  stay on their CJK-aware heuristics. Cache validation rejects non-regular files,
+  caps the synchronous read at 4 MiB, and is claimed once per encoding so
+  concurrent callers do not repeat it. No thread is started, so finalization has
+  nothing to kill.
+
+  0.8.1 moved `import tiktoken` to the caller thread and added a 1 s `atexit`
+  join. That budget covers a cache *hit* (~140 ms) and nothing else: on a miss
+  `get_encoding` does an unbounded `requests.get` (tiktoken's `load.py` passes no
+  timeout) plus a BPE parse, so the thread is still mid-flight when the budget
+  expires and gets `pthread_exit`ed anyway — out of the dynamic linker now, but
+  plausibly inside `malloc`. **The 0.8.1 fix covered only the warm half**, which
+  is exactly the half every CI job sees, because warming the cache is the standard
+  mitigation.
+
+  Reproduced 2026-09-06 in ApodexHarness, repeating the two `serve` protocol
+  tests with the cache guaranteed empty (`TMPDIR` redirected to a fresh directory
+  each iteration, `TIKTOKEN_CACHE_DIR` unset):
+
+  | arm | runs | negative exit codes |
+  |---|---|---|
+  | cold cache, `test_serve_subprocess_e2e` | 90 | **1** (`-6`) |
+  | cold cache, `test_stateless_across_invocations` | 30 | 0 |
+  | warm cache, both tests | 60 | 0 |
+  | warm cache, exit micro-probe | 200 | 0 |
+  | cold cache + unroutable proxy, micro-probe and both tests | 260 | 0 |
+
+  The death: `double free or corruption (fasttop)`, `serve exited -6`, after a
+  fully correct protocol stream — stdout was complete and valid, the process
+  simply did not survive its own exit. Two details worth keeping. The failure is
+  ~1%, so a passing run proves nothing and only repetition at a fixed cache state
+  measures anything. And blocking egress instead of emptying the cache does *not*
+  reproduce it: a thread parked in a TCP connect allocates nothing and dies
+  harmlessly, so the dangerous window is a fetch that is *succeeding* and parsing
+  — the opposite of what the wedge history would suggest.
+
+### Changed
+
+- `KeepLastNToolResultsCompactor(max_card_urls=...)` now exposes the Tier 1 mini
+  card's per-card URL budget, which 0.8.2 narrowed from 3 to 1 as a module
+  constant. The default is unchanged, so behaviour is identical unless a host
+  passes the argument. A host that genuinely needs several independent sources per
+  claim raises it (~120 chars per extra URL per card); 0 drops the card's source
+  line entirely, keeping the call and any argument URL. 0.8.2's entry told hosts
+  to raise the constant, which was not something a consumer could do.
+
+- **Consumer impact: a host that never warmed the tiktoken cache now gets
+  approximate token counts instead of exact ones**, where it previously got a
+  one-time runtime fetch that populated the cache for later processes. Measured
+  against cl100k_base, the heuristic lands at 0.84x of the real count on pure
+  Chinese, 0.88x on mixed Chinese/Latin, 1.14x on English prose, and 0.72x on
+  JSON tool arguments. Those are measurements, not an error bound: emoji-heavy
+  samples measured only 0.10-0.125x, and the context guard's 1.5x buffer does not
+  cover that case. A host sizing a request against a hard gateway limit must warm
+  the cache rather than rely on the estimate. Anything built from
+  `docker/stateful-agent.Dockerfile` (or any image baking `TIKTOKEN_CACHE_DIR`) is
+  unaffected — that cache is warm, the load runs, counts stay exact. Fresh
+  checkouts, CI jobs without the warm-up step, and images built without it change
+  behaviour.
+
+  Two ways back to exact counts, in preference order: warm the cache once as a
+  build or setup step (`python -c "import tiktoken;
+  tiktoken.get_encoding('cl100k_base')"`), or set
+  `AGENT_CORE_TIKTOKEN_FETCH=1` to allow the runtime fetch and accept the
+  exit-time window it reopens. If `TIKTOKEN_CACHE_DIR=""` currently disables
+  caching, set it to a writable directory before running the warm-up command.
+
+  **A consumer test that fakes `tiktoken` now takes the gate branch** if the real
+  cache directory happens to be empty, because the gate looks at the filesystem
+  before it looks at `sys.modules` — it cannot tell that a monkeypatched module
+  will never fetch anything. Found by running ApodexHarness's suite against this
+  branch with `TIKTOKEN_CACHE_DIR` pointed at an empty directory:
+  `test_first_call_is_nonblocking_even_if_load_is_slow` installs a deliberately
+  slow fake `get_encoding` and asserts the encoder eventually lands, which it now
+  never does. Such a test should set `AGENT_CORE_TIKTOKEN_FETCH=1`; a placeholder
+  cache file is deliberately insufficient because production must not mistake it
+  for a usable vocabulary. Note the same suite is fully green with a valid warm
+  cache, so this is invisible until a host runs cold.
+
+  The gate pins tiktoken's cache key and expected content hash for
+  `cl100k_base`, the only encoding AgentCore requests. Other encoding names fail
+  closed unless runtime fetching is explicitly enabled. If a future tiktoken
+  release changes its artifact, exact counts remain disabled rather than silently
+  reopening a network-capable daemon thread; update the pinned metadata as part of
+  that dependency upgrade. Those two pins are now checked against tiktoken's own
+  declaration (`tiktoken_ext.openai_public`, read without calling the constructor
+  that fetches) by `test_pinned_cache_metadata_matches_tiktokens_own_declaration`.
+  The test also exercises tiktoken's real cache lookup with network access stubbed
+  out, so a cache-key algorithm change fails the build. CI runs it with the
+  lockfile's tokenizer extra in an isolated environment, for the reason in the
+  next paragraph.
+
+  **A host test calibrated against the heuristic changes answer once the cache is
+  warm**, because the cache state now decides which estimator runs. Found here:
+  installing tiktoken across this repo's own suite turned
+  `test_agent_loop_engine.py`'s context-guard arithmetic red, since a 4000-char
+  filler string is ~1000 heuristic tokens but far fewer real ones. That test now
+  pins the heuristic explicitly. Consumer tests that assert on token totals should
+  do the same rather than inherit whichever estimator the machine's cache happens
+  to select.
+
 ## [0.8.2] - 2026-09-06
 
 ### Changed
@@ -16,7 +125,9 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   gets `[Called: <tool>]` alone instead of a 120-char argument preview.
 
   **Consumer impact:** a host that needs several independent sources per claim
-  should now raise `_MINI_CARD_MAX_URLS` deliberately rather than inherit 3.
+  loses the 2nd and 3rd URL it used to inherit; the first URL alone covered 99.2%
+  of carded results that had any. 0.9.0 turns this into a constructor argument
+  (`max_card_urls`) for hosts that want the old width back.
   Nothing else changes: cards still carry the call, still carry a source when one
   exists, and the placeholder/footer contract is untouched.
 

@@ -23,6 +23,10 @@ jobs:
       # a product worded from it vanishes on adoption. See the script's docstring.
       - run: python3 scripts/check_unconsumed_fields.py
       - run: uv run pytest -q
+      # The gate pins tiktoken's own cache key and content hash, and only a real
+      # tiktoken can falsify them. Scope that optional dependency to this contract
+      # test; the isolated run uses the tokenizer version pinned in uv.lock.
+      - run: uv run --isolated --frozen --extra dev --extra tokenizer pytest -q tests/test_tokenizer_nonblocking.py::test_pinned_cache_metadata_matches_tiktokens_own_declaration
       - run: uv build
 
   # Two products pin an AgentCore revision. If published code changes without a

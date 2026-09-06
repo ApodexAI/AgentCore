@@ -9,6 +9,8 @@ body it would have replaced.
 
 from __future__ import annotations
 
+import pytest
+
 from agent_core.messages import system_msg, tool_msg
 from agent_core.runtime.loop.compact import (
     _LEGACY_OMITTED_TOOL_RESULT_PLACEHOLDERS,
@@ -367,3 +369,33 @@ def test_at_most_one_url_even_in_a_url_heavy_body():
     body = " ".join(f"https://example.com/r{i}" for i in range(50)) + "x" * 2_000
     content = _blanked(_one_call("web_search", '{"query": "q"}', body))
     assert content.count("https://example.com/r") == _MINI_CARD_MAX_URLS
+
+
+# --- the max_card_urls knob ------------------------------------------------
+
+
+def test_default_is_one_url_so_hosts_inherit_the_measured_budget():
+    assert _MINI_CARD_MAX_URLS == 1
+    body = " ".join(f"https://example.com/r{i}" for i in range(5)) + " " + "x" * 2_000
+    assert _blanked(_one_call("web_search", '{"query": "q"}', body)).count("https://") == 1
+
+
+def test_a_host_that_needs_several_sources_raises_max_card_urls():
+    """The knob the CHANGELOG points at: more URLs per card, on request."""
+    body = " ".join(f"https://example.com/r{i}" for i in range(5)) + " " + "x" * 2_000
+    content = _blanked(_one_call("web_search", '{"query": "q"}', body), max_card_urls=3)
+    assert content.count("https://example.com/r") == 3
+    # Still bounded by the body budget, not by the raised count alone.
+    assert len(_card_of(content)) <= _MINI_CARD_BODY_MAX_CHARS
+
+
+def test_zero_max_card_urls_drops_the_source_line_but_keeps_the_call():
+    body = "see https://example.com/r0 " + "x" * 2_000
+    content = _blanked(_one_call("web_search", '{"query": "q"}', body), max_card_urls=0)
+    assert "[Source URLs]" not in content
+    assert "[Called: web_search(" in content
+
+
+def test_negative_max_card_urls_is_rejected_at_construction():
+    with pytest.raises(ValueError, match="max_card_urls must be >= 0"):
+        KeepLastNToolResultsCompactor(keep_tool_result=0, max_card_urls=-1)

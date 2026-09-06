@@ -14,8 +14,9 @@ Two layers of defense protect the loop:
    local file read — see ``docker/stateful-agent.Dockerfile``.
 2. **This module**: the first request for an encoding kicks the
    (potentially network-fetching) init onto a daemon thread and returns
-   ``None``; callers fall back to a chars/4 heuristic until the encoder
-   lands. The loop thread NEVER blocks on tiktoken, cache-baked or not.
+   ``None``; callers fall back to their CJK-aware heuristics until the
+   encoder lands. The loop thread NEVER blocks on tiktoken, cache-baked
+   or not.
 
 What is deliberately NOT on that daemon thread is ``import tiktoken``.
 ``tiktoken._tiktoken`` is a Rust extension, so the import ``dlopen``s a
@@ -37,12 +38,46 @@ Belt and braces: an ``atexit`` hook joins any in-flight init, following
 ``providers/nonblocking_stream.py``. CPython runs ``atexit`` callbacks
 before it starts killing daemon threads, so that is the last point at
 which the load can be drained cleanly.
+
+That join has a 1 s budget, which covers a cache *hit* (~140 ms) and
+nothing else. On a cache **miss** ``get_encoding`` does an unbounded
+``requests.get`` (tiktoken's ``load.py`` passes no timeout) plus a BPE
+parse, so it is still mid-flight when the budget expires and the thread
+is killed anyway — no longer inside the dynamic linker, but plausibly
+inside ``malloc``. Reproduced 2026-09-06 on
+``test_serve_subprocess_e2e``: with the vocab cache guaranteed empty,
+1 of 90 runs died with ``double free or corruption (fasttop)`` and
+``-6`` after a fully correct protocol stream, while 60/60 warm runs and
+400 warm/blocked-egress micro-probes were clean. So the previous fix
+covered only the warm half.
+
+Hence the third layer: no thread is started unless the requested vocab's
+exact cache artifact exists and passes the hash tiktoken itself expects.
+An unrelated or corrupt cache file cannot accidentally reopen the fetch
+path. There is then nothing to kill, at the cost of approximate token
+counts on a host that never warmed the cache. A host that wants the
+fetch anyway sets ``AGENT_CORE_TIKTOKEN_FETCH=1`` and accepts the window.
+
+Proving the load is local costs a SHA-256 over the cached vocab — ~1.7 MB
+for ``cl100k_base``, single-digit milliseconds — and it runs on the
+calling thread, like the import above it. The file is opened non-blocking,
+must be a regular file, and the read is capped at 4 MiB before its hash is
+trusted. The first caller claims the encoding before validation, so
+concurrent callers return ``None`` rather than repeating the read. Same
+reasoning: bounded local validation is not what the network defense above
+exists for. Verifying with tiktoken's own constructor instead would mean
+*calling the thing that may fetch*, which is the operation being avoided.
 """
 
 from __future__ import annotations
 
 import atexit
+import contextlib
+import hashlib
 import logging
+import os
+import stat
+import tempfile
 import threading
 import time
 from typing import Any
@@ -55,7 +90,7 @@ _MISSING = object()
 
 # Per-encoding cache. State machine for a given name:
 #   absent (==_MISSING) → never requested
-#   None                → background init in flight; use the heuristic for now
+#   None                → validation/import/background init in flight; heuristic for now
 #   False               → tiktoken unavailable / bad name; terminal, heuristic forever
 #   <Encoding object>   → ready
 _encoders: dict[str, Any] = {}
@@ -72,6 +107,96 @@ _atexit_registered = False
 # touches the dynamic linker, which is what made the mid-flight kill
 # dangerous in the first place.
 _JOIN_TIMEOUT_S = 1.0
+
+# Opt back in to the unbounded network fetch (and its exit-time window).
+_FETCH_ENV = "AGENT_CORE_TIKTOKEN_FETCH"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# cl100k_base is ~1.7 MB. Bound the synchronous validation read so a corrupt,
+# replaced, or concurrently growing cache file cannot turn this non-blocking
+# accessor into an unbounded caller-thread read.
+_MAX_CACHE_BYTES = 4 * 1024 * 1024
+
+# tiktoken caches the downloaded bytes under ``sha1(blobpath)`` and validates
+# them against the constructor's expected SHA-256 before parsing. All AgentCore
+# callers currently request cl100k_base. Keeping both values here lets us prove
+# that this exact load is local without invoking tiktoken's constructor (which
+# is the operation that may fetch). If tiktoken changes either value, this gate
+# fails closed until the table is updated.
+_CACHE_SPECS: dict[str, tuple[str, str]] = {
+    "cl100k_base": (
+        "9b5ad71b2ce5302211f9c61530b329a4922fc6a4",
+        "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+    ),
+}
+
+# The "no valid target cache, staying on the heuristic" warning is worth once.
+_warned_uncached = False
+
+
+def _cache_dir() -> str:
+    """Where tiktoken would look for a cached vocab.
+
+    Mirrors ``tiktoken.load.read_file_cached``: ``TIKTOKEN_CACHE_DIR``,
+    else ``DATA_GYM_CACHE_DIR``, else ``<tmp>/data-gym-cache``. An empty
+    string is tiktoken's way of disabling the cache entirely.
+    """
+    for var in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR"):
+        value = os.environ.get(var)
+        if value is not None:
+            return value
+    return os.path.join(tempfile.gettempdir(), "data-gym-cache")
+
+
+def _cache_problem(name: str) -> str | None:
+    """Why ``name`` cannot be proved to load locally, or ``None`` if it can."""
+    directory = _cache_dir()
+    if not directory:
+        return "disabled"
+
+    spec = _CACHE_SPECS.get(name)
+    if spec is None:
+        return "unverified encoding"
+
+    cache_key, expected_hash = spec
+    path = os.path.join(directory, cache_key)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "not a regular file"
+        if info.st_size > _MAX_CACHE_BYTES:
+            return "oversized"
+
+        digest = hashlib.sha256()
+        remaining = _MAX_CACHE_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if remaining == 0:
+            return "oversized"
+        actual_hash = digest.hexdigest()
+    except OSError:
+        return "unreadable"
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    return None if actual_hash == expected_hash else "invalid"
+
+
+def _network_fetch_allowed() -> bool:
+    return os.environ.get(_FETCH_ENV, "").strip().lower() in _TRUTHY
 
 
 def _join_pending() -> None:
@@ -110,14 +235,57 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
     local dlopen, no network), schedules the encoder init on a daemon
     thread and returns ``None``; later calls return the encoder once it
     has loaded, or ``None`` while it is still loading. Returns ``None``
-    permanently when tiktoken is unavailable — callers MUST fall back to
-    a heuristic on ``None``.
+    permanently when tiktoken is unavailable, and permanently when the
+    requested vocab has no valid cache artifact so the init could issue
+    an unbounded network fetch (``AGENT_CORE_TIKTOKEN_FETCH=1`` opts
+    back in) — callers MUST fall back to a heuristic on ``None``.
     """
-    global _atexit_registered
+    global _atexit_registered, _warned_uncached
 
-    enc = _encoders.get(name, _MISSING)
-    if enc is not _MISSING:
-        return enc or None  # None (loading) and False (failed) both collapse to None
+    # Claim the name before any filesystem work. Concurrent first callers return
+    # immediately on the ``None`` state instead of hashing the same artifact.
+    with _lock:
+        enc = _encoders.get(name, _MISSING)
+        if enc is not _MISSING:
+            return enc or None  # None (initializing) and False (failed) collapse to None
+        _encoders[name] = None
+
+    # A load that can only be served over the network is not worth a
+    # thread: it cannot finish inside the exit-time join budget, and
+    # being killed mid-fetch is what corrupts the heap.
+    fetch_allowed = _network_fetch_allowed()
+    cache_problem = None if fetch_allowed else _cache_problem(name)
+    if cache_problem is not None:
+        with _lock:
+            _encoders[name] = False
+            should_warn = not _warned_uncached
+            _warned_uncached = True
+        if should_warn:
+            directory = _cache_dir()
+            if cache_problem == "disabled":
+                logger.warning(
+                    "tiktoken caching is disabled by TIKTOKEN_CACHE_DIR=''; "
+                    "token counts stay approximate (CJK-aware heuristic). Set "
+                    "TIKTOKEN_CACHE_DIR to a writable directory, warm %s there, "
+                    "or set %s=1 to fetch it at runtime.",
+                    name,
+                    _FETCH_ENV,
+                )
+            else:
+                logger.warning(
+                    "tiktoken vocab cache %r has no valid %s artifact (%s); "
+                    "token counts stay approximate (CJK-aware heuristic). Warm it "
+                    "once with "
+                    "`python -c 'import tiktoken; tiktoken.get_encoding(\"%s\")'` "
+                    "after ensuring TIKTOKEN_CACHE_DIR points to a readable and "
+                    "writable cache; set %s=1 to fetch it at runtime instead.",
+                    directory,
+                    name,
+                    cache_problem,
+                    name,
+                    _FETCH_ENV,
+                )
+        return None
 
     # On the caller thread, deliberately — never on the daemon thread.
     try:
@@ -129,9 +297,6 @@ def get_encoding_nonblocking(name: str = "cl100k_base") -> Any | None:
         return None
 
     with _lock:
-        if _encoders.get(name, _MISSING) is not _MISSING:  # claimed while we imported
-            return _encoders[name] or None
-        _encoders[name] = None  # mark loading so concurrent callers don't re-spawn
         thread = threading.Thread(
             target=_load,
             args=(name, tiktoken),
