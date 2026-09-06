@@ -7,6 +7,43 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [Unreleased]
+
+### Changed
+
+- Tier 1 mini card narrowed on measurement, in two places.
+  `_MINI_CARD_MAX_URLS` drops 3 -> 1, and a result carrying no source anywhere
+  gets `[Called: <tool>]` alone instead of a 120-char argument preview.
+
+  **Consumer impact:** a host that needs several independent sources per claim
+  should now raise `_MINI_CARD_MAX_URLS` deliberately rather than inherit 3.
+  Nothing else changes: cards still carry the call, still carry a source when one
+  exists, and the placeholder/footer contract is untouched.
+
+  Rationale, measured over 12 real long-running research trials in ApodexHarness
+  (1337 carded results, ~13.5k source URLs in the bodies being discarded):
+
+  - Keeping 3 URLs retained 16.5% of all URLs, but the only quantity anything
+    downstream consumes is whether a retrieval left *one* traceable source
+    behind, and the first URL alone covers 769/775 (99.2%) of cards that had any
+    URL. Dropping to 1 took total retention to 7.8% and left that 99.2%
+    unchanged - the extra two URLs were spending ~120 chars each on a percentage
+    with no reader.
+  - 435 of 1337 cards (33%) had no source at all - shell commands, task-board
+    updates, file writes. The card exists so a later turn does not redo work
+    whose provenance it can still see; without a source that premise does not
+    hold, and repeating such a call is usually legitimate because the state it
+    reads has changed. Those arguments are not decision information.
+
+  A source can live in the arguments rather than the body (`web_fetch`'s argument
+  IS the url), so the sourceless test is "no URL in the body **and** none in the
+  arguments" - reading only the body would strip `web_fetch` of its one source.
+
+  Cost on that sample: cards add ~49.6k tokens across the 12 trials, 25.0% of the
+  post-compaction context under an aggressive `keep_last_k=5`. Under the
+  threshold-triggered `tiered` path a product actually ships, post-compaction
+  context is 150-200k, putting the same cards at 2-3%.
+
 ## [0.8.1] - 2026-09-05
 
 ### Fixed
