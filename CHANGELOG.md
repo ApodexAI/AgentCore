@@ -64,6 +64,18 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   `AGENT_CORE_TIKTOKEN_FETCH=1` to allow the runtime fetch and accept the
   exit-time window it reopens.
 
+  **A consumer test that fakes `tiktoken` now takes the gate branch** if the real
+  cache directory happens to be empty, because the gate looks at the filesystem
+  before it looks at `sys.modules` — it cannot tell that a monkeypatched module
+  will never fetch anything. Found by running ApodexHarness's suite against this
+  branch with `TIKTOKEN_CACHE_DIR` pointed at an empty directory:
+  `test_first_call_is_nonblocking_even_if_load_is_slow` installs a deliberately
+  slow fake `get_encoding` and asserts the encoder eventually lands, which it now
+  never does. Such a test should pin `TIKTOKEN_CACHE_DIR` at a directory holding
+  any file (that is what the tests here do, via the `warm_cache_dir` fixture) or
+  set `AGENT_CORE_TIKTOKEN_FETCH=1`. Note the same suite is fully green with a
+  warm cache, so this is invisible until a host runs cold.
+
   The gate is deliberately coarse — it asks "is this cache empty?", not "is
   *this* encoding cached". tiktoken keys cache files by `sha1(blobpath)` and the
   blobpath only exists inside the constructor being avoided, so a per-encoding
