@@ -42,6 +42,21 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   reads as though an image were delivered will be answered as though one were.
   Products adding their own image paths should preserve this property.
 
+### Fixed
+
+- `ExtensionsConfig.has_changed` compares a digest of the file's bytes instead
+  of `st_mtime > loaded_mtime`, so a skill toggled on disk is actually picked up
+  by `get_enabled_skills`. Timestamps are much coarser than the edits they were
+  being asked to order: the filesystem clock advances in 1 ms steps and two
+  consecutive writes collide on a single mtime about 92% of the time, so a
+  change landing in the same millisecond as the load was invisible. The strict
+  `>` also could not see a timestamp moving BACKWARD -- restoring a backup, a
+  `git checkout`, an `rsync --times` of an older revision -- and it reported a
+  change for an identical rewrite, forcing a reload with nothing to reload.
+  This surfaced as an intermittent failure in `test_skills_loader_reload.py`
+  whose rate tracked machine speed; the regression tests now pin both
+  timestamps to one value and fail deterministically without the fix.
+
 ### Changed
 
 - `messages.text_of` renders an `image_url` content block as

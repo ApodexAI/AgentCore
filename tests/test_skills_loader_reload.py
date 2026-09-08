@@ -152,3 +152,51 @@ def test_toggle_on_a_fresh_loader_is_not_a_silent_no_op(skill_dir, config_file):
 def test_toggle_still_reports_a_genuinely_missing_skill(skill_dir, config_file):
     loader = _loader(skill_dir, config_file)
     assert loader.toggle_skill("no-such-skill", False) is False
+
+
+def _pin_mtime(path, when: float = 1_700_000_000.0) -> None:
+    """Force an exact mtime, so a change is invisible to a timestamp check."""
+    os.utime(path, (when, when))
+
+
+def test_change_within_one_clock_tick_is_still_seen(skill_dir, config_file):
+    """Two edits sharing an mtime must not look like no edit at all.
+
+    This is the real shape of the flake that used to surface here: the
+    filesystem clock advances in 1 ms steps, consecutive writes collide on a
+    single value about 92% of the time, and the old ``st_mtime > loaded_mtime``
+    check reported "unchanged" for every one of those. It only passed as often
+    as it did because the work between the two writes usually spilled into the
+    next millisecond. Pinning both timestamps to the same value reproduces it
+    every run instead of a quarter of them.
+    """
+    _write(config_file, {"debug": False})
+    _pin_mtime(config_file)
+    loader = _loader(skill_dir, config_file)
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"code-review"}
+
+    _write(config_file, {"code-review": False})
+    _pin_mtime(config_file)
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"debug"}
+
+
+def test_a_timestamp_moving_backward_is_still_a_change(skill_dir, config_file):
+    """Restoring a backup, a git checkout, an rsync --times of an older tree."""
+    _write(config_file, {"debug": False})
+    _pin_mtime(config_file, 1_700_000_000.0)
+    loader = _loader(skill_dir, config_file)
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"code-review"}
+
+    _write(config_file, {"code-review": False})
+    _pin_mtime(config_file, 1_600_000_000.0)
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"debug"}
+
+
+def test_an_identical_rewrite_is_not_a_change(skill_dir, config_file):
+    """Nothing to reload, so nothing should be reloaded."""
+    _write(config_file, {"debug": False})
+    loader = _loader(skill_dir, config_file)
+    assert {s.skill_id for s in loader.get_enabled_skills()} == {"code-review"}
+
+    _write(config_file, {"debug": False})
+    assert loader._extensions_config.has_changed() is False
