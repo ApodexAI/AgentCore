@@ -20,7 +20,13 @@ def new_task_id() -> TaskId:
 
 
 def new_event_id() -> EventId:
-    return EventId(uuid4().hex[:16])
+    raw = uuid4().hex
+    # Keep the historical 16-character lowercase-hex shape while making the
+    # opaque-id namespace disjoint from decimal store ordinals. UUID4's
+    # version nibble at index 12 is fixed to ``4``; replacing that non-random
+    # nibble with an alphabetic marker preserves the original 60 random bits
+    # and guarantees ``event_ordinal()`` cannot mistake this id for a cursor.
+    return EventId(f"e{raw[:12]}{raw[13:16]}")
 
 
 def new_session_id() -> SessionId:

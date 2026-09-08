@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from agent_core import types
 from agent_core.components.agent_bus.agent_comm import (
     AgentComm,
     DeliveryMode,
@@ -229,6 +230,25 @@ def test_default_event_id_generator_cannot_order_a_cursor():
     event = KernelEvent(
         task_id=TaskId("t1"), event_type=EventType.AGENT_MESSAGE,
         id=new_event_id(),
+    )
+    with pytest.raises(EventStoreContractError):
+        event_ordinal(event)
+
+
+def test_all_decimal_uuid_source_still_produces_an_opaque_event_id(monkeypatch):
+    """The opaque-id namespace must not overlap decimal store ordinals."""
+
+    class _AllDecimalUUID:
+        hex = "12345678901234567890123456789012"
+
+    monkeypatch.setattr(types, "uuid4", _AllDecimalUUID)
+
+    event_id = types.new_event_id()
+
+    assert event_id == "e123456789012456"
+    assert not event_id.isdecimal()
+    event = KernelEvent(
+        task_id=TaskId("t1"), event_type=EventType.AGENT_MESSAGE, id=event_id,
     )
     with pytest.raises(EventStoreContractError):
         event_ordinal(event)

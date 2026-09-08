@@ -7,6 +7,22 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.9.1] - 2026-09-08
+
+### Fixed
+
+- `new_event_id()` now guarantees that its opaque 16-character lowercase-hex
+  value contains an alphabetic namespace marker. Previously it returned the
+  first 16 characters of a UUID4. Because the UUID version nibble is always the
+  decimal digit `4`, the whole value was accidentally decimal with probability
+  `(10/16)^15` (about 1 in 1,153). `AgentComm.event_ordinal()` then accepted that
+  opaque id as the legacy decimal-store fallback and advanced its in-process
+  cursor to a huge, non-monotonic value instead of raising
+  `EventStoreContractError`. The new shape remains 16 lowercase hex characters
+  and retains the same 60 random bits, but its namespace can no longer overlap
+  decimal store ordinals. A deterministic all-decimal UUID-source regression
+  test replaces the probabilistic coverage that made the contract test flaky.
+
 ## [0.9.0] - 2026-09-06
 
 ### Fixed
