@@ -24,6 +24,7 @@ from agent_core.loop_types import (
     ToolResult,
     TurnContext,
 )
+from agent_core.tool_content import redacted_for_trace
 
 _FORMATS: tuple[str, ...] = ("json", "jsonl")
 _DEFAULT_FORMATS: tuple[str, ...] = _FORMATS
@@ -399,7 +400,10 @@ class TrajectoryFileObserver(BaseObserver):
         is a copy. Anything that isn't a role-bearing dict is dropped.
         """
         if isinstance(m, dict) and m.get("role"):
-            return dict(m)
+            # ``redacted_for_trace`` swaps an inline image's base64 for its
+            # size. Verbatim, one 1080p screenshot writes ~137 KB here for
+            # every turn it stays in history.
+            return dict(redacted_for_trace(m))
         return None
 
     # ── Lifecycle hooks ─────────────────────────────────────────────────

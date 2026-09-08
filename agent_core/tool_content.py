@@ -55,6 +55,7 @@ __all__ = [
     "message_image_meta",
     "message_image_tokens",
     "parse_tool_content",
+    "redacted_for_trace",
     "sniff_image_size",
     "tool_content",
 ]
@@ -354,3 +355,58 @@ def message_image_tokens(message: Any) -> int:
             priced = 0
         total += priced or _UNKNOWN_IMAGE_TOKENS
     return total
+
+
+def redacted_for_trace(message: Any) -> Any:
+    """A copy of *message* with inline image payloads replaced by a marker.
+
+    For anything that writes a message somewhere other than the provider: a
+    trajectory file, a log line, an event record. The base64 of a single 1080p
+    screenshot is ~137 KB, and a trace that copies messages verbatim writes that
+    again for every turn the image survives in history -- a few screenshots turn
+    a readable trajectory into tens of megabytes of unreadable one.
+
+    The block KEEPS its ``image_url`` type and gains a stated size, so a reader
+    can still see that an image was in the request and how big it was. That
+    matters for the same reason the loop narrates evictions: a trace that shows
+    no image where the model saw one misrepresents what the model was answering.
+
+    Returns the message unchanged (not a copy) when it carries no inline image,
+    which is nearly every message.
+    """
+    if not isinstance(message, dict):
+        return message
+    typed = cast("dict[str, Any]", message)
+    content = typed.get("content")
+    if not isinstance(content, list):
+        return typed
+    blocks = cast("list[Any]", content)
+    if not any(
+        isinstance(block, dict)
+        and cast("dict[str, Any]", block).get("type") == "image_url"
+        for block in blocks
+    ):
+        return typed
+
+    redacted: list[Any] = []
+    for block in blocks:
+        entry = cast("dict[str, Any]", block) if isinstance(block, dict) else None
+        if entry is None or entry.get("type") != "image_url":
+            redacted.append(block)
+            continue
+        url = entry.get("image_url")
+        raw = str(cast("dict[str, Any]", url).get("url") or "") if isinstance(url, dict) else ""
+        redacted.append({
+            "type": "image_url",
+            "image_url": {"url": _elided_data_uri(raw)},
+        })
+    return {**typed, "content": redacted}
+
+
+def _elided_data_uri(url: str) -> str:
+    """``data:image/png;base64,<...>`` → a same-shaped string stating the size."""
+    if not url.startswith("data:") or ";base64," not in url:
+        return url
+    prefix, payload = url.split(";base64,", 1)
+    approx_kb = max(1, (len(payload) * 3 // 4) // 1024)
+    return f"{prefix};base64,[{approx_kb} KB of image data elided from trace]"

@@ -346,3 +346,52 @@ def test_images_without_bookkeeping_are_still_charged() -> None:
     )
     del message["image_meta"]
     assert estimate_message_tokens(message) > 1000
+
+
+# ── trace redaction ───────────────────────────────────────────────────────
+
+
+def test_trace_redaction_keeps_the_shape_and_states_the_size() -> None:
+    from agent_core.tool_content import redacted_for_trace
+
+    message = _attached(
+        "shot:", [image_attachment(_png(1920, 1080), "image/png")], _vision_profile(),
+    )
+    traced = redacted_for_trace(message)
+    url = traced["content"][1]["image_url"]["url"]
+    assert "base64" in url
+    assert "elided from trace" in url
+    assert "KB" in url
+    # Still visibly an image, so a trace does not misrepresent what the model saw.
+    assert traced["content"][1]["type"] == "image_url"
+    assert traced["content"][0] == {"type": "text", "text": "shot:"}
+    # And the real message is untouched.
+    assert message["content"][1]["image_url"]["url"].startswith("data:image/png;base64,i")
+
+
+def test_trace_redaction_is_a_no_op_for_ordinary_messages() -> None:
+    from agent_core.tool_content import redacted_for_trace
+
+    plain = tool_msg("no images", "call_1")
+    assert redacted_for_trace(plain) is plain
+    assert redacted_for_trace("not a message") == "not a message"
+
+
+def test_the_trajectory_observer_does_not_write_base64() -> None:
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from agent_core.components.observers.trajectory import TrajectoryFileObserver
+
+    message = _attached(
+        "shot:", [image_attachment(_png(1920, 1080), "image/png")], _vision_profile(),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        observer = TrajectoryFileObserver(Path(tmp))
+        rendered = observer._message_to_dict(message)
+    assert rendered is not None
+    body = json.dumps(rendered)
+    assert "elided from trace" in body
+    # A 1080p PNG is ~137 KB of base64; the trace entry must not carry it.
+    assert len(body) < 2000

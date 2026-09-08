@@ -73,6 +73,12 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   a 4K one ~8.5K). It previously returned the length of the caption alone, so a
   history of screenshots measured as nearly empty to the context guard and to
   every compaction trigger. Estimates for image-free histories are unchanged.
+- `TrajectoryFileObserver` writes `[N KB of image data elided from trace]` in
+  place of an inline image's base64, via the new
+  `tool_content.redacted_for_trace`. It copied messages verbatim, so one 1080p
+  screenshot wrote ~137 KB into the trajectory for every turn it survived in
+  history. The block keeps its `image_url` type and states its size, because a
+  trace showing no image where the model saw one misreports what was answered.
 - `Message` gains the in-process key `image_meta`, positionally aligned with the
   `image_url` blocks in `content`. It is outside `WIRE_MESSAGE_KEYS`, so
   `for_wire` strips it. It is message-level rather than per-block because a
