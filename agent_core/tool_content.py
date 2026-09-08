@@ -56,6 +56,7 @@ __all__ = [
     "message_image_tokens",
     "parse_tool_content",
     "redacted_for_trace",
+    "redacted_tool_result_content",
     "sniff_image_size",
     "tool_content",
 ]
@@ -184,12 +185,14 @@ def _validated_image(candidate: Any) -> tuple[dict[str, Any] | None, str]:
     data = image.get("data")
     if not isinstance(data, str) or not data:
         return None, "no base64 payload"
-    # Validated here rather than at the provider: a bad payload is an HTTP 400
-    # that takes the whole turn down, and the turn's other tool results with it.
+    # Validated here rather than at the provider: a bad payload fails the whole
+    # completion (HTTP 500 on the calibrated Apodex endpoint), including the
+    # turn's other tool results.
     try:
-        decoded_size = len(base64.b64decode(data, validate=True))
+        decoded = base64.b64decode(data, validate=True)
     except (binascii.Error, ValueError):
         return None, "payload is not valid base64"
+    decoded_size = len(decoded)
     if decoded_size == 0:
         return None, "payload is empty"
     if decoded_size > MAX_IMAGE_BYTES:
@@ -198,16 +201,27 @@ def _validated_image(candidate: Any) -> tuple[dict[str, Any] | None, str]:
             f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB per-image cap"
         )
 
-    accepted: dict[str, Any] = {"mime_type": mime, "data": data}
+    actual_mime = _sniff_image_mime(decoded)
+    if actual_mime is None:
+        return None, "payload is not a recognizable supported image"
+    if actual_mime != mime:
+        return None, f"payload is {actual_mime}, not declared {mime}"
+    width, height = sniff_image_size(decoded)
+    if width <= 0 or height <= 0:
+        return None, "image dimensions could not be read"
+
+    accepted: dict[str, Any] = {
+        "mime_type": mime,
+        "data": data,
+        # Always derive accounting dimensions from the payload. A producer's
+        # stale or incorrect declaration must not turn a 4K image into a
+        # one-token image and bypass the context-overflow guard.
+        "width": width,
+        "height": height,
+    }
     label = image.get("label")
     if isinstance(label, str) and label:
         accepted["label"] = label
-    width, height = _declared_size(image)
-    if width <= 0 or height <= 0:
-        width, height = sniff_image_size(base64.b64decode(data, validate=True))
-    if width > 0 and height > 0:
-        accepted["width"] = width
-        accepted["height"] = height
     return accepted, ""
 
 
@@ -245,19 +259,32 @@ def sniff_image_size(data: bytes) -> tuple[int, int]:
     return 0, 0
 
 
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Recognize one of the supported image encodings from its header."""
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return "image/png"
+    if len(data) >= 10 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 25 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 11 and data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    return None
+
+
 def _webp_size(data: bytes) -> tuple[int, int]:
     chunk = data[12:16]
-    if chunk == b"VP8X":
+    if chunk == b"VP8X" and len(data) >= 30:
         return (
             int.from_bytes(data[24:27], "little") + 1,
             int.from_bytes(data[27:30], "little") + 1,
         )
-    if chunk == b"VP8 ":
+    if chunk == b"VP8 " and len(data) >= 30:
         return (
             int.from_bytes(data[26:28], "little") & 0x3FFF,
             int.from_bytes(data[28:30], "little") & 0x3FFF,
         )
-    if chunk == b"VP8L":
+    if chunk == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
         bits = int.from_bytes(data[21:25], "little")
         return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
     return 0, 0
@@ -401,6 +428,32 @@ def redacted_for_trace(message: Any) -> Any:
             "image_url": {"url": _elided_data_uri(raw)},
         })
     return {**typed, "content": redacted}
+
+
+def redacted_tool_result_content(
+    text: str,
+    images: list[dict[str, Any]],
+) -> str | list[dict[str, Any]]:
+    """Render returned images for a trace without retaining their Base64.
+
+    This describes what the tool returned. Delivery to the provider remains a
+    separate loop decision, so trace consumers must not interpret these blocks
+    as proof that a text-only profile received the pixels.
+    """
+    if not images:
+        return text
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    for image in images:
+        mime = str(image.get("mime_type") or "image/unknown")
+        payload = str(image.get("data") or "")
+        prefix = f"data:{mime}"
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": _elided_data_uri(f"{prefix};base64,{payload}")},
+        })
+    return blocks
 
 
 def _elided_data_uri(url: str) -> str:

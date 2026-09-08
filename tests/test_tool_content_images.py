@@ -114,6 +114,24 @@ def test_a_rejected_image_is_reported_not_dropped(image: Any, reason: str) -> No
     assert reason in text
 
 
+def test_base64_valid_non_image_is_rejected_before_the_provider() -> None:
+    image = image_attachment(b"not an image", "image/png")
+    parsed = parse_tool_content(tool_content("image follows", images=[image]))
+    assert parsed is not None
+    text, images = parsed
+    assert images == []
+    assert "not a recognizable supported image" in text
+
+
+def test_declared_mime_must_match_the_payload() -> None:
+    image = image_attachment(_png(8, 8), "image/jpeg")
+    parsed = parse_tool_content(tool_content("image follows", images=[image]))
+    assert parsed is not None
+    text, images = parsed
+    assert images == []
+    assert "payload is image/png, not declared image/jpeg" in text
+
+
 def test_oversized_image_is_rejected_with_its_size() -> None:
     payload = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * MAX_IMAGE_BYTES)
     parsed = parse_tool_content(
@@ -155,6 +173,25 @@ def test_token_estimate_tracks_pixels() -> None:
     large = image_tokens({"width": 1920, "height": 1080})
     assert small == pytest.approx(225, abs=30)
     assert large == pytest.approx(2043, abs=200)
+
+
+def test_payload_dimensions_override_an_incorrect_declaration() -> None:
+    envelope = tool_content(
+        "screenshot:",
+        images=[
+            image_attachment(
+                _png(1920, 1080),
+                "image/png",
+                width=1,
+                height=1,
+            )
+        ],
+    )
+    parsed = parse_tool_content(envelope)
+    assert parsed is not None
+    _, images = parsed
+    assert (images[0]["width"], images[0]["height"]) == (1920, 1080)
+    assert image_tokens(images[0]) > 1500
 
 
 def test_estimate_counts_attached_images() -> None:
@@ -395,3 +432,48 @@ def test_the_trajectory_observer_does_not_write_base64() -> None:
     assert "elided from trace" in body
     # A 1080p PNG is ~137 KB of base64; the trace entry must not carry it.
     assert len(body) < 2000
+
+
+@pytest.mark.asyncio
+async def test_live_trajectory_records_returned_images_without_base64(tmp_path) -> None:
+    import json
+    from types import SimpleNamespace
+
+    from agent_core.components.observers.trajectory import TrajectoryFileObserver
+    from agent_core.loop_types import LoopConfig, ToolResult
+
+    attachment = image_attachment(
+        _png(64, 32),
+        "image/png",
+        label="/tmp/live.png",
+    )
+    observer = TrajectoryFileObserver(
+        tmp_path,
+        filename="live",
+        formats=["json", "jsonl"],
+    )
+    await observer.on_loop_start(LoopConfig(task_id="probe"))
+    await observer.on_tool_result(
+        SimpleNamespace(turn=1),
+        ToolResult(
+            name="view_image",
+            args={"path": "/tmp/live.png"},
+            result="image follows",
+            duration_ms=1,
+            tool_call_id="call_1",
+            is_error=False,
+            images=[attachment],
+        ),
+    )
+    observer._flush_json(force=True)
+
+    envelope = json.loads((tmp_path / "live.json").read_text(encoding="utf-8"))
+    content = envelope["messages"][-1]["content"]
+    assert content[1]["type"] == "image_url"
+    assert "elided from trace" in content[1]["image_url"]["url"]
+
+    jsonl = (tmp_path / "live.jsonl").read_text(encoding="utf-8")
+    assert '"images"' in jsonl
+    assert "elided from trace" in jsonl
+    assert attachment["data"] not in json.dumps(envelope)
+    assert attachment["data"] not in jsonl

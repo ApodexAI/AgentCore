@@ -24,7 +24,7 @@ from agent_core.loop_types import (
     ToolResult,
     TurnContext,
 )
-from agent_core.tool_content import redacted_for_trace
+from agent_core.tool_content import redacted_for_trace, redacted_tool_result_content
 
 _FORMATS: tuple[str, ...] = ("json", "jsonl")
 _DEFAULT_FORMATS: tuple[str, ...] = _FORMATS
@@ -567,7 +567,7 @@ class TrajectoryFileObserver(BaseObserver):
         # — that fallback advances ``_tool_results_seen``, so sharing it would
         # double-count, and a synthesised id matches nothing outside the
         # snapshot anyway. Empty here means the runtime itself had no id.
-        self._write_jsonl({
+        jsonl_record: dict[str, Any] = {
             "t": "result",
             "turn": ctx.turn,
             "name": result.name,
@@ -575,7 +575,12 @@ class TrajectoryFileObserver(BaseObserver):
             "result": result.result,
             "error": result.is_error,
             "ms": result.duration_ms,
-        })
+        }
+        if result.images:
+            # The result event predates message attachment/capability gating, so
+            # this states what the TOOL returned, not that every profile saw it.
+            jsonl_record["images"] = redacted_tool_result_content("", result.images)
+        self._write_jsonl(jsonl_record)
 
         if "json" in self._formats:
             cid = getattr(result, "tool_call_id", "") or ""
@@ -588,10 +593,14 @@ class TrajectoryFileObserver(BaseObserver):
                 )
                 self._tool_results_seen[ctx.turn] = seen + 1
             body = _clip(self._stringify(result.result), _BODY_MAX_CHARS)
+            rendered_body = f"[error] {body}" if result.is_error else body
             self._append_message({
                 "role": "tool",
                 "tool_call_id": cid,
-                "content": f"[error] {body}" if result.is_error else body,
+                "content": redacted_tool_result_content(
+                    rendered_body,
+                    result.images,
+                ),
             })
             self._flush_json()
         return None

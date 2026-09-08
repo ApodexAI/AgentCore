@@ -119,7 +119,11 @@ The split of responsibility:
   `ModelProfile.supports_images` and `ModelProfile.protocol`, and how many stay
   in history, from `HistoryPolicy.max_images_in_history`. Products do not
   pre-filter on capability: `attach_images` is called unconditionally and writes
-  the withheld note itself.
+  the withheld note itself. Before that decision, core verifies that the decoded
+  bytes have a supported image header matching the declared MIME type. It also
+  derives dimensions from those bytes rather than trusting producer metadata;
+  the dimensions drive context-budget accounting and cannot be allowed to
+  understate the actual image.
 
 `ToolResult.images` is populated by core (`tool_exec` parses the envelope) and
 consumed by core (`agent_loop` builds the message). It is not a host-supplied

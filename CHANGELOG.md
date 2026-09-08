@@ -44,6 +44,12 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 ### Fixed
 
+- Structured image results now reject Base64-valid data that is not a
+  recognizable PNG, JPEG, WEBP or GIF, and reject a declared MIME type that
+  disagrees with the payload. The Apodex endpoint otherwise fails the entire
+  completion while decoding the bad image. Token-accounting dimensions are
+  always read from the payload, so stale producer metadata cannot price a 4K
+  image as one token and bypass the context guard.
 - `ExtensionsConfig.has_changed` compares a digest of the file's bytes instead
   of `st_mtime > loaded_mtime`, so a skill toggled on disk is actually picked up
   by `get_enabled_skills`. Timestamps are much coarser than the edits they were
@@ -75,10 +81,10 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   every compaction trigger. Estimates for image-free histories are unchanged.
 - `TrajectoryFileObserver` writes `[N KB of image data elided from trace]` in
   place of an inline image's base64, via the new
-  `tool_content.redacted_for_trace`. It copied messages verbatim, so one 1080p
-  screenshot wrote ~137 KB into the trajectory for every turn it survived in
-  history. The block keeps its `image_url` type and states its size, because a
-  trace showing no image where the model saw one misreports what was answered.
+  `tool_content.redacted_for_trace`. Live tool-result JSON and JSONL entries
+  record the same redacted shape from `ToolResult.images`; previously that path
+  kept only the text and omitted that the tool returned an image. The block
+  keeps its `image_url` type and states its size, without copying the Base64.
 - `Message` gains the in-process key `image_meta`, positionally aligned with the
   `image_url` blocks in `content`. It is outside `WIRE_MESSAGE_KEYS`, so
   `for_wire` strips it. It is message-level rather than per-block because a
