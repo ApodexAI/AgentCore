@@ -32,6 +32,7 @@ import json
 from typing import Any, cast
 
 from agent_core.messages import text_of
+from agent_core.tool_content import message_image_tokens
 
 # Per-message wire overhead (role, delimiters, the trailing separator). Same
 # constant ``compact.estimate_tokens`` adds when it sums a whole history.
@@ -84,4 +85,10 @@ def estimate_message_tokens(message: Any) -> int:
     tokens = estimate_text_tokens(text_of(content)) + _PER_MESSAGE_OVERHEAD
     if tool_calls:
         tokens += estimate_text_tokens(_tool_calls_text(tool_calls))
+    # Inline images contribute no text, so without this a tool result carrying a
+    # 1080p screenshot -- about 2.4K prompt tokens on the model this was
+    # calibrated against -- measures as the length of its caption. The context
+    # guard and every compaction trigger read this number, so undercounting it
+    # is how a history walks into an overflow the guard reported as comfortable.
+    tokens += message_image_tokens(message)
     return tokens

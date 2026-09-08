@@ -98,3 +98,50 @@ product words its note. Two consequences worth stating:
 - AgentCore still words nothing about repeats. A product moving off its own loop
   copy must port its note into `render_tool_result`; nothing here will fail if it
   forgets, which is why this paragraph exists.
+
+## Image attachments: the core decides visibility, the product supplies pixels
+
+A tool returns images by returning the `agent_core.tool_content.tool_content`
+envelope — a plain JSON dict — instead of a string. Sandbox-native tools run in
+a child process and their return value crosses `json.dumps(default=str)` on the
+way back, so the envelope is a dict by requirement, not by taste; a dataclass
+arrives as its repr.
+
+The split of responsibility:
+
+- **The product** decides what is worth attaching, and downscales. Pixel count
+  is the cost driver (roughly 1 token per 1024 px against the model this was
+  calibrated on — a 1080p screenshot ~2.4K tokens, a 4K one ~8.5K), and
+  AgentCore has no imaging dependency with which to resize. The caps in
+  `tool_content` (6 MB and 8 images per result) are a backstop against a
+  runaway producer, not a resize policy.
+- **AgentCore** decides whether an attachment is shown, from
+  `ModelProfile.supports_images` and `ModelProfile.protocol`, and how many stay
+  in history, from `HistoryPolicy.max_images_in_history`. Products do not
+  pre-filter on capability: `attach_images` is called unconditionally and writes
+  the withheld note itself.
+
+`ToolResult.images` is populated by core (`tool_exec` parses the envelope) and
+consumed by core (`agent_loop` builds the message). It is not a host-supplied
+field, so unlike `result_id` and the repeated-invocation metadata above it needs
+no boundary exemption.
+
+### Why every disappearance is narrated
+
+Both the capability path and the eviction path replace the image with a sentence
+saying an image was there and is not visible. The calibration run behind this
+feature (MiroHarness
+`internal-docs/designs/2026-09-08-native-image-in-tool-result-calibration.md`)
+removed the image block from an otherwise working request and changed nothing
+else. The model had been told to answer `NO_IMAGE` if it could not see
+an image; it instead produced a four-digit code and three shapes, every one of
+them invented. A tool result whose text reads as though an image were delivered
+will be answered as though one were, so the text has to say otherwise. A product
+that adds its own image-bearing path — or its own compactor that touches these
+messages — inherits that obligation.
+
+For the same reason `messages.text_of` renders an `image_url` block as a
+placeholder rather than as nothing: every flattening caller (Anthropic message
+translation, compaction summaries, trajectory lines) is dropping the image at
+that call, and a transcript that never mentions the picture is the same trap in
+a different place.

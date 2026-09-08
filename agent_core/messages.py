@@ -75,6 +75,15 @@ class Message(TypedDict, total=False):
     # the text back, which is what makes an index distinguishable from a summary
     # that happens to quote one. Filtered out by ``for_wire``.
     spill_refs: list[str]
+    # Per-image bookkeeping for the ``image_url`` blocks in ``content``, in the
+    # same order: ``{"label": str, "tokens": int}`` each. Written by
+    # ``runtime.loop.image_attach.attach_images`` and read back by eviction (to
+    # name an image it is removing) and by the token estimate (so a history of
+    # images is not costed at zero). It cannot live inside the content blocks:
+    # a content part carrying an unknown key is rejected outright by the served
+    # endpoint's pydantic union, whereas a message-level key outside
+    # ``WIRE_MESSAGE_KEYS`` is dropped by ``for_wire``.
+    image_meta: list[dict[str, Any]]
 
 
 # ── Wire boundary ────────────────────────────────────────────────────────
@@ -222,6 +231,10 @@ def assistant_msg_with_reasoning(
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
+# What an inline image renders as once its blocks are flattened away.
+_IMAGE_PLACEHOLDER = "[image — not visible in this text-only rendering]"
+
+
 def text_of(content: Any) -> str:
     """Flatten an OpenAI/Anthropic message content to plain text."""
     if content is None:
@@ -235,6 +248,18 @@ def text_of(content: Any) -> str:
                 parts.append(block)
             elif isinstance(block, dict):
                 content_block = cast(dict[str, object], block)
+                # An image flattened to text must leave a mark. Every caller is
+                # either estimating size or building a text-only rendering --
+                # the Anthropic translation, a compaction summary, a trajectory
+                # line -- and in the rendering case the image is being dropped
+                # right here. Returning nothing for it yields a tool result that
+                # reads as though it were pure text and never mentioned an
+                # image, which is the exact input that made the calibration
+                # model invent a reading of a picture it could not see (see
+                # ``runtime.loop.image_attach``).
+                if content_block.get("type") == "image_url":
+                    parts.append(_IMAGE_PLACEHOLDER)
+                    continue
                 val = content_block.get("text") or content_block.get("content") or ""
                 if isinstance(val, str):
                     parts.append(val)
