@@ -35,7 +35,9 @@ from agent_core.types import TaskStatus, new_event_id, new_prompt_id, new_sessio
 
 
 def test_identity_shapes_and_string_event_contract() -> None:
-    assert len(new_event_id()) == 16
+    event_id = new_event_id()
+    assert len(event_id) == 16
+    assert not event_id.isdecimal()
     assert len(new_session_id()) == 12
     assert len(new_prompt_id()) == 12
     assert len(new_step_id()) == 10

@@ -51,8 +51,9 @@ retained event: `KernelEvent.seq`, a monotonically increasing integer, or a
 decimal `KernelEvent.id` for stores whose integer primary key already serves as
 the id. `EventReader`'s `after_id` cursor is expressed in that ordinal, and it —
 not `timestamp` — defines the order. `EventId` is deliberately an opaque
-string, so `types.new_event_id()` (uuid4 hex: neither numeric nor monotonic)
-cannot order a cursor; a store that stamps only that fails
+string, so `types.new_event_id()` (16-character uuid4-derived hex with a
+guaranteed alphabetic namespace marker: neither numeric nor monotonic) cannot
+order a cursor; a store that stamps only that fails
 `AgentComm.consume` with `EventStoreContractError`, and `AgentBus` logs the
 lost durable-recovery capability at ERROR while still degrading to the
 in-memory path. `tests/test_agent_comm_store_contract.py` is the executable
