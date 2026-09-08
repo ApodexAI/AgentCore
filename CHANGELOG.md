@@ -7,6 +7,91 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.10.0] - 2026-09-08
+
+### Added
+
+- A tool can return images that the model itself looks at, instead of prose from
+  a second model describing them. Return
+  `tool_content(text, images=[image_attachment(png_bytes, "image/png", label=path)])`
+  from `agent_core.tool_content` — a plain JSON dict, not a dataclass, so it
+  survives the `json.dumps` boundary a sandbox-native tool's return value
+  crosses. `ToolResult` grows an `images` field; `result` remains the full text,
+  so observers, spill/recovery, repeat detection and the trajectory see exactly
+  what they saw before.
+
+  Whether the pixels reach the provider is decided by the loop, from
+  `ModelProfile.supports_images` (default `False`, so nothing changes for a
+  product that does not opt in) and the wire protocol. Only
+  `chat_completions` is implemented: the attachment becomes an OpenAI
+  `image_url` content part carrying a data URI. The Anthropic block spelling is
+  **not** interchangeable — a served OpenAI-compatible endpoint rejects it with
+  HTTP 400 and a pydantic union error, taking the whole turn down, so an
+  unimplemented protocol withholds rather than guessing.
+
+  `HistoryPolicy.max_images_in_history` (default 5) now does something: after
+  each tool batch the loop keeps that many of the newest images and replaces
+  the rest with text. Both flags existed as unread placeholders before this
+  release.
+
+  **An image that leaves the context always leaves a sentence behind** — when
+  it is withheld for capability reasons, and when it is evicted for room. This
+  is not cosmetic. In the calibration run, deleting the image block from an
+  otherwise working request did not make the model report a missing image: it
+  reported a four-digit code and three shapes, all invented. A tool result that
+  reads as though an image were delivered will be answered as though one were.
+  Products adding their own image paths should preserve this property.
+
+### Fixed
+
+- Structured image results now reject Base64-valid data that is not a
+  recognizable PNG, JPEG, WEBP or GIF, and reject a declared MIME type that
+  disagrees with the payload. Lightweight container checks also reject common
+  truncation and corruption before delivery (including PNG chunk/CRC damage).
+  The Apodex endpoint otherwise fails the entire completion while decoding the
+  bad image. Token-accounting dimensions are always read from the payload, so
+  stale producer metadata cannot price a 4K image as one token and bypass the
+  context guard.
+- `ExtensionsConfig.has_changed` compares a digest of the file's bytes instead
+  of `st_mtime > loaded_mtime`, so a skill toggled on disk is actually picked up
+  by `get_enabled_skills`. Timestamps are much coarser than the edits they were
+  being asked to order: the filesystem clock advances in 1 ms steps and two
+  consecutive writes collide on a single mtime about 92% of the time, so a
+  change landing in the same millisecond as the load was invisible. The strict
+  `>` also could not see a timestamp moving BACKWARD -- restoring a backup, a
+  `git checkout`, an `rsync --times` of an older revision -- and it reported a
+  change for an identical rewrite, forcing a reload with nothing to reload.
+  This surfaced as an intermittent failure in `test_skills_loader_reload.py`
+  whose rate tracked machine speed; the regression tests now pin both
+  timestamps to one value and fail deterministically without the fix.
+
+### Changed
+
+- `messages.text_of` renders an `image_url` content block as
+  `[image — not visible in this text-only rendering]` instead of the empty
+  string. Every caller is either sizing a message or building a text-only
+  rendering — the Anthropic message translation, a compaction summary, a
+  trajectory line — and in the rendering case the image is being dropped at
+  that call. **If a product already puts `image_url` blocks in `content`, its
+  flattened text changes**; nothing else in this package produced such blocks
+  before 0.10.0.
+- `tokens.estimate_message_tokens` charges for inline images, read off the
+  `image_meta` message key written at attach time (~1 token per 1024 pixels,
+  fitted against measured `prompt_tokens`; a 1080p screenshot is ~2.4K tokens,
+  a 4K one ~8.5K). It previously returned the length of the caption alone, so a
+  history of screenshots measured as nearly empty to the context guard and to
+  every compaction trigger. Estimates for image-free histories are unchanged.
+- `TrajectoryFileObserver` writes `[N KB of image data elided from trace]` in
+  place of an inline image's base64, via the new
+  `tool_content.redacted_for_trace`. Live tool-result JSON and JSONL entries
+  record the same redacted shape from `ToolResult.images`; previously that path
+  kept only the text and omitted that the tool returned an image. The block
+  keeps its `image_url` type and states its size, without copying the Base64.
+- `Message` gains the in-process key `image_meta`, positionally aligned with the
+  `image_url` blocks in `content`. It is outside `WIRE_MESSAGE_KEYS`, so
+  `for_wire` strips it. It is message-level rather than per-block because a
+  content part carrying an unknown key is rejected by the served endpoint.
+
 ## [0.9.1] - 2026-09-08
 
 ### Fixed

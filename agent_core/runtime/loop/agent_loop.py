@@ -49,6 +49,7 @@ from agent_core.runtime.loop.compact import (
     DefaultMessageCompactor,
     estimate_tokens,
 )
+from agent_core.runtime.loop.image_attach import attach_images, evict_old_images
 from agent_core.runtime.loop.llm_client import (
     RUNAWAY_STATE_KEY,
     TRUNCATION_CONTINUATION_GUIDANCE,
@@ -527,6 +528,8 @@ async def _run_loop_inner(
                 runtime.body_has_spill_reference,
                 runtime.render_tool_result,
                 result_max_chars=tool_result_cap,
+                profile=profile,
+                max_images_in_history=policy.max_images_in_history,
             )
             total_tool_calls += tool_calls_executed
             if stop_reason:
@@ -1259,6 +1262,10 @@ async def _execute_tool_calls(
     ],
     *,
     result_max_chars: int | None = None,
+    profile: ModelProfile | None = None,
+    # -1 disables eviction. Not 0: a defaulted caller must not silently mean
+    # "throw every image away", which is what a 0 default would spell.
+    max_images_in_history: int = -1,
 ) -> tuple[str, int]:
     executable: list[tuple[int, dict]] = []
     synthetic: list[tuple[int, ToolResult]] = []
@@ -1356,7 +1363,25 @@ async def _execute_tool_calls(
             tr_result.tool_call_id,
         )
         cast("dict[str, Any]", history_message).update(message_metadata)
+        # After the recovery handle and the host metadata, so the text the model
+        # reads is final before it becomes the text block of a multimodal
+        # message. Called unconditionally: when the model cannot see images
+        # ``attach_images`` writes the note saying so, and a caller that skipped
+        # it on capability grounds would produce the one shape that is actually
+        # dangerous -- a result reading as though an image had been delivered,
+        # with no image in it.
+        attach_images(
+            history_message,
+            tr_result.images,
+            profile=profile or ModelProfile(model_id="default", provider="openai"),
+        )
         messages.append(history_message)
+
+    # Bound the history's image count once the batch is in, not before: the
+    # newest results are the ones worth keeping, and evicting first would let a
+    # turn that returned several images push out its own.
+    if max_images_in_history >= 0:
+        evict_old_images(messages, max_images_in_history)
 
     if any(result.interrupted for result in results):
         wait_interventions = await notify_observers(obs, "on_tool_wait_interrupted", ctx)

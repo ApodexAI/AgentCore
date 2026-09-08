@@ -312,6 +312,13 @@ class ToolResult:
     error_kind: str = ""
     # Opaque host-owned handle for a result body shed from model context.
     result_id: str = ""
+    # Image attachments the tool returned alongside ``result``, validated by
+    # ``agent_core.tool_content.parse_tool_content``. ``result`` stays the
+    # complete TEXT of the result, so every consumer that reads a string --
+    # observers, spill/recovery, repeat detection, the trajectory -- is
+    # unaffected by a tool that attaches images. Only the message built for the
+    # provider looks at this, and only when the model can actually see it.
+    images: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     # Host-provided repeated-invocation metadata. Execution is never skipped.
     repeat_count: int = 1
     repeat_recovery_id: str = ""

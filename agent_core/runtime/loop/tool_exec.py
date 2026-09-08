@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from agent_core.loop_types import ToolResult
+from agent_core.tool_content import parse_tool_content
 
 logger = logging.getLogger(__name__)
 
@@ -335,7 +336,16 @@ async def execute_tools(
                 else:
                     raw = await invocation
 
-            result = runtime.transform_result(name, str(raw) if raw is not None else "")
+            # A tool may hand back text plus image attachments instead of a
+            # bare string. Split them BEFORE the stringify: ``str()`` on the
+            # envelope would put a base64 blob's repr into the model's context
+            # and lose the attachment at the same time.
+            structured = parse_tool_content(raw)
+            if structured is not None:
+                raw_text, images = structured
+            else:
+                raw_text, images = (str(raw) if raw is not None else ""), []
+            result = runtime.transform_result(name, raw_text)
             metadata_raw = _safe_hook(
                 "result_metadata",
                 lambda: runtime.result_metadata(name, args, raw, result),
@@ -354,6 +364,7 @@ async def execute_tools(
                 duration_ms=int((time.monotonic() - start) * 1000),
                 tool_call_id=tool_call_id,
                 is_error=bool(error_kind),
+                images=images,
                 interrupted=woke_for_interrupt,
                 error_kind=error_kind,
                 result_id=str(metadata.get("result_id") or ""),

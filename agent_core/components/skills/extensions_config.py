@@ -7,10 +7,10 @@ no MCP server configuration.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +56,8 @@ class ExtensionsConfig(BaseModel):
 
     skills: dict[str, SkillStateConfig] = Field(default_factory=dict)
     _file_path: Path | None = PrivateAttr(default=None)
-    _file_mtime: float = PrivateAttr(default=0.0)
+    # Digest of the bytes this config was parsed from -- see ``has_changed``.
+    _file_digest: str = PrivateAttr(default="")
 
     model_config = {"populate_by_name": True}
 
@@ -79,14 +80,15 @@ class ExtensionsConfig(BaseModel):
             return cls()
 
         try:
-            with open(resolved, encoding="utf-8") as f:
-                data = json.load(f)
+            raw = resolved.read_bytes()
+            data = json.loads(raw.decode("utf-8"))
             _resolve_env_variables(data)
             logger.info("Loaded extensions config from %s", resolved)
             instance = cls.model_validate(data)
             instance._file_path = resolved
-            with suppress(OSError):
-                instance._file_mtime = resolved.stat().st_mtime
+            # Digest the exact bytes that were parsed, so the stored fingerprint
+            # and the loaded state can never describe different file contents.
+            instance._file_digest = _digest(raw)
             return instance
         except Exception as e:
             logger.warning("Failed to load extensions config %s: %s", resolved, e)
@@ -103,11 +105,33 @@ class ExtensionsConfig(BaseModel):
         return self._file_path
 
     def has_changed(self) -> bool:
-        """Return True if the backing file has been modified since load."""
+        """Return True if the backing file's contents differ from what we hold.
+
+        Compares a digest of the bytes, not the modification time. Two reasons,
+        both of which bit this code:
+
+        Timestamps are far coarser than the edits they are meant to order. The
+        filesystem clock here advances in 1 ms steps, and two consecutive writes
+        land on an identical mtime about 92% of the time -- so a change made
+        within a millisecond of the load was simply invisible, and an operator
+        toggling a skill got the old state until something else touched the
+        file. That was reaching the test suite as an intermittent failure whose
+        rate tracked how fast the machine happened to be running.
+
+        A strict ``>`` also cannot see a file whose timestamp moves BACKWARD,
+        which is the normal outcome of restoring a backup, a ``git checkout``,
+        or an ``rsync --times`` of an older revision. The content changed; the
+        config went on reporting that it had not.
+
+        The file is a small JSON document and this is called from
+        ``get_enabled_skills``, which its callers cache -- reading it is cheaper
+        than being wrong about it. An identical rewrite correctly reports no
+        change, since nothing needs reloading.
+        """
         if self._file_path is None or not self._file_path.is_file():
             return False
         try:
-            return self._file_path.stat().st_mtime > self._file_mtime
+            return _digest(self._file_path.read_bytes()) != self._file_digest
         except OSError:
             return False
 
@@ -115,6 +139,11 @@ class ExtensionsConfig(BaseModel):
         """Check if a skill is enabled (default: True if not listed)."""
         state = self.skills.get(skill_name)
         return state.enabled if state else True
+
+
+def _digest(raw: bytes) -> str:
+    """Content fingerprint. Not a security boundary -- just change detection."""
+    return hashlib.blake2b(raw, digest_size=16).hexdigest()
 
 
 def _resolve_env_variables(obj: Any) -> Any:
