@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import zlib
 from typing import Any, cast
 
 logger = logging.getLogger(__name__)
@@ -150,11 +151,13 @@ def parse_tool_content(raw: Any) -> tuple[str, list[dict[str, Any]]] | None:
     text = text if isinstance(text, str) else ("" if text is None else str(text))
 
     raw_images = envelope.get("images")
-    candidates: list[Any] = (
-        list(cast("list[Any]", raw_images)) if isinstance(raw_images, list) else []
-    )
+    candidates: list[Any] = []
     images: list[dict[str, Any]] = []
     rejected: list[str] = []
+    if isinstance(raw_images, list):
+        candidates = list(cast("list[Any]", raw_images))
+    elif raw_images is not None:
+        rejected.append("images field (must be a list)")
     for index, candidate in enumerate(candidates):
         if len(images) >= MAX_IMAGES_PER_RESULT:
             rejected.append(
@@ -206,6 +209,8 @@ def _validated_image(candidate: Any) -> tuple[dict[str, Any] | None, str]:
         return None, "payload is not a recognizable supported image"
     if actual_mime != mime:
         return None, f"payload is {actual_mime}, not declared {mime}"
+    if not _has_complete_image_container(decoded, actual_mime):
+        return None, "payload is truncated or structurally invalid"
     width, height = sniff_image_size(decoded)
     if width <= 0 or height <= 0:
         return None, "image dimensions could not be read"
@@ -270,6 +275,46 @@ def _sniff_image_mime(data: bytes) -> str | None:
     if len(data) >= 11 and data[:2] == b"\xff\xd8":
         return "image/jpeg"
     return None
+
+
+def _has_complete_image_container(data: bytes, mime: str) -> bool:
+    """Reject common truncation/corruption without adding an image decoder."""
+    if mime == "image/png":
+        return _has_complete_png_container(data)
+    if mime == "image/jpeg":
+        return data.endswith(b"\xff\xd9")
+    if mime == "image/gif":
+        return data.endswith(b"\x3b")
+    if mime == "image/webp":
+        return len(data) >= 12 and int.from_bytes(data[4:8], "little") + 8 == len(data)
+    return False
+
+
+def _has_complete_png_container(data: bytes) -> bool:
+    """Check PNG chunk bounds, CRCs, ordering anchors, and the final IEND."""
+    offset = 8
+    saw_header = False
+    saw_data = False
+    while offset + 12 <= len(data):
+        body_size = int.from_bytes(data[offset:offset + 4], "big")
+        chunk_end = offset + 12 + body_size
+        if chunk_end > len(data):
+            return False
+        chunk_type = data[offset + 4:offset + 8]
+        body = data[offset + 8:offset + 8 + body_size]
+        expected_crc = int.from_bytes(data[offset + 8 + body_size:chunk_end], "big")
+        if zlib.crc32(chunk_type + body) & 0xFFFFFFFF != expected_crc:
+            return False
+        if not saw_header:
+            if chunk_type != b"IHDR" or body_size != 13:
+                return False
+            saw_header = True
+        elif chunk_type == b"IDAT":
+            saw_data = True
+        elif chunk_type == b"IEND":
+            return body_size == 0 and saw_data and chunk_end == len(data)
+        offset = chunk_end
+    return False
 
 
 def _webp_size(data: bytes) -> tuple[int, int]:

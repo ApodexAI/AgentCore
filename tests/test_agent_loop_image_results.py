@@ -83,6 +83,15 @@ class ShotTool:
         }
 
 
+class BrokenShotTool(ShotTool):
+    async def ainvoke(self, args: dict[str, Any]) -> Any:
+        path = str(args.get("path") or "/tmp/broken.png")
+        return tool_content(
+            f"Image {path} is attached below.",
+            images=[image_attachment(b"not an image", "image/png", label=path)],
+        )
+
+
 def _call(index: int, path: str) -> dict[str, Any]:
     return {
         "id": f"tc{index}",
@@ -170,6 +179,35 @@ async def test_a_text_only_model_gets_the_warning_instead_of_the_bytes() -> None
     assert isinstance(content, str)
     assert "base64" not in content
     assert "have NOT" in content
+
+
+@pytest.mark.asyncio
+async def test_invalid_image_is_reported_and_never_reaches_the_llm() -> None:
+    llm = SequenceLLM([
+        LLMResponse(content="", tool_calls=[_call(0, "/tmp/broken.png")]),
+        LLMResponse(content="done"),
+    ])
+    result = await run_agent_loop(
+        system_prompt="system",
+        user_message="look",
+        llm=llm,
+        tools=[BrokenShotTool()],
+        config=_config(),
+        model_profile=ModelProfile(
+            model_id="apodex-1.1-mini",
+            provider="apodex",
+            supports_images=True,
+        ),
+    )
+
+    (history_message,) = _tool_messages(result.messages)
+    assert isinstance(history_message["content"], str)
+    assert "not a recognizable supported image" in history_message["content"]
+    assert "base64" not in history_message["content"]
+
+    (sent_message,) = _tool_messages(llm.calls[-1])
+    assert isinstance(sent_message["content"], str)
+    assert "not a recognizable supported image" in sent_message["content"]
 
 
 @pytest.mark.asyncio

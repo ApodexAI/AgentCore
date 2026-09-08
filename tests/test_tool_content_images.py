@@ -54,6 +54,32 @@ def _png(width: int, height: int) -> bytes:
     )
 
 
+_GIF_2X3 = base64.b64decode(
+    "R0lGODlhAgADAPAAAP8AAAAAACH5BAAAAAAALAAAAAACAAMAAAIChF8AOw=="
+)
+_JPEG_2X3 = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgG"
+    "BgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMD"
+    "AwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+    "EBAQEBAQEBAQEBAQEBD/wAARCAADAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAA"
+    "AAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAHC"
+    "f/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ADoDFU3/2Q=="
+)
+_WEBP_2X3 = base64.b64decode(
+    "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAMAAgA0JaACdLoB+AADsAD+8MQL"
+    "/yC5YXXI1/8gP+QH/ID/+PIAAAA="
+)
+
+
+def _real_images() -> list[tuple[str, bytes]]:
+    return [
+        ("image/png", _png(2, 3)),
+        ("image/gif", _GIF_2X3),
+        ("image/jpeg", _JPEG_2X3),
+        ("image/webp", _WEBP_2X3),
+    ]
+
+
 def _vision_profile() -> ModelProfile:
     return ModelProfile(
         model_id="apodex-1.1-mini", provider="apodex", supports_images=True,
@@ -130,6 +156,80 @@ def test_declared_mime_must_match_the_payload() -> None:
     text, images = parsed
     assert images == []
     assert "payload is image/png, not declared image/jpeg" in text
+
+
+@pytest.mark.parametrize(("mime", "payload"), _real_images())
+def test_each_supported_real_image_format_is_accepted(
+    mime: str,
+    payload: bytes,
+) -> None:
+    parsed = parse_tool_content(
+        tool_content("image follows", images=[image_attachment(payload, mime)])
+    )
+    assert parsed is not None
+    text, images = parsed
+    assert text == "image follows"
+    assert len(images) == 1
+    assert images[0]["mime_type"] == mime
+    assert (images[0]["width"], images[0]["height"]) == (2, 3)
+
+
+@pytest.mark.parametrize(("mime", "payload"), _real_images())
+def test_truncated_real_images_are_rejected(
+    mime: str,
+    payload: bytes,
+) -> None:
+    parsed = parse_tool_content(
+        tool_content("image follows", images=[image_attachment(payload[:-1], mime)])
+    )
+    assert parsed is not None
+    text, images = parsed
+    assert images == []
+    assert "truncated or structurally invalid" in text
+
+
+def test_corrupt_png_crc_is_rejected() -> None:
+    payload = bytearray(_png(2, 3))
+    payload[-1] ^= 0x01
+    parsed = parse_tool_content(
+        tool_content(
+            "image follows",
+            images=[image_attachment(bytes(payload), "image/png")],
+        )
+    )
+    assert parsed is not None
+    text, images = parsed
+    assert images == []
+    assert "structurally invalid" in text
+
+
+def test_malformed_images_field_is_reported() -> None:
+    parsed = parse_tool_content({
+        "__tool_content__": 1,
+        "text": "image follows",
+        "images": {"mime_type": "image/png", "data": "aGk="},
+    })
+    assert parsed is not None
+    text, images = parsed
+    assert images == []
+    assert "images field (must be a list)" in text
+
+
+def test_mixed_valid_and_invalid_images_keep_the_valid_one_and_report_the_other() -> None:
+    parsed = parse_tool_content(
+        tool_content(
+            "two images",
+            images=[
+                image_attachment(_png(2, 3), "image/png", label="valid"),
+                image_attachment(b"not an image", "image/png", label="invalid"),
+            ],
+        )
+    )
+    assert parsed is not None
+    text, images = parsed
+    assert [image["label"] for image in images] == ["valid"]
+    assert "image 2" in text
+    assert "not a recognizable supported image" in text
 
 
 def test_oversized_image_is_rejected_with_its_size() -> None:

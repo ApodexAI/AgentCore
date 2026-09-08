@@ -46,10 +46,12 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 - Structured image results now reject Base64-valid data that is not a
   recognizable PNG, JPEG, WEBP or GIF, and reject a declared MIME type that
-  disagrees with the payload. The Apodex endpoint otherwise fails the entire
-  completion while decoding the bad image. Token-accounting dimensions are
-  always read from the payload, so stale producer metadata cannot price a 4K
-  image as one token and bypass the context guard.
+  disagrees with the payload. Lightweight container checks also reject common
+  truncation and corruption before delivery (including PNG chunk/CRC damage).
+  The Apodex endpoint otherwise fails the entire completion while decoding the
+  bad image. Token-accounting dimensions are always read from the payload, so
+  stale producer metadata cannot price a 4K image as one token and bypass the
+  context guard.
 - `ExtensionsConfig.has_changed` compares a digest of the file's bytes instead
   of `st_mtime > loaded_mtime`, so a skill toggled on disk is actually picked up
   by `get_enabled_skills`. Timestamps are much coarser than the edits they were

@@ -120,7 +120,8 @@ The split of responsibility:
   in history, from `HistoryPolicy.max_images_in_history`. Products do not
   pre-filter on capability: `attach_images` is called unconditionally and writes
   the withheld note itself. Before that decision, core verifies that the decoded
-  bytes have a supported image header matching the declared MIME type. It also
+  bytes have a supported image header matching the declared MIME type and a
+  complete lightweight container shape (including PNG chunk CRCs). It also
   derives dimensions from those bytes rather than trusting producer metadata;
   the dimensions drive context-budget accounting and cannot be allowed to
   understate the actual image.
