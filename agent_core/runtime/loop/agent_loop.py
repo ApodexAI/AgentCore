@@ -149,6 +149,27 @@ async def _default_render_tool_result(
 
 
 @dataclass(frozen=True)
+class TurnToolSet:
+    """The tool set for one coming turn, returned by
+    :attr:`AgentLoopHooks.resolve_turn_tools`.
+
+    ``tools`` is the full set the loop binds for the turn — it becomes the tool
+    map, the parser's known-name set and the landing check's universe, and any
+    of them is callable. ``visible`` optionally narrows the turn to a subset by
+    writing the existing ``_llm_allowed_tools`` channel, which both hides the
+    rest from the request and refuses them if called — use it when a tool
+    should be off this turn, not merely undocumented. A tool that must stay
+    callable while hidden (deferred loading) is not this: leave ``visible`` at
+    ``None`` and filter the request's schemas at the LLM boundary instead.
+    ``None`` shows and permits all of ``tools`` and leaves any ``_llm_allowed_tools``
+    an observer set for the turn untouched.
+    """
+
+    tools: Sequence[ToolLike]
+    visible: frozenset[str] | None = None
+
+
+@dataclass(frozen=True)
 class AgentLoopHooks:
     """Product-owned runtime state injected around the shared loop engine."""
 
@@ -175,6 +196,17 @@ class AgentLoopHooks:
     context_overflow_recovery_note: Callable[
         [list[Message]], Message | None
     ] = _no_recovery_note
+
+    # Re-resolve the bound tool set at the top of each turn. Returning a
+    # ``TurnToolSet`` rebinds the loop's tool map, known-name set and the
+    # tool-bound LLM for that turn onward; returning ``None`` keeps the current
+    # binding (the default, so a product that does not reconfigure tools
+    # mid-run pays nothing). This is the one seam that lets a turn bind a tool
+    # the run did not start with — without it the loop freezes its tools once,
+    # outside the turn loop.
+    resolve_turn_tools: Callable[
+        [LoopConfig, dict[str, Any], int], TurnToolSet | None
+    ] | None = None
 
 
 async def _wait_for_tool_interrupt(
@@ -403,6 +435,28 @@ async def _run_loop_inner(
         attempts += 1
         if scope is not None:
             scope.metadata["current_turn"] = turn
+
+        # Re-resolve the turn's tools before anything reads them. A product
+        # that reconfigures its tool surface mid-run (adds an MCP server,
+        # disables a tool) returns the new full set here; the rebind updates
+        # the tool map, the parser's known-name set and the tool-bound LLM in
+        # place, so the request built below, the parser and the landing check
+        # all see it. ``None`` (the default and the common case) changes
+        # nothing and rebinds nothing, so there is no per-turn cost and no
+        # prompt-cache churn for a run whose tools never move.
+        if runtime.resolve_turn_tools is not None:
+            resolved = runtime.resolve_turn_tools(cfg, metadata, turn)
+            if resolved is not None:
+                tool_map = {t.name: t for t in resolved.tools}
+                tool_names = set(tool_map.keys())
+                llm_with_tools = bind_tools(
+                    llm_with_session, list(resolved.tools),
+                )
+                if resolved.visible is not None:
+                    # Reuse the per-turn narrowing channel _prepare_llm_request
+                    # already honours; only the shown set is narrowed, every
+                    # tool stays callable.
+                    metadata["_llm_allowed_tools"] = sorted(resolved.visible)
 
         (
             llm_for_turn,
