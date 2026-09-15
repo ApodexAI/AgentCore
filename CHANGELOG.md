@@ -7,6 +7,27 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.11.0] - 2026-09-14
+
+### Added
+
+- `AgentLoopHooks.resolve_turn_tools`, an optional hook the loop calls at the
+  top of every turn: returning a `TurnToolSet(tools=..., visible=...)` rebinds
+  the turn's tool map, the parser's known-name set and the tool-bound LLM;
+  returning `None` (the default) keeps the current binding and costs nothing.
+  This is the one seam that lets a turn bind a tool the run did not start with —
+  the loop otherwise freezes `tool_map` / `tool_names` / `llm_with_tools` once,
+  outside the turn loop. A product that reconfigures its tool surface mid-run
+  (installs an MCP server, disables a tool) resolves the new set here; a product
+  that does not supply the hook is byte-for-byte unaffected.
+
+  `TurnToolSet.tools` is the full callable set for the turn. `TurnToolSet.visible`
+  optionally narrows it by writing the existing `_llm_allowed_tools` channel,
+  which both hides the rest from the request and refuses them if called; leave
+  it `None` for a tool that must stay callable while hidden (deferred loading),
+  which a product filters at the LLM boundary instead. `TurnToolSet` is exported
+  from `agent_core.runtime.loop`.
+
 ## [0.10.0] - 2026-09-08
 
 ### Added

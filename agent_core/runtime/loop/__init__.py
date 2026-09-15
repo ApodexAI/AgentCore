@@ -1,6 +1,10 @@
 """Shared loop foundation primitives."""
 
-from agent_core.runtime.loop.agent_loop import AgentLoopHooks, run_agent_loop
+from agent_core.runtime.loop.agent_loop import (
+    AgentLoopHooks,
+    TurnToolSet,
+    run_agent_loop,
+)
 from agent_core.runtime.loop.budget_consistency import (
     COMPACTION_TRIGGER_RATIO,
     check_context_budget,
@@ -104,6 +108,7 @@ __all__ = [
     "TieredCompactor",
     "ToolCallRepairMiddleware",
     "ToolExecutionHooks",
+    "TurnToolSet",
     "bind_max_tokens",
     "bind_session_id",
     "bind_temperature",
