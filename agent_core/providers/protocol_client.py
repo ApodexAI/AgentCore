@@ -110,7 +110,9 @@ def _effort_str(cfg: dict[str, Any]) -> str:
     return effort.strip() if isinstance(effort, str) else ""
 
 
-def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient:
+def _build_anthropic(
+    cfg: dict[str, Any], title: str, *, bedrock: bool = False
+) -> LLMClient:
     """Native Anthropic Messages API with extended thinking.
 
     Responses carry thinking + signature blocks, kept verbatim
@@ -120,7 +122,7 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
     (``bedrock=True``, AWS Bedrock runtime, Bearer API-key auth + the
     ``anthropic_version`` body stamp). Optional ``effort`` →
     ``output_config.effort``. ``default_headers`` (gateway routing / auth
-    headers) is forwarded to the client verbatim.
+    headers) is merged over ``X-Title``, as in the Responses builder.
 
     ``thinking_type`` selects the request shape (default ``adaptive``). Live-
     verified against api.anthropic.com + Bedrock 2026-07-09 (see
@@ -170,7 +172,7 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
         max_tokens=max_tokens,
         thinking=thinking,
         effort=effort,
-        default_headers=dict(cfg.get("default_headers") or {}),
+        default_headers={"X-Title": title, **(cfg.get("default_headers") or {})},
         bedrock=bedrock,
     )
 
@@ -247,9 +249,9 @@ def build_protocol_client(cfg: dict[str, Any], *, title: str) -> LLMClient | Non
     """
     protocol = protocol_of(cfg)
     if protocol == "anthropic":
-        return _build_anthropic(cfg)
+        return _build_anthropic(cfg, title)
     if protocol == "bedrock":
-        return _build_anthropic(cfg, bedrock=True)
+        return _build_anthropic(cfg, title, bedrock=True)
     if protocol == "responses":
         return _build_responses(cfg, title)
     return None

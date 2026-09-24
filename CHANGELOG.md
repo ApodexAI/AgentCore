@@ -17,6 +17,8 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   never reached those requests. Consumers that shimmed the builder to work
   around this (ApodexHarness `miroharness.infra.protocol_client`) can revert to
   a pure alias after upgrading.
+- Anthropic/Bedrock clients now also send `X-Title`, matching the Responses
+  client.
 - The `protocol: responses` builder now merges `cfg["default_headers"]` with
   its `X-Title` header instead of discarding them.
 

@@ -545,12 +545,12 @@ def test_anthropic_builders_forward_default_headers(monkeypatch, protocol):
     build_protocol_client(
         {"model": "claude-x", "protocol": protocol, "api_key": "k",
          "default_headers": headers}, title="T")
-    assert seen["default_headers"] == {"X-Route": "gw-a"}
-    assert seen["default_headers"] is not headers
+    assert seen["default_headers"] == {"X-Title": "T", "X-Route": "gw-a"}
+    assert headers == {"X-Route": "gw-a"}
     assert seen["bedrock"] is (protocol == "bedrock")
 
     build_protocol_client({"model": "claude-x", "protocol": protocol}, title="T")
-    assert seen["default_headers"] == {}
+    assert seen["default_headers"] == {"X-Title": "T"}
 
 
 def test_openai_responses_builder_merges_default_headers(monkeypatch):
