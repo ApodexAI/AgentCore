@@ -17,6 +17,8 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   never reached those requests. Consumers that shimmed the builder to work
   around this (ApodexHarness `miroharness.infra.protocol_client`) can revert to
   a pure alias after upgrading.
+- The `protocol: responses` builder now merges `cfg["default_headers"]` with
+  its `X-Title` header instead of discarding them.
 
 ## [0.11.0] - 2026-09-14
 

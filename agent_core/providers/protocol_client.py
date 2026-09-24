@@ -229,7 +229,7 @@ def _build_responses(cfg: dict[str, Any], title: str) -> LLMClient:
         base_url=cfg.get("base_url"),
         temperature=cfg.get("temperature"),
         max_output_tokens=cfg.get("max_tokens", 32768),
-        default_headers={"X-Title": title},
+        default_headers={"X-Title": title, **(cfg.get("default_headers") or {})},
         reasoning=reasoning or None,
         store=False,
     )

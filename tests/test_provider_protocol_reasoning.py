@@ -551,3 +551,22 @@ def test_anthropic_builders_forward_default_headers(monkeypatch, protocol):
 
     build_protocol_client({"model": "claude-x", "protocol": protocol}, title="T")
     assert seen["default_headers"] == {}
+
+
+def test_openai_responses_builder_merges_default_headers(monkeypatch):
+    # Gateway headers from cfg must reach the Responses client alongside X-Title.
+    import agent_core.providers.openai_responses as responses_mod
+
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(responses_mod.OpenAIResponsesClient, "__init__", fake_init)
+    build_protocol_client(
+        {"model": "gpt-x", "protocol": "responses", "api_key": "k",
+         "default_headers": {"X-Route": "gw-a"}}, title="T")
+    assert seen["default_headers"] == {"X-Title": "T", "X-Route": "gw-a"}
+
+    build_protocol_client({"model": "gpt-x", "protocol": "responses"}, title="T")
+    assert seen["default_headers"] == {"X-Title": "T"}
