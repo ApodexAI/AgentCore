@@ -527,3 +527,46 @@ def test_absent_or_valid_protocol_is_not_logged(cfg, caplog):
     with caplog.at_level(logging.WARNING):
         protocol_of(cfg)
     assert "unknown llm.protocol" not in caplog.text
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "bedrock"])
+def test_anthropic_builders_forward_default_headers(monkeypatch, protocol):
+    # Regression: the builder used to drop cfg["default_headers"], so gateway
+    # routing/auth headers never reached Anthropic or Bedrock requests.
+    import agent_core.providers.anthropic as anthropic_mod
+
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(anthropic_mod.AnthropicClient, "__init__", fake_init)
+    headers = {"X-Route": "gw-a"}
+    build_protocol_client(
+        {"model": "claude-x", "protocol": protocol, "api_key": "k",
+         "default_headers": headers}, title="T")
+    assert seen["default_headers"] == {"X-Title": "T", "X-Route": "gw-a"}
+    assert headers == {"X-Route": "gw-a"}
+    assert seen["bedrock"] is (protocol == "bedrock")
+
+    build_protocol_client({"model": "claude-x", "protocol": protocol}, title="T")
+    assert seen["default_headers"] == {"X-Title": "T"}
+
+
+def test_openai_responses_builder_merges_default_headers(monkeypatch):
+    # Gateway headers from cfg must reach the Responses client alongside X-Title.
+    import agent_core.providers.openai_responses as responses_mod
+
+    seen = {}
+
+    def fake_init(self, *args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(responses_mod.OpenAIResponsesClient, "__init__", fake_init)
+    build_protocol_client(
+        {"model": "gpt-x", "protocol": "responses", "api_key": "k",
+         "default_headers": {"X-Route": "gw-a"}}, title="T")
+    assert seen["default_headers"] == {"X-Title": "T", "X-Route": "gw-a"}
+
+    build_protocol_client({"model": "gpt-x", "protocol": "responses"}, title="T")
+    assert seen["default_headers"] == {"X-Title": "T"}
