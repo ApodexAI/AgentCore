@@ -7,7 +7,7 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
-## [0.12.0] - 2026-09-24
+## [0.11.1] - 2026-09-24
 
 ### Added
 
@@ -20,8 +20,6 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   binds nothing; a bare `str` is rejected with `TypeError`. Ignored when
   `AgentLoopHooks.bind_session` is supplied. `DEFAULT_SESSION_HEADER_NAMES` is
   exported from `agent_core.runtime.loop`.
-
-## [0.11.1] - 2026-09-24
 
 ### Fixed
 
