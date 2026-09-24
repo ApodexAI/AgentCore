@@ -7,6 +7,17 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [Unreleased]
+
+### Fixed
+
+- `build_protocol_client` now forwards `cfg["default_headers"]` to
+  `AnthropicClient` for both `protocol: anthropic` and `protocol: bedrock`.
+  Previously the headers were silently dropped, so gateway routing/auth headers
+  never reached those requests. Consumers that shimmed the builder to work
+  around this (ApodexHarness `miroharness.infra.protocol_client`) can revert to
+  a pure alias after upgrading.
+
 ## [0.11.0] - 2026-09-14
 
 ### Added

@@ -119,7 +119,8 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
     ``{base_url}/v1/messages`` (direct) or ``{base_url}/model/{id}/invoke``
     (``bedrock=True``, AWS Bedrock runtime, Bearer API-key auth + the
     ``anthropic_version`` body stamp). Optional ``effort`` →
-    ``output_config.effort``.
+    ``output_config.effort``. ``default_headers`` (gateway routing / auth
+    headers) is forwarded to the client verbatim.
 
     ``thinking_type`` selects the request shape (default ``adaptive``). Live-
     verified against api.anthropic.com + Bedrock 2026-07-09 (see
@@ -169,6 +170,7 @@ def _build_anthropic(cfg: dict[str, Any], *, bedrock: bool = False) -> LLMClient
         max_tokens=max_tokens,
         thinking=thinking,
         effort=effort,
+        default_headers=dict(cfg.get("default_headers") or {}),
         bedrock=bedrock,
     )
 
