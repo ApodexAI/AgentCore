@@ -20,6 +20,7 @@ from agent_core.runtime.loop.guardrails import (
     check_budget_exhausted,
 )
 from agent_core.runtime.loop.llm_client import (
+    DEFAULT_SESSION_HEADER_NAMES,
     RUNAWAY_STATE_KEY,
     TRUNCATION_CONTINUATION_GUIDANCE,
     LLMCallExhausted,
@@ -79,6 +80,7 @@ __all__ = [
     "COMPACTION_TRIGGER_RATIO",
     "DEFAULT_DUPLICATE_THRESHOLDS",
     "DEFAULT_KEY_ALIASES",
+    "DEFAULT_SESSION_HEADER_NAMES",
     "DEFAULT_TRIGGER_RATIO",
     "LITERAL_CONTENT_KEYS",
     "RUNAWAY_STATE_KEY",

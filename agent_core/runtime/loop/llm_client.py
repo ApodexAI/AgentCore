@@ -16,13 +16,14 @@ from agent_core.errors import (
     LLMStreamStalled,
 )
 from agent_core.runtime.loop._bind import (
-    _ensure_bound as _ensure_bound,
-)
-from agent_core.runtime.loop._bind import (
+    DEFAULT_SESSION_HEADER_NAMES,
     bind_max_tokens,
     bind_session_id,
     bind_temperature,
     bind_tools,
+)
+from agent_core.runtime.loop._bind import (
+    _ensure_bound as _ensure_bound,
 )
 from agent_core.runtime.loop._call import call_llm
 from agent_core.runtime.loop._response import (
@@ -45,6 +46,7 @@ from agent_core.tokens import (
 )
 
 __all__ = [
+    "DEFAULT_SESSION_HEADER_NAMES",
     "RUNAWAY_STATE_KEY",
     "TRUNCATION_CONTINUATION_GUIDANCE",
     "LLMCallExhausted",

@@ -386,6 +386,36 @@ async def test_host_can_override_session_binding() -> None:
     assert bound == ["gateway-session"]
 
 
+
+@pytest.mark.asyncio
+async def test_session_header_names_hook_reaches_the_provider_call() -> None:
+    seen: list[dict[str, str]] = []
+
+    class HeaderLLM(SequenceLLM):
+        async def chat(self, messages, **kwargs) -> LLMResponse:
+            seen.append(dict(kwargs.get("extra_headers") or {}))
+            return await super().chat(messages, **kwargs)
+
+    await run_agent_loop(
+        system_prompt="system",
+        user_message="start",
+        llm=HeaderLLM([LLMResponse(content="done")]),
+        tools=[],
+        config=LoopConfig(
+            max_turns=1,
+            task_id="runtime-task",
+            llm_session_id="gateway-session",
+            loop_policy=LoopPolicy(no_tool_behavior="stop"),
+            max_llm_retries=1,
+        ),
+        runtime_hooks=AgentLoopHooks(
+            session_header_names=("x-upstream-session-id", "X-Llmhub-Session"),
+        ),
+    )
+
+    assert seen and seen[0]["X-Llmhub-Session"] == "gateway-session"
+    assert seen[0]["x-upstream-session-id"] == "gateway-session"
+
 def _orphan_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
     """Ids an assistant message announces that no tool message answers.
 

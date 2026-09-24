@@ -83,3 +83,22 @@ async def test_thinking_override_is_task_local_and_restored() -> None:
         "disabled",
     ]
     assert current_thinking_retry_override() is None
+
+
+def test_bind_session_id_stamps_every_configured_header_name() -> None:
+    llm = FakeLLM()
+
+    bound = bind_session_id(
+        llm, "task-1", header_names=("x-upstream-session-id", "X-Llmhub-Session")
+    )
+    assert bound.extra_headers == {
+        "x-upstream-session-id": "task-1",
+        "X-Llmhub-Session": "task-1",
+    }
+    assert bind_session_id(llm, "task-1", header_names=()) is llm
+
+
+def test_bind_session_id_rejects_a_bare_string_header_name() -> None:
+    # A str is a Sequence[str]; iterating it would stamp one header per letter.
+    with pytest.raises(TypeError):
+        bind_session_id(FakeLLM(), "task-1", header_names="X-Llmhub-Session")
