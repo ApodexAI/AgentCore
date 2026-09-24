@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -145,13 +145,23 @@ def bind_tools(llm: Any, tools: list[Any]) -> Any:
     return replace(_ensure_bound(llm), tools=schemas)
 
 
+DEFAULT_SESSION_HEADER_NAMES: tuple[str, ...] = ("x-upstream-session-id",)
+
+
 def bind_session_id(
     llm: Any,
     task_id: str,
     *,
     sticky_session_enabled: Callable[[], bool] | None = None,
+    header_names: Sequence[str] = DEFAULT_SESSION_HEADER_NAMES,
 ) -> Any:
-    """Attach ``x-upstream-session-id: <task_id>`` to every LLM request.
+    """Attach ``<header>: <task_id>`` to every LLM request, per ``header_names``.
+
+    ``header_names`` defaults to ``x-upstream-session-id``. Gateways that key
+    affinity on a different header (e.g. an account-pool proxy pinning a
+    session to one upstream key so prompt caches hit) pass their own name(s);
+    every listed header carries the same ``task_id``. An empty sequence binds
+    nothing.
 
     Pinning it at client-construction time is the obvious approach, but
     the LLM is per-profile-cached (one client shared across tasks), so the
@@ -171,13 +181,16 @@ def bind_session_id(
     that attribution was retracted when the real cause turned out to be silent
     mid-stream stalls, now handled by the stall watchdog.
     """
-    if not task_id or (
+    if isinstance(header_names, str):
+        raise TypeError("header_names must be a sequence of names, not a str")
+    if not task_id or not header_names or (
         sticky_session_enabled is not None and not sticky_session_enabled()
     ):
         return llm
     bound = _ensure_bound(llm)
     headers = dict(bound.extra_headers or {})
-    headers["x-upstream-session-id"] = task_id
+    for name in header_names:
+        headers[name] = task_id
     return replace(bound, extra_headers=headers)
 
 

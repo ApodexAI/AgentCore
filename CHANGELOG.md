@@ -9,6 +9,18 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 ## [0.11.1] - 2026-09-24
 
+### Added
+
+- `bind_session_id(..., header_names=...)` and
+  `AgentLoopHooks.session_header_names` choose which request header(s) carry
+  the session id (default unchanged: `x-upstream-session-id`). Every listed
+  header gets the same value, so a host can keep the legacy header and add a
+  gateway's own affinity header (e.g. `X-Llmhub-Session`, which pins a session
+  to one upstream key in an account pool so prompt caches hit). An empty tuple
+  binds nothing; a bare `str` is rejected with `TypeError`. Ignored when
+  `AgentLoopHooks.bind_session` is supplied. `DEFAULT_SESSION_HEADER_NAMES` is
+  exported from `agent_core.runtime.loop`.
+
 ### Fixed
 
 - `build_protocol_client` now forwards `cfg["default_headers"]` to

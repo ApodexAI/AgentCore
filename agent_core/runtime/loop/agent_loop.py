@@ -51,6 +51,7 @@ from agent_core.runtime.loop.compact import (
 )
 from agent_core.runtime.loop.image_attach import attach_images, evict_old_images
 from agent_core.runtime.loop.llm_client import (
+    DEFAULT_SESSION_HEADER_NAMES,
     RUNAWAY_STATE_KEY,
     TRUNCATION_CONTINUATION_GUIDANCE,
     LLMCallExhausted,
@@ -179,6 +180,12 @@ class AgentLoopHooks:
     # consult the flag a host binding is free to ignore. Supplying both is a
     # configuration error and is reported once at loop start.
     sticky_session_enabled: Callable[[], bool] | None = None
+    # Header(s) the built-in binding stamps with the session id. Ignored when
+    # ``bind_session`` is supplied, like ``sticky_session_enabled``.
+    # Keyword-only to preserve the existing positional hook arguments.
+    session_header_names: tuple[str, ...] = field(
+        default=DEFAULT_SESSION_HEADER_NAMES, kw_only=True,
+    )
     bind_session: Callable[[LLMClient, str], LLMClient] | None = None
     wall_deadline_remaining: Callable[[], float | None] = _no_deadline
     chain_fallback_active: Callable[[], bool] = _false
@@ -300,6 +307,7 @@ async def run_agent_loop(
             llm,
             llm_session_id,
             sticky_session_enabled=runtime.sticky_session_enabled,
+            header_names=runtime.session_header_names,
         )
     llm_with_tools = bind_tools(llm_with_session, list(tools))
 
