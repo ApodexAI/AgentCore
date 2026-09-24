@@ -359,9 +359,20 @@ async def test_in_place_compactor_notifies_context_observers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_host_can_override_session_binding() -> None:
+@pytest.mark.parametrize("positional", [False, True])
+async def test_host_can_override_session_binding(positional: bool) -> None:
     bound: list[str] = []
     llm = SequenceLLM([LLMResponse(content="done")])
+
+    def bind_session(client, session_id):
+        bound.append(session_id)
+        return client
+
+    hooks = (
+        AgentLoopHooks(None, bind_session)
+        if positional
+        else AgentLoopHooks(bind_session=bind_session)
+    )
 
     result = await run_agent_loop(
         system_prompt="system",
@@ -375,11 +386,7 @@ async def test_host_can_override_session_binding() -> None:
             loop_policy=LoopPolicy(no_tool_behavior="stop"),
             max_llm_retries=1,
         ),
-        runtime_hooks=AgentLoopHooks(
-            bind_session=lambda client, session_id: (
-                bound.append(session_id) or client
-            )
-        ),
+        runtime_hooks=hooks,
     )
 
     assert result.final_content == "done"

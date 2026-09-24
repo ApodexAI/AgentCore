@@ -182,7 +182,10 @@ class AgentLoopHooks:
     sticky_session_enabled: Callable[[], bool] | None = None
     # Header(s) the built-in binding stamps with the session id. Ignored when
     # ``bind_session`` is supplied, like ``sticky_session_enabled``.
-    session_header_names: tuple[str, ...] = DEFAULT_SESSION_HEADER_NAMES
+    # Keyword-only to preserve the existing positional hook arguments.
+    session_header_names: tuple[str, ...] = field(
+        default=DEFAULT_SESSION_HEADER_NAMES, kw_only=True,
+    )
     bind_session: Callable[[LLMClient, str], LLMClient] | None = None
     wall_deadline_remaining: Callable[[], float | None] = _no_deadline
     chain_fallback_active: Callable[[], bool] = _false
