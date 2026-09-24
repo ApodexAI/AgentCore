@@ -606,6 +606,70 @@ async def test_skipping_a_text_parsed_call_does_not_reuse_the_synthetic_id() -> 
     assert "b" in bodies
 
 
+def _tool_call_ids(messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(message.get("tool_call_id"))
+        for message in messages
+        if message.get("role") == "tool"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_text_parsed_call_ids_stay_unique_across_turns_and_resume() -> None:
+    """Text-mode parsers number calls per response, so every turn minted the
+    same ids. The engine now makes them unique across the whole history,
+    including a history resumed through ``initial_messages`` (turn restarts).
+    """
+    text_calls = (
+        '<tool_call>{"tool": "echo", "args": {"value": "a"}}</tool_call>'
+        '<tool_call>{"tool": "echo", "args": {"value": "b"}}</tool_call>'
+    )
+
+    def _llm() -> SequenceLLM:
+        return SequenceLLM([
+            LLMResponse(content=text_calls),
+            LLMResponse(content=text_calls),
+            LLMResponse(content="finished"),
+        ])
+
+    profile = ModelProfile(model_id="test", provider="test")
+    first = await run_agent_loop(
+        system_prompt="system", user_message="start", llm=_llm(),
+        tools=[EchoTool()], config=_config(), model_profile=profile,
+    )
+    resumed = await run_agent_loop(
+        system_prompt="system", user_message="again", llm=_llm(),
+        tools=[EchoTool()], config=_config(), model_profile=profile,
+        initial_messages=first.messages,
+    )
+
+    ids = _tool_call_ids(resumed.messages)
+    assert len(ids) == 8
+    assert len(set(ids)) == 8, f"colliding tool_call_ids: {ids}"
+    bodies = [
+        m.get("content") for m in resumed.messages if m.get("role") == "tool"
+    ]
+    assert bodies == ["a", "b"] * 4
+
+
+@pytest.mark.asyncio
+async def test_native_tool_call_ids_are_kept_verbatim() -> None:
+    native = LLMResponse(tool_calls=[
+        {"id": f"prov_{v}", "type": "function",
+         "function": {"name": "echo", "arguments": json.dumps({"value": v})}}
+        for v in ("a", "b")
+    ])
+    llm = SequenceLLM([native, LLMResponse(content="finished")])
+
+    result = await run_agent_loop(
+        system_prompt="system", user_message="start", llm=llm,
+        tools=[EchoTool()], config=_config(),
+        model_profile=ModelProfile(model_id="test", provider="test"),
+    )
+
+    assert _tool_call_ids(result.messages) == ["prov_a", "prov_b"]
+
+
 @pytest.mark.asyncio
 async def test_bind_session_takes_over_and_warns_about_the_sticky_flag(
     caplog: pytest.LogCaptureFixture,
