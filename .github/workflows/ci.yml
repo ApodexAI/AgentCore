@@ -29,14 +29,10 @@ jobs:
       - run: uv run --isolated --frozen --extra dev --extra tokenizer pytest -q tests/test_tokenizer_nonblocking.py::test_pinned_cache_metadata_matches_tiktokens_own_declaration
       - run: uv build
 
-  # Two products pin an AgentCore revision. If published code changes without a
-  # version bump, both end up reporting the same version for different code and
-  # the installed dist-info stops identifying what is running. Enforce the bump
-  # at the pull request, where it is cheap to fix.
+  # Keep the existing status-check name for branch protection. Feature PRs
+  # require independent fragments; only release PRs change shared version files.
   version-bump:
-    if: >-
-      github.event_name == 'pull_request' &&
-      !contains(github.event.pull_request.labels.*.name, 'skip-version-bump')
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

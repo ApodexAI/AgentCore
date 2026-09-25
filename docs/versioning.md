@@ -55,24 +55,48 @@ behavior, tests, docs, and tooling.
 When in doubt, bump MINOR. The cost of an unnecessary MINOR is nothing; the cost
 of a breaking PATCH is a product discovering it in production.
 
-## Bumping
+## Feature pull requests
 
-CI fails any pull request that touches `agent_core/` or `pyproject.toml` without
-increasing the three-part `[project].version`. Equal versions, downgrades, and
-malformed versions are rejected. To bump:
+Feature and fix PRs do not bump the package version or edit `CHANGELOG.md`.
+Add one independent file under `changes/`, using the PR number or a unique slug:
+
+- `changes/42.fix.md` for a bug fix or internal change;
+- `changes/43.feature.md` for a new capability;
+- `changes/example.breaking.md` for a compatibility change.
+
+Write a non-empty release-note paragraph without headings. Explain the consumer
+impact and any required migration. Each PR gets its own file, so merging another
+feature PR does not conflict on a shared version, lockfile or changelog entry.
+CI requires a newly added fragment for published code changes and validates all
+pending fragments. Docs/tests/tooling-only PRs need no fragment. The CI status
+keeps the name `version-bump` for branch-protection compatibility; the old
+`skip-version-bump` label no longer bypasses the gate.
+
+Between releases, main keeps the last released package version. Use a commit SHA
+to identify development snapshots; distribution versions identify releases.
+Consumers requiring a distinct package version should consume published releases.
+
+## Preparing a release
+
+Create one release PR from current main after the desired feature PRs merge:
 
 ```bash
-# 1. Edit [project].version in pyproject.toml.
-# 2. Sync the lockfile — uv.lock records this project's own version, and a stale
-#    lock makes `uv sync --frozen` fail in CI and in both products.
+python3 scripts/prepare_release.py --dry-run  # review the aggregated notes
+python3 scripts/prepare_release.py
 uv lock
-# 3. Add a '## [<version>] - <YYYY-MM-DD>' section to CHANGELOG.md.
 ```
 
-If a change genuinely cannot affect consumers and the check is wrong, apply the
-`skip-version-bump` label to the pull request and say why in the description.
-Adding or removing that label triggers a fresh CI run, so the gate reflects the
-current escape-hatch decision without requiring an unrelated commit.
+The script selects the next PATCH for fixes only, or MINOR for any feature or
+breaking change. `--version 0.X.Y` can select a higher version. It updates
+`pyproject.toml`, prepends one dated `CHANGELOG.md` section, and removes the
+consumed fragments. Commit those changes together with `uv.lock`. CI rejects a
+stale lock, a missing release entry, remaining fragments, or a version downgrade.
+Only this release PR edits the shared version/changelog, so serialize releases.
+If more feature PRs merge while the release PR is open, regenerate the release
+from updated main to include their fragments before tagging.
+
+Tags additionally reject any pending fragments and stale project lock version,
+so unreleased main cannot accidentally publish changes under the old version.
 
 ## Releasing
 
