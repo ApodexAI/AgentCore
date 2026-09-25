@@ -901,6 +901,37 @@ async def _call_llm_with_callbacks(
     )
 
 
+def _assign_unique_tool_call_ids(
+    parsed_calls: list[dict], history_msg: Message, turn: int
+) -> list[dict]:
+    """Give every non-native parsed call an id unique across the whole history.
+
+    Native calls keep the provider id: the assistant message in history carries
+    it and the tool reply must echo it. Text-mode parsers only number calls
+    within one response (``qwen_tc_0``, ``fc_tc_0``, ``dangling_tc_0``...), so
+    every turn reused the same ids, and lookups keyed by ``tool_call_id``
+    (compaction's preserved results, spill recovery handles) could hit the
+    wrong turn's result. ``turn`` alone is not enough either: a history resumed
+    through ``initial_messages`` restarts at turn 1, hence the random suffix.
+    Assigned here, before any filtering, so observers, blocked/dropped replies
+    and executed results all see the same final id.
+    """
+    native_ids = {
+        str(call.get("id"))
+        for call in (history_msg.get("tool_calls") or [])
+        if isinstance(call, dict) and call.get("id")
+    }
+    if all(str(call.get("id") or "") in native_ids for call in parsed_calls):
+        return parsed_calls
+    suffix = uuid.uuid4().hex[:8]
+    return [
+        call
+        if str(call.get("id") or "") in native_ids
+        else {**call, "id": f"call_{turn}_{idx}_{suffix}"}
+        for idx, call in enumerate(parsed_calls)
+    ]
+
+
 def _answer_dropped_tool_calls(
     messages: list[Message], history_msg: Message,
     parsed_calls: list[dict], tool_names: set[str],
@@ -1090,6 +1121,7 @@ async def _process_llm_response(
         parsed_calls = tc_parser.parse_text(tr.thinking, parser_tool_names)
         if parsed_calls:
             logger.warning("turn=%d recovered %d tool_call(s) leaked into <think>", turn, len(parsed_calls))
+    parsed_calls = _assign_unique_tool_call_ids(parsed_calls, history_msg, turn)
 
     # Tool schemas are stripped on the landing turn, but text-mode models can
     # still emit parseable tool markup. Permit only the workflow's bounded
