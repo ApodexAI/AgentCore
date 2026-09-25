@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.11.3] - 2026-09-25
+
+### Fixed
+
+- `TaskBoardObserver` now runs as a critical observer so its task-board reminder is collected and injected into the next turn. Hosts that subclassed it only to set `critical = True` can remove that override.
+
 ## [0.11.1] - 2026-09-24
 
 ### Added
