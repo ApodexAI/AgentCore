@@ -41,12 +41,21 @@ def main(argv: list[str] | None = None) -> int:
     if tagged != version:
         print(
             f"tag {args.check_tag!r} does not match pyproject version {version!r}.\n"
-            "A release tag must name the version it publishes: either move the tag "
-            "or bump [project].version (and re-run `uv lock`).",
+            "A release tag must name the version it publishes: bump [project].version "
+            "and use a new tag (never move a published tag).",
             file=sys.stderr,
         )
         return 1
 
+    # A tag must never publish a tree with pending feature changes or a stale lock.
+    sys.path.insert(0, str(ROOT))
+    from scripts.release_notes import validate_release
+
+    try:
+        validate_release(ROOT, version)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     print(version)
     return 0
 

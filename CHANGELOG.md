@@ -7,21 +7,6 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
-## [0.12.1] - 2026-09-25
-
-### Fixed
-
-- `run_agent_loop` now gives every text-mode (non-native) tool call an id that
-  is unique across the whole history: `call_{turn}_{idx}_{8 hex}`. Text parsers
-  number calls per response (`qwen_tc_0`, `fc_tc_0`, `dangling_tc_0`, ...), so
-  the same ids repeated every turn, and the engine's own `call_{turn}_{n}`
-  fallback repeated after a resume through `initial_messages` (turn restarts at
-  1). Lookups keyed by `tool_call_id` (compaction's preserved results, spill
-  recovery handles) could then resolve to the wrong turn. Native provider ids
-  are unchanged. Consumers that assert on the exact synthesised id of a
-  text-mode call in loop output must match the new shape; ids produced by the
-  parsers themselves and by `execute_tools` called directly are unchanged.
-
 ## [0.11.2] - 2026-09-25
 
 ### Fixed

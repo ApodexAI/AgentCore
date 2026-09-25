@@ -1,14 +1,4 @@
-"""Fail a pull request that changes shared runtime code without increasing the version.
-
-Two products consume AgentCore by pinning a revision. When ``agent_core/``
-changes but ``[project].version`` does not increase, both products can end up reporting the
-same version for different code: the installed ``dist-info`` stops identifying
-what is actually running, and no version constraint downstream can mean
-anything. This check is the enforcement point for that rule.
-
-Docs-only, test-only, and tooling-only pull requests are exempt, because they
-change nothing a consumer can import.
-"""
+"""Require independent change fragments for code PRs and validate release PRs."""
 
 from __future__ import annotations
 
@@ -20,9 +10,12 @@ import tomllib
 from pathlib import Path
 
 # Support being run as a plain script from any working directory.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from version import read_version
+from scripts.release_notes import fragments, read_fragment, validate_lock, validate_release
+from scripts.version import read_version
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # Paths whose contents are importable by a consumer. A change under any of these
 # alters the published artifact and therefore requires a new version.
@@ -69,42 +62,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", required=True, help="Base ref or SHA of the pull request.")
     args = parser.parse_args(argv)
 
-    touched = [f for f in changed_files(args.base) if f.startswith(PUBLISHED_PATHS)]
-    if not touched:
-        print("No published code changed; version bump not required.")
-        return 0
-
+    changed = changed_files(args.base)
+    touched = [f for f in changed if f.startswith(PUBLISHED_PATHS)]
     current = read_version()
     previous = base_version(args.base)
-
-    if previous is None:
-        print(f"Published code changed and version moved {previous} -> {current}.")
-        return 0
-
     try:
-        increased = version_key(current) > version_key(previous)
+        current_key = version_key(current)
+        previous_key = version_key(previous) if previous is not None else current_key
+        validate_lock(ROOT, current)
+        for path in fragments(ROOT):
+            read_fragment(path)
+        if current_key < previous_key:
+            raise ValueError(f"Version must not decrease: {previous} -> {current}")
+        if current_key > previous_key:
+            base_fragments = _git("ls-tree", "-r", "--name-only", args.base, "--", "changes/").splitlines()
+            if any(p.endswith((".feature.md", ".breaking.md")) for p in base_fragments):
+                minimum = (previous_key[0], previous_key[1] + 1, 0)
+                if current_key < minimum:
+                    raise ValueError("Feature or breaking fragments require a MINOR release")
+            validate_release(ROOT, current)
+            print(f"Release validated: {previous} -> {current}")
+            return 0
+        merge_base = _git("merge-base", args.base, "HEAD").strip()
+        changed_existing = _git("diff", "--no-renames", "--diff-filter=MD", "--name-only", f"{merge_base}..HEAD").splitlines()
+        if any(p.startswith("changes/") and p.endswith(".md") for p in changed_existing):
+            raise ValueError("Only a release PR may modify or remove existing change fragments")
+        if "CHANGELOG.md" in changed:
+            raise ValueError("Keep CHANGELOG.md for release PRs; add a changes/<id>.<kind>.md fragment instead")
+        if not touched:
+            print("No published code changed; release fragment not required.")
+            return 0
+        added = _git("diff", "--diff-filter=A", "--name-only", f"{merge_base}..HEAD").splitlines()
+        new_fragments = [p for p in fragments(ROOT) if p.relative_to(ROOT).as_posix() in added]
+        if not new_fragments:
+            raise ValueError("Published code changed: add changes/<id>.fix.md, .feature.md or .breaking.md; do not bump the version in a feature PR")
+        print("Published change has a new release fragment; version stays unchanged until release.")
+        return 0
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 1
-
-    if increased:
-        print(f"Published code changed and version increased {previous} -> {current}.")
-        return 0
-
-    listed = "\n  ".join(touched[:20])
-    overflow = f"\n  ... and {len(touched) - 20} more" if len(touched) > 20 else ""
-    print(
-        "This pull request changes published code but does not increase "
-        f"[project].version ({previous!r} -> {current!r}).\n\n"
-        f"Changed:\n  {listed}{overflow}\n\n"
-        "Bump [project].version in pyproject.toml, then run `uv lock` so the "
-        "lockfile's self-entry matches (otherwise `uv sync --frozen` fails), and "
-        "add a CHANGELOG.md entry. See docs/versioning.md for how to choose the "
-        "new number. If this change genuinely cannot affect consumers, apply the "
-        "'skip-version-bump' label.",
-        file=sys.stderr,
-    )
-    return 1
 
 
 if __name__ == "__main__":
