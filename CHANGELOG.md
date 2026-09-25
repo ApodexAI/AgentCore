@@ -22,6 +22,12 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
   text-mode call in loop output must match the new shape; ids produced by the
   parsers themselves and by `execute_tools` called directly are unchanged.
 
+## [0.11.2] - 2026-09-25
+
+### Fixed
+
+- `OpenAIClient` and `OpenAIResponsesClient` now treat an empty `api_key` as unset and fall back to `OPENAI_API_KEY`, matching the behavior of `None`.
+
 ## [0.11.1] - 2026-09-24
 
 ### Added
