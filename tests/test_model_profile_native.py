@@ -19,7 +19,7 @@ from agent_core.runtime.loop.model_profile import (
     NativeMessageNormalizer,
     ThinkingResult,
     _extract_reasoning,
-    _to_openai_tool_calls,
+    to_openai_tool_calls,
 )
 
 
@@ -114,11 +114,11 @@ def test_to_history_thinking_in_history_snapshots_full_content():
     assert msg["content"] == "<think>x</think>\nanswer"
 
 
-# ── _to_openai_tool_calls wire conversion ───────────────────────────────────
+# ── to_openai_tool_calls wire conversion ───────────────────────────────────
 
 
 def test_to_openai_tool_calls_parsed_to_wire():
-    out = _to_openai_tool_calls([{"name": "f", "args": {"x": 1}, "id": "c1"}])
+    out = to_openai_tool_calls([{"name": "f", "args": {"x": 1}, "id": "c1"}])
     assert out == [{"type": "function", "id": "c1",
                     "function": {"name": "f", "arguments": '{"x": 1}'}}]
 
@@ -126,11 +126,11 @@ def test_to_openai_tool_calls_parsed_to_wire():
 def test_to_openai_tool_calls_passthrough_already_wire():
     wire = [{"type": "function", "id": "c1",
              "function": {"name": "f", "arguments": "{}"}}]
-    assert _to_openai_tool_calls(wire) == wire
+    assert to_openai_tool_calls(wire) == wire
 
 
 def test_to_openai_tool_calls_string_args_kept_verbatim():
-    out = _to_openai_tool_calls([{"name": "f", "args": '{"x":1}', "id": "c1"}])
+    out = to_openai_tool_calls([{"name": "f", "args": '{"x":1}', "id": "c1"}])
     assert out[0]["function"]["arguments"] == '{"x":1}'
 
 
@@ -141,7 +141,7 @@ def test_to_openai_tool_calls_repairs_empty_wire_arguments():
         "function": {"name": "bfunction", "arguments": ""},
     }]
 
-    out = _to_openai_tool_calls(wire)
+    out = to_openai_tool_calls(wire)
 
     assert out[0]["function"]["arguments"] == "{}"
 
@@ -149,7 +149,7 @@ def test_to_openai_tool_calls_repairs_empty_wire_arguments():
 def test_to_openai_tool_calls_repairs_truncated_parsed_arguments():
     parsed = [{"name": "bash", "args": '{"command":', "id": "c1"}]
 
-    out = _to_openai_tool_calls(parsed)
+    out = to_openai_tool_calls(parsed)
 
     assert out[0]["function"]["arguments"] == "{}"
 
@@ -157,13 +157,13 @@ def test_to_openai_tool_calls_repairs_truncated_parsed_arguments():
 def test_to_openai_tool_calls_rejects_non_object_arguments():
     parsed = [{"name": "bash", "args": '["unexpected"]', "id": "c1"}]
 
-    out = _to_openai_tool_calls(parsed)
+    out = to_openai_tool_calls(parsed)
 
     assert out[0]["function"]["arguments"] == "{}"
 
 
 def test_to_openai_tool_calls_empty():
-    assert _to_openai_tool_calls([]) == []
+    assert to_openai_tool_calls([]) == []
 
 
 # ── format-aware reasoning round-trip (replaces _ReasoningChatOpenAI) ────────
