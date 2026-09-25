@@ -7,11 +7,11 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
-## [0.11.3] - 2026-09-25
+## [0.11.2] - 2026-09-25
 
 ### Fixed
 
-- `TaskBoardObserver` now runs as a critical observer so its task-board reminder is collected and injected into the next turn. Hosts that subclassed it only to set `critical = True` can remove that override.
+- `OpenAIClient` and `OpenAIResponsesClient` now treat an empty `api_key` as unset and fall back to `OPENAI_API_KEY`, matching the behavior of `None`.
 
 ## [0.11.1] - 2026-09-24
 

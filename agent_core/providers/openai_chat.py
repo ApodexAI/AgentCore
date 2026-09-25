@@ -180,7 +180,10 @@ class OpenAIClient(LLMClient):
         # (see ``mirror_session_query``) — mirror a construction-time session
         # header into ``default_query`` so it rides every request's URL.
         self._client = AsyncOpenAI(
-            api_key=api_key,
+            # The SDK consults OPENAI_API_KEY only for ``None``; an empty
+            # string (a config read before the environment was populated)
+            # raises "Missing credentials" even with the variable set.
+            api_key=api_key or None,
             base_url=base_url or None,
             timeout=timeout,
             default_headers=default_headers,

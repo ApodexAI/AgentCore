@@ -16,7 +16,7 @@ jobs:
           python-version: "3.12"
 
       # Fail before building anything if the tag names a version the tree does
-      # not declare, or if the release has no changelog entry to publish.
+      # not declare, has pending change fragments, a stale lock, or no release notes.
       - name: Verify tag matches declared version
         run: python3 scripts/version.py --check-tag "$TAG"
         env:
