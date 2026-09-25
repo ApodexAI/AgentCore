@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.12.0] - 2026-09-25
+
+### Added
+
+- `loop_types.wall_deadline_remaining_s` is now included in `__all__`. `model_profile.to_openai_tool_calls` is public for host facades; the former `_to_openai_tool_calls` name remains a compatibility alias.
+
 ## [0.11.1] - 2026-09-24
 
 ### Added
