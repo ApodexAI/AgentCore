@@ -375,6 +375,8 @@ async def call_llm(
     # Phase index and retry spend diverge when expansion is skipped.
     runaway_retries = 0
     runaway_attempts = 0
+    # Whether an expanded-thinking retry actually ran (drives the guidance).
+    runaway_expanded = False
     last_runaway_reason = ""
     stream_stall_count = 0
     if runaway_state is not None:
@@ -732,6 +734,7 @@ async def call_llm(
                         )
                         if expanded_llm is not None:
                             runaway_retries = 1
+                            runaway_expanded = True
                             llm_active = expanded_llm
                         else:
                             runaway_retries = 2
@@ -752,7 +755,10 @@ async def call_llm(
                         max_tokens=reasoning_only_max_tokens,
                     )
                     retry_thinking, recovery_guidance, recovery_action = (
-                        _runaway_retry_policy(runaway_retries, next_cap)
+                        _runaway_retry_policy(
+                            runaway_retries, next_cap,
+                            expanded_attempted=runaway_expanded,
+                        )
                     )
                     messages_active = [*messages, user_msg(recovery_guidance)]
                     await _finish_attempt(
@@ -850,6 +856,7 @@ async def call_llm(
                     )
                     if expanded_llm is not None:
                         runaway_retries = 1
+                        runaway_expanded = True
                         llm_active = expanded_llm
                     else:
                         runaway_retries = 2
@@ -870,7 +877,10 @@ async def call_llm(
                     max_tokens=reasoning_only_max_tokens,
                 )
                 retry_thinking, recovery_guidance, recovery_action = (
-                    _runaway_retry_policy(runaway_retries, next_cap)
+                    _runaway_retry_policy(
+                        runaway_retries, next_cap,
+                        expanded_attempted=runaway_expanded,
+                    )
                 )
                 messages_active = [*messages, user_msg(recovery_guidance)]
                 await _finish_attempt(
