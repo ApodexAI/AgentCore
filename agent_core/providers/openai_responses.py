@@ -71,7 +71,10 @@ class OpenAIResponsesClient(LLMClient):
         self._reasoning = reasoning or None
         self._store = store
         self._client = AsyncOpenAI(
-            api_key=api_key,
+            # The SDK consults OPENAI_API_KEY only for ``None``; an empty
+            # string (a config read before the environment was populated)
+            # raises "Missing credentials" even with the variable set.
+            api_key=api_key or None,
             base_url=base_url or None,
             timeout=timeout,
             default_headers=default_headers,
