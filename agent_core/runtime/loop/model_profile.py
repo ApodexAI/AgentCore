@@ -540,7 +540,7 @@ def _extract_reasoning(response: Any) -> str:
     return ""
 
 
-def _to_openai_tool_calls(parsed: list[dict[str, Any]]) -> list[ToolCall]:
+def to_openai_tool_calls(parsed: list[dict[str, Any]]) -> list[ToolCall]:
     """Echo parsed tool calls into OpenAI wire format.
 
     Key order ``{type, id, function: {name, arguments}}`` — served checkpoints
@@ -583,6 +583,10 @@ def _to_openai_tool_calls(parsed: list[dict[str, Any]]) -> list[ToolCall]:
     return out
 
 
+
+
+# Former private name; hosts that build assistant messages by hand imported it.
+_to_openai_tool_calls = to_openai_tool_calls
 class NativeMessageNormalizer:
     """Convert an LLM response to the OpenAI-wire ``Message`` stored in history.
 
@@ -607,7 +611,7 @@ class NativeMessageNormalizer:
         # (verbatim replay is transport correctness, not an agent choice). No
         # effect on other formats, where raw_content_blocks is None.
         if thinking_result.raw_content_blocks is not None:
-            tool_calls = _to_openai_tool_calls(thinking_result.tool_calls)
+            tool_calls = to_openai_tool_calls(thinking_result.tool_calls)
             return assistant_msg(
                 thinking_result.raw_content_blocks, tool_calls=tool_calls,
             )
@@ -616,7 +620,7 @@ class NativeMessageNormalizer:
         # ``response.content`` when it contains inline <think> tags makes the
         # builder below prepend the same reasoning a second time.
         visible = thinking_result.visible_content
-        tool_calls = _to_openai_tool_calls(thinking_result.tool_calls)
+        tool_calls = to_openai_tool_calls(thinking_result.tool_calls)
         reasoning = ""
         if policy.thinking_in_history:
             reasoning = (

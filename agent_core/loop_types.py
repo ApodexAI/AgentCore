@@ -757,4 +757,5 @@ __all__ = [
     "notify_observers",
     "notify_tool_call",
     "notify_tool_result",
+    "wall_deadline_remaining_s",
 ]
