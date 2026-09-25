@@ -14,9 +14,14 @@ BusTaskResolver = Callable[[Any], str | None]
 
 
 class TaskBoardObserver(BaseObserver):
-    """Re-inject a non-empty task board after a configurable cooldown."""
+    """Re-inject a non-empty task board after a configurable cooldown.
 
-    critical = False
+    Critical because its whole output is an ``Intervention``: the loop only
+    collects return values from critical observers, so a non-critical board
+    reminder would run in the background and never reach the next turn.
+    """
+
+    critical = True
 
     def __init__(
         self,
