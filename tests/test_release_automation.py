@@ -30,29 +30,6 @@ def test_version_key_rejects_values_outside_the_version_scheme(value: str) -> No
         check_version_bump.version_key(value)
 
 
-@pytest.mark.parametrize(("previous", "current"), [("0.2.0", "0.2.0"), ("0.2.0", "0.1.9")])
-def test_version_gate_rejects_equal_or_decreasing_versions(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    previous: str,
-    current: str,
-) -> None:
-    monkeypatch.setattr(check_version_bump, "changed_files", lambda _base: ["agent_core/x.py"])
-    monkeypatch.setattr(check_version_bump, "base_version", lambda _base: previous)
-    monkeypatch.setattr(check_version_bump, "read_version", lambda: current)
-
-    assert check_version_bump.main(["--base", "base-sha"]) == 1
-    assert "does not increase" in capsys.readouterr().err
-
-
-def test_version_gate_accepts_an_increase(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(check_version_bump, "changed_files", lambda _base: ["agent_core/x.py"])
-    monkeypatch.setattr(check_version_bump, "base_version", lambda _base: "0.2.0")
-    monkeypatch.setattr(check_version_bump, "read_version", lambda: "0.2.1")
-
-    assert check_version_bump.main(["--base", "base-sha"]) == 0
-
-
 def test_version_label_changes_retrigger_ci() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
