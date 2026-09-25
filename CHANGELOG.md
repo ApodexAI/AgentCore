@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.11.2] - 2026-09-25
+
+### Fixed
+
+- `OpenAIClient` and `OpenAIResponsesClient` now treat an empty `api_key` as unset and fall back to `OPENAI_API_KEY`, matching the behavior of `None`.
+
 ## [0.11.1] - 2026-09-24
 
 ### Added
