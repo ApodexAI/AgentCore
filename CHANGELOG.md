@@ -7,11 +7,17 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
-## [0.11.2] - 2026-09-25
+## [0.12.0] - 2026-09-25
+
+### Added
+
+- `loop_types.wall_deadline_remaining_s` is now included in `__all__`. `model_profile.to_openai_tool_calls` is public for host facades; the former `_to_openai_tool_calls` name remains a compatibility alias.
 
 ### Fixed
 
-- `OpenAIClient` and `OpenAIResponsesClient` now treat an empty `api_key` as unset and fall back to `OPENAI_API_KEY`, matching the behavior of `None`.
+- `run_agent_loop` now assigns text-mode tool calls IDs unique across turns and resumed histories, preventing tool-result and spill-recovery lookups from resolving to another turn. Native provider IDs remain unchanged. Consumers asserting exact synthesized IDs should accept the new `call_{turn}_{idx}_{8 hex}` shape; direct parser and `execute_tools` IDs are unchanged.
+- `OpenAIClient` and `OpenAIResponsesClient` now treat an empty `api_key` as unset and fall back to `OPENAI_API_KEY`, matching the behavior of `None`. (Prepared as 0.11.2, which was never published; it ships in 0.12.0.)
+- `TaskBoardObserver` now runs as a critical observer so its task-board reminder is collected and injected into the next turn. Hosts that subclassed it only to set `critical = True` can remove that override.
 
 ## [0.11.1] - 2026-09-24
 
