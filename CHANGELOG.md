@@ -7,6 +7,13 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.12.1] - 2026-09-26
+
+### Fixed
+
+- Fix Anthropic prompt caching for per-call runtime addenda by anchoring the rolling cache breakpoint on the last persistent conversation message.
+- Runaway recovery no longer tells the model that an "expanded-thinking retry" failed when none ran. With expansion disabled by a lowered `RUNAWAY_MAX_RETRIES`, or skipped because it could not fit the context, the reduced retry now gets a reminder that only references the previous attempt. The retry ladder, caps and thinking overrides are unchanged; only the injected reminder text differs in that case.
+
 ## [0.12.0] - 2026-09-25
 
 ### Added
