@@ -715,7 +715,11 @@ async def _prepare_llm_request(
             else system_msg
         )
         if addendum_text:
-            messages_for_call = [*messages, addendum_factory(addendum_text)]
+            addendum = addendum_factory(addendum_text)
+            # Not in ``messages``: tell cache-aware providers not to anchor the
+            # rolling breakpoint on it (see ``Message.transient``).
+            addendum["transient"] = True
+            messages_for_call = [*messages, addendum]
 
     # Publish the estimate of THIS request, after observer injections and the
     # addendum. An observer comparing its own estimate against the provider's

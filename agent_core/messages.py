@@ -84,6 +84,12 @@ class Message(TypedDict, total=False):
     # endpoint's pydantic union, whereas a message-level key outside
     # ``WIRE_MESSAGE_KEYS`` is dropped by ``for_wire``.
     image_meta: list[dict[str, Any]]
+    # Marks a per-request projection that is NOT in persistent history (the
+    # loop's ``system_addendum_per_call``). A provider that places a rolling
+    # prompt-cache breakpoint must anchor it BEFORE such messages: the next
+    # request drops them and appends the real turn in their place, so a prefix
+    # ending on one is never reused. Filtered out by ``for_wire``.
+    transient: bool
 
 
 # ── Wire boundary ────────────────────────────────────────────────────────
