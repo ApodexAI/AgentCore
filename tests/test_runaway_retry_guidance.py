@@ -13,8 +13,9 @@ from typing import Any
 
 import pytest
 
-from agent_core.llm import LLMResponse
+from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.runtime.loop import _call
+from agent_core.runtime.loop._bind import bind_max_tokens
 from agent_core.runtime.loop._runaway import _runaway_retry_policy
 
 
@@ -67,3 +68,46 @@ def test_skipped_expansion_does_not_mention_it(monkeypatch: pytest.MonkeyPatch) 
     reminder = _retry_reminder(llm)
     assert reminder.startswith("[system reminder]")
     assert "expanded" not in reminder
+
+
+def test_early_stopped_stream_does_not_claim_full_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_call, "_RUNAWAY_MAX_RETRIES", 2)
+    monkeypatch.setattr(_call, "_RUNAWAY_EXPAND_ENABLED", False)
+    monkeypatch.setattr(_call, "_RUNAWAY_BACKOFF_S", 0.0)
+
+    class _EarlyStoppedThenAnswer:
+        model = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[list[Any]] = []
+
+        async def stream(self, messages: list[Any], **_kwargs: Any) -> Any:
+            self.requests.append(list(messages))
+            if len(self.requests) == 1:
+                yield StreamDelta(reasoning_content="x" * 400)
+            else:
+                yield StreamDelta(content="done", finish_reason="stop")
+
+    async def on_delta(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    llm = _EarlyStoppedThenAnswer()
+    response = asyncio.run(
+        _call.call_llm(
+            bind_max_tokens(llm, 2048),
+            [{"role": "user", "content": "q"}],
+            timeout=30,
+            max_retries=2,
+            turn=1,
+            on_delta=on_delta,
+            reasoning_only_max_tokens=100,
+        )
+    )
+
+    assert response is not None and response.content == "done"
+    assert len(llm.requests) == 2
+    reminder = llm.requests[1][-1]["content"]
+    assert "previous attempt stopped" in reminder
+    assert "full private-reasoning budget" not in reminder

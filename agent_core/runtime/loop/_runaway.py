@@ -59,8 +59,8 @@ _RUNAWAY_RECOVERY_GUIDANCE = (
 # expanded one (expansion disabled by a lowered retry budget, or no room to
 # expand); naming a retry the model never saw would misdescribe its history.
 _RUNAWAY_REDUCED_GUIDANCE = (
-    "[system reminder] The previous attempt used its full private-reasoning "
-    "budget without producing a visible answer or tool call. Use only a short, "
+    "[system reminder] The previous attempt stopped without producing a visible "
+    "answer or tool call. Use only a short, "
     "bounded reasoning pass now, then promptly emit either one valid tool call "
     "or visible answer text. Do not re-derive the full plan."
 )
