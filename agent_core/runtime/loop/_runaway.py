@@ -55,6 +55,15 @@ _RUNAWAY_RECOVERY_GUIDANCE = (
     "a short, bounded reasoning pass now, then promptly emit either one valid "
     "tool call or visible answer text. Do not re-derive the full plan."
 )
+# Same instruction as above for a reduced retry that was NOT preceded by an
+# expanded one (expansion disabled by a lowered retry budget, or no room to
+# expand); naming a retry the model never saw would misdescribe its history.
+_RUNAWAY_REDUCED_GUIDANCE = (
+    "[system reminder] The previous attempt stopped without producing a visible "
+    "answer or tool call. Use only a short, "
+    "bounded reasoning pass now, then promptly emit either one valid tool call "
+    "or visible answer text. Do not re-derive the full plan."
+)
 _RUNAWAY_DIRECT_RECOVERY_GUIDANCE = (
     "[system reminder] Three consecutive attempts spent their budgets in "
     "private reasoning without producing a visible answer or tool call. "
@@ -310,8 +319,14 @@ def _phase_reasoning_guard(
 def _runaway_retry_policy(
     retry_number: int,
     next_cap: Any,
+    *,
+    expanded_attempted: bool = True,
 ) -> tuple[ThinkingRetryOverride, str, str]:
-    """Choose the next retry's task-local thinking policy and guidance."""
+    """Choose the next retry's task-local thinking policy and guidance.
+
+    ``expanded_attempted`` says whether an expanded-thinking retry actually ran
+    before this reduced one; the reduced guidance only refers to it if so.
+    """
     if retry_number == 1:
         try:
             cap = max(int(next_cap), 1)
@@ -353,6 +368,6 @@ def _runaway_retry_policy(
             thinking_budget=budget,
             reasoning_effort="low",
         ),
-        _RUNAWAY_RECOVERY_GUIDANCE,
+        _RUNAWAY_RECOVERY_GUIDANCE if expanded_attempted else _RUNAWAY_REDUCED_GUIDANCE,
         "retry_reduced_cap_and_thinking",
     )
