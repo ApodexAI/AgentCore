@@ -1009,3 +1009,23 @@ async def test_rollback_after_an_injected_message_still_drops_the_turn() -> None
         for message in llm.calls[1]
     )
     assert _orphan_tool_call_ids(llm.calls[1]) == set()
+
+
+@pytest.mark.asyncio
+async def test_per_call_addendum_is_flagged_transient_and_kept_out_of_history() -> None:
+    llm = SequenceLLM([LLMResponse(content="finished")])
+    config = LoopConfig(
+        max_turns=1,
+        loop_policy=LoopPolicy(no_tool_behavior="stop"),
+        max_llm_retries=1,
+        system_addendum_per_call="[env]",
+        system_addendum_per_call_role="user",
+    )
+    result = await run_agent_loop(
+        system_prompt="system", user_message="start", llm=llm, tools=[],
+        config=config, model_profile=ModelProfile(model_id="test", provider="test"),
+    )
+    sent = llm.calls[0]
+    assert sent[-1]["content"] == "[env]" and sent[-1]["transient"] is True
+    assert not any(m.get("transient") for m in sent[:-1])
+    assert not any(m.get("content") == "[env]" for m in result.messages)

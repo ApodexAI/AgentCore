@@ -1120,3 +1120,73 @@ def test_session_resolver_hooks_are_reachable_from_the_package_facade():
     ):
         assert hasattr(providers, name), name
         assert name in providers.__all__, name
+
+
+def _tail_breakpoints(kwargs):
+    """Indices of messages carrying a ``cache_control`` block."""
+    return [
+        i for i, m in enumerate(kwargs["messages"])
+        if isinstance(m["content"], list)
+        and any(isinstance(b, dict) and "cache_control" in b for b in m["content"])
+    ]
+
+
+def _transient(text):
+    m = user_msg(text)
+    m["transient"] = True
+    return m
+
+
+def _strip_cache(msgs):
+    return [
+        {**m, "content": [
+            {k: v for k, v in b.items() if k != "cache_control"} for b in m["content"]
+        ] if isinstance(m["content"], list) else m["content"]}
+        for m in msgs
+    ]
+
+
+def test_anthropic_rolling_breakpoint_skips_transient_addendum(monkeypatch):
+    """The per-call addendum is dropped next turn, so the rolling breakpoint
+    must sit on the last persistent message; otherwise no conversation prefix
+    is ever reused and only the static system head hits the cache."""
+    monkeypatch.delenv("ANTHROPIC_PROMPT_CACHE", raising=False)
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    call = {"id": "t1", "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}}
+    history = [system_msg("s"), user_msg("q"),
+               assistant_msg("", tool_calls=[call]), tool_msg("t1", "out")]
+    build = lambda msgs: c._build_kwargs(  # noqa: E731
+        msgs, tools=None, temperature=None, max_tokens=None,
+        extra_headers=None, timeout=None,
+    )
+
+    first = build([*history, _transient("[Runtime environment metadata]")])
+    # Anchor is the tool result (index 2 after the system split), not the addendum.
+    assert _tail_breakpoints(first) == [2]
+    assert "cache_control" not in first["messages"][-1]["content"][-1]
+
+    call2 = {**call, "id": "t2"}
+    history += [assistant_msg("", tool_calls=[call2]), tool_msg("t2", "out2")]
+    second = build([*history, _transient("[Runtime environment metadata]")])
+    # Everything up to last turn's breakpoint is byte-identical this turn.
+    assert _strip_cache(first["messages"][:3]) == _strip_cache(second["messages"][:3])
+    assert _tail_breakpoints(second) == [4]
+
+
+def test_anthropic_rolling_breakpoint_without_addendum_marks_last(monkeypatch):
+    """Turns before ``system_addendum_min_turn`` carry no addendum: no offset."""
+    monkeypatch.delenv("ANTHROPIC_PROMPT_CACHE", raising=False)
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("q")],
+        tools=None, temperature=None, max_tokens=None,
+        extra_headers=None, timeout=None,
+    )
+    assert _tail_breakpoints(kwargs) == [0]
+
+
+def test_transient_flag_is_not_sent_on_openai_wire():
+    from agent_core.messages import for_wire
+
+    assert for_wire([_transient("x")]) == [user_msg("x")]

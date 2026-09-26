@@ -95,15 +95,21 @@ class AnthropicClient(LLMClient):
     ) -> dict[str, Any]:
         """Shared request-shape builder for :meth:`chat` and :meth:`stream`."""
         system, msgs = _split_system(messages)
+        # ``_to_anthropic_msg`` returns None for a message with nothing
+        # sendable (a contentless assistant turn); those are dropped.
+        pairs = [
+            (converted, bool(m.get("transient")))
+            for m in msgs
+            if (converted := _to_anthropic_msg(m)) is not None
+        ]
+        transient_tail = 0
+        for _, is_transient in reversed(pairs):
+            if not is_transient:
+                break
+            transient_tail += 1
         kwargs: dict[str, Any] = {
             "model": self.model,
-            # ``_to_anthropic_msg`` returns None for a message with nothing
-            # sendable (a contentless assistant turn); those are dropped.
-            "messages": [
-                converted
-                for converted in (_to_anthropic_msg(m) for m in msgs)
-                if converted is not None
-            ],
+            "messages": [converted for converted, _ in pairs],
             "max_tokens": max_tokens or self.default_max_tokens or 4096,
         }
         if system:
@@ -128,7 +134,7 @@ class AnthropicClient(LLMClient):
             kwargs["timeout"] = timeout
         elif self.default_timeout is not None:
             kwargs["timeout"] = self.default_timeout
-        _add_prompt_cache(kwargs)
+        _add_prompt_cache(kwargs, transient_tail=transient_tail)
         return kwargs
 
     async def chat(
@@ -380,7 +386,7 @@ def _split_system(messages: list[Message]) -> tuple[str, list[Message]]:
     return "", list(messages)
 
 
-def _add_prompt_cache(kwargs: dict[str, Any]) -> None:
+def _add_prompt_cache(kwargs: dict[str, Any], *, transient_tail: int = 0) -> None:
     """Set Anthropic prompt-cache breakpoints on ``kwargs`` in place.
 
     Anthropic caching is opt-in per content block (unlike OpenAI's automatic
@@ -391,6 +397,13 @@ def _add_prompt_cache(kwargs: dict[str, Any]) -> None:
     to 4 and serves the longest matching cached prefix, so these two cover the
     static head and the moving tail. This lives inside ``AnthropicClient`` so it
     only ever touches Anthropic requests. Disable with ``ANTHROPIC_PROMPT_CACHE=0``.
+
+    ``transient_tail`` counts trailing messages that exist only in this request
+    (``Message.transient``, e.g. the per-call runtime addendum). The rolling
+    breakpoint skips them: the next request replaces them with the real turn,
+    so a cached prefix ending on one never matches again and every turn would
+    re-write the whole conversation at the cache-write rate while reading only
+    the static head.
     """
     if os.getenv("ANTHROPIC_PROMPT_CACHE", "1") == "0":
         return
@@ -402,11 +415,11 @@ def _add_prompt_cache(kwargs: dict[str, Any]) -> None:
             "text": system,
             "cache_control": {"type": "ephemeral"},
         }]
-    # Rolling tail: mark the last message's final content block.
+    # Rolling tail: mark the last persistent message's final content block.
     msgs = kwargs.get("messages")
-    if not msgs:
+    if not msgs or transient_tail >= len(msgs):
         return
-    last = msgs[-1]
+    last = msgs[-1 - transient_tail]
     content = last.get("content")
     if isinstance(content, str):
         if content:
