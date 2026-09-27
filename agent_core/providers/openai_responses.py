@@ -37,6 +37,7 @@ from openai import AsyncOpenAI
 
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
+from agent_core.providers._api_key import resolve_openai_api_key
 from agent_core.providers.finish_reason import (
     normalize_finish_reason,
     responses_finish_reason,
@@ -71,10 +72,7 @@ class OpenAIResponsesClient(LLMClient):
         self._reasoning = reasoning or None
         self._store = store
         self._client = AsyncOpenAI(
-            # The SDK consults OPENAI_API_KEY only for ``None``; an empty
-            # string (a config read before the environment was populated)
-            # raises "Missing credentials" even with the variable set.
-            api_key=api_key or None,
+            api_key=resolve_openai_api_key(api_key),
             base_url=base_url or None,
             timeout=timeout,
             default_headers=default_headers,
