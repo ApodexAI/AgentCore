@@ -21,6 +21,7 @@ from openai import AsyncOpenAI, BadRequestError
 
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, for_wire
+from agent_core.providers._api_key import resolve_openai_api_key
 from agent_core.runtime.llm_request_overrides import (
     current_thinking_retry_override,
 )
@@ -180,10 +181,7 @@ class OpenAIClient(LLMClient):
         # (see ``mirror_session_query``) — mirror a construction-time session
         # header into ``default_query`` so it rides every request's URL.
         self._client = AsyncOpenAI(
-            # The SDK consults OPENAI_API_KEY only for ``None``; an empty
-            # string (a config read before the environment was populated)
-            # raises "Missing credentials" even with the variable set.
-            api_key=api_key or None,
+            api_key=resolve_openai_api_key(api_key),
             base_url=base_url or None,
             timeout=timeout,
             default_headers=default_headers,
