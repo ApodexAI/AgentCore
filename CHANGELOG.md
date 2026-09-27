@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.12.2] - 2026-09-27
+
+### Fixed
+
+- OpenAI clients no longer fail at construction when the API key is empty and `OPENAI_API_KEY` is unset (a regression in 0.12.0 that broke hosts building an unused default OpenAI client, e.g. ApodexHarness BenchmarkSession beside an Anthropic workflow LLM). A placeholder key is used instead; a client that is actually called fails with the endpoint's 401. The environment variable still wins over an empty key.
+
 ## [0.12.1] - 2026-09-26
 
 ### Fixed
