@@ -102,6 +102,7 @@ class AnthropicClient(LLMClient):
             for m in msgs
             if (converted := _to_anthropic_msg(m)) is not None
         ]
+        pairs = _merge_tool_results(pairs)
         transient_tail = 0
         for _, is_transient in reversed(pairs):
             if not is_transient:
@@ -376,6 +377,39 @@ def _build_bedrock_client(
 
 
 # ── Conversion helpers ───────────────────────────────────────────────────
+
+
+def _merge_tool_results(
+    pairs: list[tuple[dict[str, Any], bool]],
+) -> list[tuple[dict[str, Any], bool]]:
+    """Fold consecutive tool-result-only user messages into one.
+
+    Each OpenAI ``tool`` message converts to its own user message, so a turn
+    with parallel calls produces several in a row. Anthropic merges them, but
+    the documented shape is ONE user message carrying every ``tool_result``,
+    and translating gateways (llm-hub in front of a non-Claude model) reject
+    the split form: "An assistant message with 'tool_calls' must be followed
+    by tool messages responding to each 'tool_call_id'".
+    """
+    def only_results(msg: dict[str, Any]) -> bool:
+        content = msg.get("content")
+        return (
+            msg.get("role") == "user"
+            and isinstance(content, list)
+            and bool(content)
+            and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+        )
+
+    out: list[tuple[dict[str, Any], bool]] = []
+    for msg, transient in pairs:
+        if out and not transient and not out[-1][1] and only_results(msg) and only_results(
+            out[-1][0]
+        ):
+            prev = out[-1][0]
+            out[-1] = ({**prev, "content": [*prev["content"], *msg["content"]]}, False)
+        else:
+            out.append((msg, transient))
+    return out
 
 
 def _split_system(messages: list[Message]) -> tuple[str, list[Message]]:

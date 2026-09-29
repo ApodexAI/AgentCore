@@ -1190,3 +1190,34 @@ def test_transient_flag_is_not_sent_on_openai_wire():
     from agent_core.messages import for_wire
 
     assert for_wire([_transient("x")]) == [user_msg("x")]
+
+
+def test_anthropic_parallel_tool_results_share_one_user_message(monkeypatch):
+    """Translating gateways reject one user message per tool_result."""
+    monkeypatch.setenv("ANTHROPIC_PROMPT_CACHE", "0")
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    calls = [{"id": i, "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+             for i in ("a", "b")]
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("q"), assistant_msg("", tool_calls=calls),
+         tool_msg("ra", "a"), tool_msg("rb", "b"), _transient("[env]")],
+        tools=None, temperature=None, max_tokens=None, extra_headers=None, timeout=None,
+    )
+    msgs = kwargs["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user", "user"]
+    assert [b["tool_use_id"] for b in msgs[2]["content"]] == ["a", "b"]
+    assert msgs[3]["content"] == "[env]"
+
+
+def test_anthropic_cache_breakpoint_after_merged_tool_results(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_PROMPT_CACHE", raising=False)
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    calls = [{"id": i, "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+             for i in ("a", "b")]
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("q"), assistant_msg("", tool_calls=calls),
+         tool_msg("ra", "a"), tool_msg("rb", "b"), _transient("[env]")],
+        tools=None, temperature=None, max_tokens=None, extra_headers=None, timeout=None,
+    )
+    assert _tail_breakpoints(kwargs) == [2]
+    assert "cache_control" in kwargs["messages"][2]["content"][-1]
