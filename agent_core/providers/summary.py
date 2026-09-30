@@ -32,6 +32,22 @@ PERMANENT_STATUS_CODES: frozenset[int] = frozenset({
 })
 
 
+_ERROR_BODY_LOG_LIMIT = 2000
+
+
+def _error_body_excerpt(response: httpx.Response) -> str:
+    try:
+        body = response.text
+    except Exception:  # body may be unread or undecodable
+        return "(unreadable)"
+    body = body.strip()
+    if not body:
+        return "(empty)"
+    if len(body) > _ERROR_BODY_LOG_LIMIT:
+        return body[:_ERROR_BODY_LOG_LIMIT] + f"...[truncated {len(body) - _ERROR_BODY_LOG_LIMIT} chars]"
+    return body
+
+
 def default_summary_retryable(error: Exception) -> bool:
     """Retry transport faults and 5xx, but not permanent request errors."""
     status = getattr(getattr(error, "response", None), "status_code", None)
@@ -222,6 +238,16 @@ class SummaryLLMEngine:
                 return ""
             except Exception as error:
                 logger.warning("Summary LLM attempt %d failed: %s", attempt + 1, error)
+                if isinstance(error, httpx.HTTPStatusError):
+                    # The status line alone ("400 Bad Request") hides why the
+                    # provider rejected the request; log the response body.
+                    logger.warning(
+                        "Summary LLM HTTP %d response body (candidate %d, model %s): %s",
+                        error.response.status_code,
+                        candidate_index + 1,
+                        model,
+                        _error_body_excerpt(error.response),
+                    )
                 if not self.retryable(error):
                     logger.warning(
                         "Summary candidate %d failed permanently; not retrying",

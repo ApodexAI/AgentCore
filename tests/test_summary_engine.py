@@ -211,3 +211,35 @@ def test_default_retryable_classification() -> None:
     assert default_summary_retryable(err(429))
     assert default_summary_retryable(err(503))
     assert default_summary_retryable(TimeoutError("timeout"))
+
+
+def test_error_response_body_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bare "400 Bad Request" hides why the provider rejected the call."""
+    reason = '{"error":{"message":"invalid image_url in content"}}'
+    _install(monkeypatch, [_Response(400, reason)])
+
+    async def sleep(_delay: float) -> None:
+        return None
+
+    engine = SummaryLLMEngine(sleep=sleep, fallback_limit=10)
+    with caplog.at_level("WARNING", logger=summary_mod.__name__):
+        asyncio.run(
+            engine.summarize(
+                "content",
+                "focus",
+                [{"endpoint": "https://a/v1/chat/completions", "model": "m1"}],
+            ),
+        )
+    assert any(
+        "HTTP 400 response body" in r.getMessage() and reason in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_error_body_excerpt_truncates() -> None:
+    long = "x" * (summary_mod._ERROR_BODY_LOG_LIMIT + 50)
+    out = summary_mod._error_body_excerpt(httpx.Response(400, text=long))
+    assert out.endswith("[truncated 50 chars]")
+    assert summary_mod._error_body_excerpt(httpx.Response(400, text="")) == "(empty)"
