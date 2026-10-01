@@ -7,6 +7,17 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.12.3] - 2026-10-01
+
+### Fixed
+
+- Anthropic clients omit sampling parameters from requests in both thinking and non-thinking modes, avoiding `TypeError` with Anthropic Python SDK v1 and HTTP 400 responses from newer models. Constructor, `chat`, and `stream` temperature arguments remain accepted for compatibility but are no longer sent; thinking and effort settings are unchanged.
+- Anthropic requests fold the trailing per-call runtime addendum into the preceding user message instead of sending a second consecutive user message; translating gateways (llm-hub before deepseek-flash) intermittently rejected the split form. The prompt-cache breakpoint stays on the last persistent block.
+- The Anthropic client now sends the tool results of one turn's parallel tool calls in a single user message, as Anthropic documents, instead of one user message per result. Translating gateways (llm-hub in front of a non-Claude model such as deepseek-flash) rejected the split form with a 400.
+- Failed Responses results now raise instead of returning their partial output, so tool calls from a response the server reported as `failed` are never executed. The raised `LLMError` keeps the provider error code and message with an equivalent HTTP status: rate limits use 429, server errors use 500, vector-store timeouts use 504, and other known SDK codes use 400. Unknown or missing codes retain the existing generic retry behavior, while existing text-based fallback and transient-network rules still take precedence. Streaming `response.failed` events now raise the same error instead of being ignored.
+- The runaway-retry reminder is now marked per-call (`transient`) in every recovery path, including early-stopped streams and retries after expanded-context overflow, like the runtime addendum it follows. Unmarked, it ended the Anthropic fold of that addendum and a retried request went out as three consecutive user messages. Cache breakpoints stay on persistent content and reminders never accumulate in history.
+- Summary LLM failures now log the provider HTTP response body, making rejected requests easier to diagnose.
+
 ## [0.12.2] - 2026-09-27
 
 ### Fixed
