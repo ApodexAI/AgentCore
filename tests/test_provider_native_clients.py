@@ -1169,8 +1169,12 @@ def test_anthropic_rolling_breakpoint_skips_transient_addendum(monkeypatch):
     call2 = {**call, "id": "t2"}
     history += [assistant_msg("", tool_calls=[call2]), tool_msg("t2", "out2")]
     second = build([*history, _transient("[Runtime environment metadata]")])
-    # Everything up to last turn's breakpoint is byte-identical this turn.
-    assert _strip_cache(first["messages"][:3]) == _strip_cache(second["messages"][:3])
+    # Everything up to and including last turn's breakpoint block is
+    # byte-identical this turn. The addendum is folded into message 2 after
+    # that block, which the cached prefix does not reach.
+    first_prefix = _strip_cache(first["messages"][:3])
+    first_prefix[2] = {**first_prefix[2], "content": first_prefix[2]["content"][:-1]}
+    assert first_prefix == _strip_cache(second["messages"][:3])
     assert _tail_breakpoints(second) == [4]
 
 
@@ -1204,9 +1208,9 @@ def test_anthropic_parallel_tool_results_share_one_user_message(monkeypatch):
         tools=None, temperature=None, max_tokens=None, extra_headers=None, timeout=None,
     )
     msgs = kwargs["messages"]
-    assert [m["role"] for m in msgs] == ["user", "assistant", "user", "user"]
-    assert [b["tool_use_id"] for b in msgs[2]["content"]] == ["a", "b"]
-    assert msgs[3]["content"] == "[env]"
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+    assert [b.get("tool_use_id") for b in msgs[2]["content"]] == ["a", "b", None]
+    assert msgs[2]["content"][-1] == {"type": "text", "text": "[env]"}
 
 
 def test_anthropic_cache_breakpoint_after_merged_tool_results(monkeypatch):
@@ -1219,5 +1223,17 @@ def test_anthropic_cache_breakpoint_after_merged_tool_results(monkeypatch):
          tool_msg("ra", "a"), tool_msg("rb", "b"), _transient("[env]")],
         tools=None, temperature=None, max_tokens=None, extra_headers=None, timeout=None,
     )
-    assert _tail_breakpoints(kwargs) == [2]
-    assert "cache_control" in kwargs["messages"][2]["content"][-1]
+    # The breakpoint stays on the last tool_result, not on the folded-in
+    # per-call text that the next request will not repeat.
+    content = kwargs["messages"][2]["content"]
+    assert "cache_control" in content[-2] and "cache_control" not in content[-1]
+
+
+def test_anthropic_transient_addendum_after_a_plain_user_turn_is_folded(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_PROMPT_CACHE", "0")
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    kwargs = c._build_kwargs([system_msg("s"), user_msg("q"), _transient("[env]")],
+                             tools=None, temperature=None, max_tokens=None,
+                             extra_headers=None, timeout=None)
+    assert kwargs["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "q"}, {"type": "text", "text": "[env]"}]}]
