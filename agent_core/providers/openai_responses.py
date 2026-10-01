@@ -35,6 +35,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from agent_core.errors import LLMError
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.providers._api_key import resolve_openai_api_key
@@ -44,6 +45,39 @@ from agent_core.providers.finish_reason import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Equivalent HTTP statuses for the Responses SDK's ResponseError codes.
+_RESPONSE_ERROR_STATUS_CODES = {
+    "rate_limit_exceeded": 429,
+    "server_error": 500,
+    "vector_store_timeout": 504,
+    "invalid_prompt": 400,
+    "data_residency_mismatch": 400,
+    "bio_policy": 400,
+    "invalid_image": 400,
+    "invalid_image_format": 400,
+    "invalid_base64_image": 400,
+    "invalid_image_url": 400,
+    "image_too_large": 400,
+    "image_too_small": 400,
+    "image_parse_error": 400,
+    "image_content_policy_violation": 400,
+    "invalid_image_mode": 400,
+    "image_file_too_large": 400,
+    "unsupported_image_media_type": 400,
+    "empty_image_file": 400,
+    "failed_to_download_image": 400,
+    "image_file_not_found": 400,
+}
+
+
+class _ResponsesError(LLMError):
+    """A failed Responses result with signals for the shared retry classifier."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}" if code else message)
+        self.code = code
+        self.status_code = _RESPONSE_ERROR_STATUS_CODES.get(code)
 
 
 class OpenAIResponsesClient(LLMClient):
@@ -162,6 +196,10 @@ class OpenAIResponsesClient(LLMClient):
                 "response.reasoning_text.delta",
             ):
                 yield StreamDelta(reasoning_content=getattr(event, "delta", "") or "")
+            elif etype == "response.failed":
+                raise _response_failure(
+                    getattr(event, "response", None), fallback="Responses request failed",
+                )
             elif etype in ("response.completed", "response.incomplete"):
                 resp = getattr(event, "response", None)
                 usage = _responses_usage_dict(getattr(resp, "usage", None))
@@ -323,7 +361,13 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
     ``content`` is kept as a verbatim block list (reasoning items incl.
     ``encrypted_content`` + text blocks) so the ``content_block`` thinking
     parser preserves them as ``raw_content_blocks`` for faithful replay.
+
+    A ``failed`` response raises instead of returning its partial output as an
+    answer: the caller would otherwise execute tool calls from a response the
+    server itself reported as failed.
     """
+    if str(_get(raw, "status", "") or "") == "failed":
+        raise _response_failure(raw, fallback="Responses request failed")
     blocks_out: list[dict[str, Any]] = []
     text_parts: list[str] = []
     summary_parts: list[str] = []
@@ -400,6 +444,14 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
         model=_get(raw, "model", "") or "",
         usage=_responses_usage_dict(_get(raw, "usage", None)),
         response_metadata={"id": _get(raw, "id", "")},
+    )
+
+
+def _response_failure(raw: Any, *, fallback: str) -> LLMError:
+    """Preserve the provider's code and message for shared retry routing."""
+    error = _get(raw, "error", None)
+    return _ResponsesError(
+        str(_get(error, "code", "") or ""), _get(error, "message", "") or fallback,
     )
 
 
