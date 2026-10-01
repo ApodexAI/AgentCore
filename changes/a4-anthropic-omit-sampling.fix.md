@@ -1,0 +1,1 @@
+Anthropic clients omit sampling parameters from requests in both thinking and non-thinking modes, avoiding `TypeError` with Anthropic Python SDK v1 and HTTP 400 responses from newer models. Constructor, `chat`, and `stream` temperature arguments remain accepted for compatibility but are no longer sent; thinking and effort settings are unchanged.

@@ -35,7 +35,11 @@ logger = logging.getLogger(__name__)
 
 
 class AnthropicClient(LLMClient):
-    """Non-streaming-first Anthropic adapter."""
+    """Non-streaming-first Anthropic adapter.
+
+    Constructor, chat and stream accept but omit ``temperature`` for compatibility:
+    SDK v1 removed sampling parameters and newer models reject non-default values with 400.
+    """
 
     def __init__(
         self,
@@ -58,8 +62,7 @@ class AnthropicClient(LLMClient):
         # Extended thinking: when set (e.g. ``{"type": "adaptive", "display":
         # "summarized"}``) the request carries ``thinking=`` so responses return
         # thinking + signature blocks; the response parser keeps them verbatim
-        # (content_block) for faithful multi-turn replay. ``temperature`` is
-        # dropped when thinking is on (Anthropic 400s on the combo). ``effort``
+        # (content_block) for faithful multi-turn replay. ``effort``
         # (low|medium|high|xhigh|max) → ``output_config.effort`` via extra_body.
         self._thinking = thinking or None
         self._effort = (effort or "").strip()
@@ -116,17 +119,11 @@ class AnthropicClient(LLMClient):
         if system:
             kwargs["system"] = system
         if self._thinking:
-            # Anthropic rejects ``temperature`` together with thinking, so it is
-            # OMITTED here regardless of the configured default. ``effort`` rides
-            # on ``extra_body.output_config`` so any value (incl. ``xhigh``)
+            # ``effort`` rides on ``extra_body.output_config`` so any value (incl. ``xhigh``)
             # reaches ``messages.create`` without the SDK's stricter validation.
             kwargs["thinking"] = self._thinking
             if self._effort:
                 kwargs["extra_body"] = {"output_config": {"effort": self._effort}}
-        else:
-            eff_temp = temperature if temperature is not None else self.default_temperature
-            if eff_temp is not None:
-                kwargs["temperature"] = eff_temp
         if tools:
             kwargs["tools"] = [_to_anthropic_tool(t) for t in tools]
         if extra_headers:
