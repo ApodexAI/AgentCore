@@ -9,6 +9,8 @@ on tool calls, per-call ``timeout`` only when explicitly passed, tool_call
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -667,6 +669,81 @@ def test_openai_client_satisfies_protocol():
 
 
 # ── Anthropic conversions (pure, no SDK call) ───────────────────────────────
+
+
+@pytest.mark.parametrize("temperature", [0.2, None])
+def test_anthropic_build_kwargs_omits_sampling_parameters(temperature):
+    c = ac.AnthropicClient("claude-x", api_key="x", temperature=0.0)
+    kwargs = c._build_kwargs(
+        [user_msg("hi")], tools=None, temperature=temperature,
+        max_tokens=None, extra_headers=None, timeout=None,
+    )
+    sampling = {"temperature", "top_p", "top_k"}
+    assert sampling.isdisjoint(kwargs)
+    assert sampling.isdisjoint(kwargs.get("extra_body", {}))
+
+
+@pytest.mark.parametrize("thinking", [None, {"type": "adaptive"}])
+def test_anthropic_build_kwargs_matches_installed_sdk_signature(thinking):
+    from anthropic.resources.messages import AsyncMessages
+
+    c = ac.AnthropicClient(
+        "claude-x", api_key="x", temperature=0.0, thinking=thinking, effort="high",
+    )
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("hi")],
+        tools=[{"type": "function", "function": {
+            "name": "search", "parameters": {"type": "object"},
+        }}],
+        temperature=0.2, max_tokens=256,
+        extra_headers={"x-test": "test"}, timeout=30,
+    )
+    parameters = inspect.signature(AsyncMessages.create).parameters
+    assert set(kwargs) <= set(parameters)
+    assert kwargs["tools"][0]["name"] == "search"
+    assert kwargs["extra_headers"] == {"x-test": "test"}
+    assert kwargs["timeout"] == 30
+    assert {"temperature", "top_p", "top_k"}.isdisjoint(kwargs.get("extra_body", {}))
+    if thinking:
+        assert kwargs["thinking"] == thinking
+        assert kwargs["extra_body"] == {"output_config": {"effort": "high"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("temperature", [0.2, None])
+async def test_anthropic_chat_real_sdk_omits_sampling_parameters(temperature):
+    from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
+
+    # Anthropic 0.x uses httpx; 1.x uses httpx2. Match the installed SDK's
+    # public default client without requiring httpx2 in supported 0.x installs.
+    if issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
+        sdk_httpx = httpx
+    else:
+        import httpx2 as sdk_httpx
+
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return sdk_httpx.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-x",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    c = ac.AnthropicClient("claude-x", api_key="test", temperature=0.0)
+    await c._client.close()
+    async with AsyncAnthropic(
+        api_key="test", base_url="https://anthropic.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond)),
+    ) as sdk:
+        c._client = sdk
+        response = await c.chat([user_msg("hi")], temperature=temperature)
+
+    assert response.content == "hello"
+    assert len(requests) == 1
+    assert {"temperature", "top_p", "top_k"}.isdisjoint(requests[0])
 
 
 def test_anthropic_split_system():

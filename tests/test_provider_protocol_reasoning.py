@@ -55,13 +55,13 @@ def test_anthropic_build_kwargs_sends_thinking_and_drops_temperature():
     assert kw["extra_body"] == {"output_config": {"effort": "high"}}
 
 
-def test_anthropic_build_kwargs_keeps_temperature_when_thinking_off():
+def test_anthropic_build_kwargs_drops_temperature_when_thinking_off():
     c = AnthropicClient("claude-x", api_key="x", temperature=0.3)
     kw = c._build_kwargs(
         [user_msg("hi")], tools=None, temperature=None,
         max_tokens=None, extra_headers=None, timeout=None,
     )
-    assert kw["temperature"] == 0.3
+    assert "temperature" not in kw
     assert "thinking" not in kw and "extra_body" not in kw
 
 
