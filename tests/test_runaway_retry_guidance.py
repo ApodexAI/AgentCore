@@ -111,3 +111,17 @@ def test_early_stopped_stream_does_not_claim_full_budget(
     reminder = llm.requests[1][-1]["content"]
     assert "previous attempt stopped" in reminder
     assert "full private-reasoning budget" not in reminder
+
+
+def test_retry_reminder_is_per_call_so_providers_can_fold_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Like the runtime addendum it follows, the reminder is never stored in
+    history; unmarked, it ended the Anthropic fold of the addendum and the
+    retry went out as three consecutive user messages."""
+    monkeypatch.setattr(_call, "_RUNAWAY_EXPAND_ENABLED", False)
+    monkeypatch.setattr(_call, "_RUNAWAY_BACKOFF_S", 0.0)
+    llm = _RunawayThenAnswer()
+    addendum = {"role": "user", "content": "[env]", "transient": True}
+    asyncio.run(_call.call_llm(llm, [{"role": "user", "content": "q"}, addendum],
+                               timeout=30, max_retries=3, turn=1))
+    retry = llm.requests[1]
+    assert retry[-2] is addendum and retry[-1].get("transient") is True

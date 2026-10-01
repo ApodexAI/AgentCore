@@ -1237,3 +1237,21 @@ def test_anthropic_transient_addendum_after_a_plain_user_turn_is_folded(monkeypa
                              extra_headers=None, timeout=None)
     assert kwargs["messages"] == [{"role": "user", "content": [
         {"type": "text", "text": "q"}, {"type": "text", "text": "[env]"}]}]
+
+
+def test_anthropic_folds_every_trailing_per_call_message(monkeypatch):
+    """A runaway retry adds its reminder after the runtime addendum: both are
+    per-call and both join the tool results, breakpoint on the last result."""
+    monkeypatch.delenv("ANTHROPIC_PROMPT_CACHE", raising=False)
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    call = {"id": "a", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("q"), assistant_msg("", tool_calls=[call]),
+         tool_msg("ra", "a"), _transient("[env]"), _transient("[system reminder] retry")],
+        tools=None, temperature=None, max_tokens=None, extra_headers=None, timeout=None,
+    )
+    msgs = kwargs["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+    content = msgs[2]["content"]
+    assert [b["type"] for b in content] == ["tool_result", "text", "text"]
+    assert "cache_control" in content[0] and all("cache_control" not in b for b in content[1:])

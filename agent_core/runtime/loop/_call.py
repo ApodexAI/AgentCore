@@ -760,7 +760,15 @@ async def call_llm(
                             expanded_attempted=runaway_expanded,
                         )
                     )
-                    messages_active = [*messages, user_msg(recovery_guidance)]
+                    # Per-call, like the runtime addendum: the loop never stores
+                    # it in history. Marked so providers treat it that way —
+                    # the Anthropic adapter folds it into the preceding user
+                    # message and keeps the cache breakpoint off it. Unmarked,
+                    # the addendum ahead of it was no longer the tail, so the
+                    # request went out as three consecutive user messages.
+                    reminder = user_msg(recovery_guidance)
+                    reminder["transient"] = True
+                    messages_active = [*messages, reminder]
                     await _finish_attempt(
                         outcome=ATTEMPT_DISCARDED,
                         reason="reasoning_runaway",

@@ -1,0 +1,1 @@
+The runaway-retry reminder is now marked per-call (`transient`), like the runtime addendum it follows. Unmarked, it ended the Anthropic fold of that addendum and a retried request went out as three consecutive user messages.
