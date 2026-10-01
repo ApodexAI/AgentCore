@@ -712,14 +712,20 @@ def test_anthropic_build_kwargs_matches_installed_sdk_signature(thinking):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("temperature", [0.2, None])
 async def test_anthropic_chat_real_sdk_omits_sampling_parameters(temperature):
-    import httpx2
-    from anthropic import AsyncAnthropic
+    from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
+
+    # Anthropic 0.x uses httpx; 1.x uses httpx2. Match the installed SDK's
+    # public default client without requiring httpx2 in supported 0.x installs.
+    if issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
+        sdk_httpx = httpx
+    else:
+        import httpx2 as sdk_httpx
 
     requests = []
 
     def respond(request):
         requests.append(json.loads(request.content))
-        return httpx2.Response(200, json={
+        return sdk_httpx.Response(200, json={
             "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-x",
             "content": [{"type": "text", "text": "hello"}],
             "stop_reason": "end_turn", "stop_sequence": None,
@@ -730,7 +736,7 @@ async def test_anthropic_chat_real_sdk_omits_sampling_parameters(temperature):
     await c._client.close()
     async with AsyncAnthropic(
         api_key="test", base_url="https://anthropic.invalid", max_retries=0,
-        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond)),
     ) as sdk:
         c._client = sdk
         response = await c.chat([user_msg("hi")], temperature=temperature)
