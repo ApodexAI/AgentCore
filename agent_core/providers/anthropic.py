@@ -136,6 +136,9 @@ class AnthropicClient(LLMClient):
         elif self.default_timeout is not None:
             kwargs["timeout"] = self.default_timeout
         _add_prompt_cache(kwargs, transient_tail=transient_tail)
+        # After the cache breakpoint is placed, so it stays on the last
+        # persistent block rather than moving onto the per-call text.
+        kwargs["messages"] = _fold_transient_tail(kwargs["messages"], transient_tail)
         return kwargs
 
     async def chat(
@@ -410,6 +413,36 @@ def _merge_tool_results(
         else:
             out.append((msg, transient))
     return out
+
+
+def _fold_transient_tail(msgs: list[dict[str, Any]], transient_tail: int) -> list[dict[str, Any]]:
+    """Append trailing per-call user text to the user message before it.
+
+    The runtime addendum (``system_addendum_per_call_role="user"``) arrives as
+    one more user message after the tool results. Anthropic accepts the pair,
+    but translating gateways do not reliably: llm-hub in front of deepseek-flash
+    answered six of 195 requests in one Forge run (2026-10-01) with
+    "An assistant message with 'tool_calls' must be followed by tool messages
+    responding to each 'tool_call_id'", and the loop then gave up on the
+    episode's history. One user message holding the results and then the text
+    is the shape every translator maps cleanly.
+    """
+    if transient_tail <= 0 or len(msgs) <= transient_tail:
+        return msgs
+    head, tail = msgs[:-transient_tail], msgs[-transient_tail:]
+    target = head[-1]
+    if target.get("role") != "user" or any(m.get("role") != "user" for m in tail):
+        return msgs
+    blocks = target.get("content")
+    blocks = [{"type": "text", "text": blocks}] if isinstance(blocks, str) else list(blocks or [])
+    for m in tail:
+        extra = m.get("content")
+        if isinstance(extra, str):
+            if extra:
+                blocks.append({"type": "text", "text": extra})
+        elif isinstance(extra, list):
+            blocks.extend(extra)
+    return [*head[:-1], {**target, "content": blocks}]
 
 
 def _split_system(messages: list[Message]) -> tuple[str, list[Message]]:

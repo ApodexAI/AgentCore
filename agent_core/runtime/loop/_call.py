@@ -170,6 +170,17 @@ def _stream_recovery_budget_too_small(
         and remaining_s < attempt_budget_s / 2
     )
 
+def _runaway_retry_messages(messages: list[Message], guidance: str) -> list[Message]:
+    """Append per-call guidance without persisting or caching the reminder.
+
+    Every recovery branch uses the same projection so providers can fold the
+    reminder and any runtime addendum into the preceding persistent user turn.
+    """
+    reminder = user_msg(guidance)
+    reminder["transient"] = True
+    return [*messages, reminder]
+
+
 async def call_llm(
     llm: Any,
     messages: list[Message],
@@ -760,7 +771,7 @@ async def call_llm(
                             expanded_attempted=runaway_expanded,
                         )
                     )
-                    messages_active = [*messages, user_msg(recovery_guidance)]
+                    messages_active = _runaway_retry_messages(messages, recovery_guidance)
                     await _finish_attempt(
                         outcome=ATTEMPT_DISCARDED,
                         reason="reasoning_runaway",
@@ -882,7 +893,7 @@ async def call_llm(
                         expanded_attempted=runaway_expanded,
                     )
                 )
-                messages_active = [*messages, user_msg(recovery_guidance)]
+                messages_active = _runaway_retry_messages(messages, recovery_guidance)
                 await _finish_attempt(
                     outcome=ATTEMPT_DISCARDED,
                     reason="reasoning_runaway_early",
@@ -1027,7 +1038,7 @@ async def call_llm(
                 retry_thinking, recovery_guidance, _ = _runaway_retry_policy(
                     runaway_retries, next_cap,
                 )
-                messages_active = [*messages, user_msg(recovery_guidance)]
+                messages_active = _runaway_retry_messages(messages, recovery_guidance)
                 await _finish_attempt(
                     outcome=ATTEMPT_DISCARDED,
                     reason="context_length",
