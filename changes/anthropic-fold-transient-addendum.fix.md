@@ -1,1 +1,0 @@
-Anthropic requests fold the trailing per-call runtime addendum into the preceding user message instead of sending a second consecutive user message; translating gateways (llm-hub before deepseek-flash) intermittently rejected the split form. The prompt-cache breakpoint stays on the last persistent block.

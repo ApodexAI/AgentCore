@@ -1,1 +1,0 @@
-The Anthropic client now sends the tool results of one turn's parallel tool calls in a single user message, as Anthropic documents, instead of one user message per result. Translating gateways (llm-hub in front of a non-Claude model such as deepseek-flash) rejected the split form with a 400.
