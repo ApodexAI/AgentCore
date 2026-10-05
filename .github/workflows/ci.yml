@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: ['**']
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
@@ -25,7 +25,11 @@ jobs:
       - run: uv run pytest -q
       # Keep current-model request/response handling usable at our SDK floor,
       # including SDK 0.x (httpx) versus 1.x (httpx2) parsing and transport.
-      - run: uv run --isolated --with 'anthropic[bedrock]==0.69.0' --extra dev pytest -q tests/test_anthropic_latest_models.py tests/test_provider_native_clients.py tests/test_provider_protocol_reasoning.py
+      - run: >-
+          uv run --isolated --with 'anthropic[bedrock]==0.69.0' --extra dev pytest -q
+          tests/test_anthropic_latest_models.py tests/test_provider_native_clients.py
+          tests/test_provider_protocol_reasoning.py tests/test_model_capabilities.py
+          tests/test_aux_builder.py
       # The gate pins tiktoken's own cache key and content hash, and only a real
       # tiktoken can falsify them. Scope that optional dependency to this contract
       # test; the isolated run uses the tokenizer version pinned in uv.lock.

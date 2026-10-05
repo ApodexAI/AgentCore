@@ -23,6 +23,7 @@ import logging
 from typing import Any, get_args
 
 from agent_core.llm import LLMClient
+from agent_core.model_capabilities import resolve_model_capabilities
 
 # Single source of truth for the valid ``llm.protocol`` values. Duplicating the
 # set here would let the two drift, which is how a protocol becomes buildable
@@ -124,46 +125,65 @@ def _build_anthropic(
     ``output_config.effort``. ``default_headers`` (gateway routing / auth
     headers) is merged over ``X-Title``, as in the Responses builder.
 
-    ``thinking_type`` selects the request shape (default ``adaptive``). Live-
-    verified against api.anthropic.com + Bedrock 2026-07-09 (see
-    ``temp/2026-07-09_reasoning-protocol-live-verification.md``); matches the
-    official matrix at platform.claude.com/docs/en/build-with-claude/adaptive-thinking:
+    ``thinking_type`` overrides the model-aware default: prefer adaptive, use
+    enabled for known manual-thinking-only models, or omit thinking when the
+    host declares no supported mode. Unknown models retain the protocol's
+    previous adaptive default. Adaptive display defaults to summarized so
+    readable progress is retained even when the API defaults to omitted.
 
-    - ``adaptive`` (DEFAULT) — the RECOMMENDED mode for all current Claude
-      (Opus 4.6/4.7/4.8, Sonnet 4.6/5, Fable/Mythos), and the ONLY mode on the
-      newest (Opus 4.7/4.8, Sonnet 5) — ``enabled`` is rejected there with 400.
-      Emits ``thinking={"type":"adaptive"}`` + ``thinking_display`` (default
-      ``summarized`` so the readable thinking text is captured; the newest
-      models default ``display`` to ``omitted`` = empty ``thinking`` field with
-      the ``signature`` still present for replay). ``effort`` is forwarded only
-      in this mode (it is an adaptive-only knob; the oldest models 400 on
-      ``enabled``+effort).
-    - ``enabled`` — LEGACY opt-in for models older than Opus 4.6 / Sonnet 4.6
-      (Sonnet 4.5, Opus 4.5, …), which reject ``adaptive`` with 400. Emits
-      ``thinking={"type":"enabled","budget_tokens":N}`` (``N`` from
-      ``thinking_budget_tokens``, default 8192, clamped to ``[1024, max_tokens-1]``
-      since Anthropic requires ``budget_tokens < max_tokens``). When the
-      configured ``max_tokens`` is too small for the 1024 floor, ``max_tokens``
-      is RAISED to ``budget + 1`` rather than emitting an invalid pair — see
-      :func:`_enabled_thinking_budget`. ``effort`` is
-      NOT sent (budget_tokens is the control knob here; oldest models 400 on it).
-      Deprecated on Opus 4.6 / Sonnet 4.6 per Anthropic.
+    Enabled thinking uses :func:`_enabled_thinking_budget` to keep the legacy
+    1024-token floor below max_tokens. It forwards effort only when the model
+    capability record establishes support (for example Opus 4.5); unknown
+    legacy models retain the previous behavior of omitting effort. Unsupported
+    explicit settings raise before creating the SDK client. Hosts can override
+    facts through the profile's ``model_capabilities`` mapping.
     """
     from agent_core.providers.anthropic import AnthropicClient
 
     max_tokens = int(cfg.get("max_tokens", 32768))
-    ttype = str(cfg.get("thinking_type", "adaptive")).strip().lower()
+    overrides = cfg.get("model_capabilities")
+    if overrides is not None and not isinstance(overrides, dict):
+        raise ValueError("model_capabilities must be a mapping")
+    capabilities = resolve_model_capabilities(
+        cfg["model"], protocol="bedrock" if bedrock else "anthropic", overrides=overrides,
+    )
+    default_mode: str | None = "adaptive"
+    if capabilities.thinking_modes is not None and "adaptive" not in capabilities.thinking_modes:
+        default_mode = (
+            "enabled" if "enabled" in capabilities.thinking_modes
+            else "disabled" if "disabled" in capabilities.thinking_modes else None
+        )
+    raw_mode = cfg.get("thinking_type")
+    if raw_mode is None or (isinstance(raw_mode, str) and not raw_mode.strip()):
+        ttype = default_mode
+    elif isinstance(raw_mode, str):
+        ttype = raw_mode.strip().lower()
+    else:
+        raise ValueError("thinking_type must be a string or null")
+    if ttype is not None and ttype not in ("adaptive", "enabled", "disabled"):
+        raise ValueError(f"unknown thinking_type {ttype!r}; use adaptive, enabled, or disabled")
+    capabilities.validate_request(
+        model=cfg["model"], thinking={"type": ttype} if ttype else None,
+        effort=_effort_str(cfg),
+    )
+    thinking: dict[str, Any] | None
     if ttype == "enabled":
         budget, max_tokens = _enabled_thinking_budget(
             int(cfg.get("thinking_budget_tokens", 8192)), max_tokens,
         )
-        thinking: dict[str, Any] = {"type": "enabled", "budget_tokens": budget}
-        effort = ""
-    else:
+        thinking = {"type": "enabled", "budget_tokens": budget}
+        effort = _effort_str(cfg) if capabilities.effort_levels else ""
+    elif ttype == "adaptive":
         thinking = {"type": "adaptive"}
         display = cfg.get("thinking_display", "summarized")
         if isinstance(display, str) and display.strip():
             thinking["display"] = display.strip()
+        effort = _effort_str(cfg)
+    elif ttype == "disabled":
+        thinking = {"type": "disabled"}
+        effort = _effort_str(cfg)
+    else:
+        thinking = None
         effort = _effort_str(cfg)
     return AnthropicClient(
         model=cfg["model"],
@@ -174,6 +194,7 @@ def _build_anthropic(
         effort=effort,
         default_headers={"X-Title": title, **(cfg.get("default_headers") or {})},
         bedrock=bedrock,
+        capabilities=capabilities,
     )
 
 

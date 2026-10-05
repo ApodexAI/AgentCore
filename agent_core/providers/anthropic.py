@@ -29,6 +29,7 @@ from typing import Any
 
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
+from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
 from agent_core.providers.finish_reason import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class AnthropicClient(LLMClient):
         effort: str = "",
         bedrock: bool = False,
         default_headers: dict[str, str] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         self.model = model
         self.default_temperature = temperature
@@ -66,6 +68,13 @@ class AnthropicClient(LLMClient):
         # (low|medium|high|xhigh|max) → ``output_config.effort`` via extra_body.
         self._thinking = thinking or None
         self._effort = (effort or "").strip()
+        self.capabilities = capabilities or resolve_model_capabilities(
+            model, protocol="bedrock" if bedrock else "anthropic",
+        )
+        self.capabilities.validate_request(
+            model=model, thinking=self._thinking, effort=self._effort,
+            max_tokens=max_tokens,
+        )
         # Transport: ``bedrock`` swaps AsyncAnthropic (``/v1/messages`` +
         # ``x-api-key``) for the AWS Bedrock runtime (``/model/{id}/invoke`` +
         # ``anthropic_version`` body stamp) authenticated with a Bedrock API Key
@@ -97,6 +106,11 @@ class AnthropicClient(LLMClient):
         timeout: float | None,
     ) -> dict[str, Any]:
         """Shared request-shape builder for :meth:`chat` and :meth:`stream`."""
+        output_limit = max_tokens or self.default_max_tokens or 4096
+        self.capabilities.validate_request(
+            model=self.model, thinking=self._thinking, effort=self._effort,
+            max_tokens=output_limit,
+        )
         system, msgs = _split_system(messages)
         # ``_to_anthropic_msg`` returns None for a message with nothing
         # sendable (a contentless assistant turn); those are dropped.
@@ -114,7 +128,7 @@ class AnthropicClient(LLMClient):
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": [converted for converted, _ in pairs],
-            "max_tokens": max_tokens or self.default_max_tokens or 4096,
+            "max_tokens": output_limit,
         }
         if system:
             kwargs["system"] = system

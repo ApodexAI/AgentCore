@@ -7,6 +7,8 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from agent_core.model_capabilities import resolve_model_capabilities
+
 logger = logging.getLogger(__name__)
 
 type ClientFactory = Callable[..., Any]
@@ -143,12 +145,34 @@ class AuxLLMFactory:
             "effort": str(section.get("effort") or ""),
             "bedrock": bedrock,
         }
+        overrides = section.get("model_capabilities")
+        if overrides is not None and not isinstance(overrides, Mapping):
+            raise ValueError("model_capabilities must be a mapping")
+        capabilities = resolve_model_capabilities(
+            str(section["model"]), protocol="bedrock" if bedrock else "anthropic",
+            overrides=overrides,
+        )
+        # Preserve the caller's intent for validation before legacy conversion
+        # maps an explicit disabled/off configuration to no thinking field.
+        raw_thinking = section.get("thinking")
+        validation_thinking = kwargs["thinking"]
+        if isinstance(raw_thinking, Mapping):
+            kind = str(raw_thinking.get("type") or "").strip().lower()
+            if kind in {"disabled", "off", "none", "false"}:
+                validation_thinking = {"type": "disabled"}
+        maximum = section.get("max_completion_tokens") or section.get("max_tokens")
+        capabilities.validate_request(
+            model=str(section["model"]), thinking=validation_thinking,
+            effort=kwargs["effort"].strip(),
+            max_tokens=int(maximum) if maximum is not None else None,
+        )
+        if overrides is not None:
+            kwargs["capabilities"] = capabilities
         if section.get("base_url"):
             kwargs["base_url"] = section["base_url"]
         default_headers = _headers(section.get("extra_headers"))
         if default_headers:
             kwargs["default_headers"] = default_headers
-        maximum = section.get("max_completion_tokens") or section.get("max_tokens")
         if maximum is not None:
             kwargs["max_tokens"] = int(maximum)
         return self._anthropic_factory(**kwargs)

@@ -19,6 +19,8 @@ from agent_core.messages import (
     assistant_msg,
     assistant_msg_with_reasoning,
 )
+from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
+from agent_core.model_capabilities import WireProtocol as WireProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,6 @@ _VALID_FORMATS: frozenset[str] = frozenset(get_args(ThinkingFormat))
 
 # Wire protocol the client speaks. Named alias so config readers can declare it
 # instead of returning a bare str that every ModelProfile call site then rejects.
-WireProtocol = Literal["chat_completions", "anthropic", "responses", "bedrock"]
 _VALID_PROTOCOLS: frozenset[str] = frozenset(get_args(WireProtocol))
 
 
@@ -209,6 +210,14 @@ class ModelProfile:
     # ``content_block`` so the parser keeps the verbatim blocks (signatures /
     # encrypted_content) for faithful multi-turn replay + trajectory.
     protocol: WireProtocol = "chat_completions"
+    # Request constraints use the same records as provider construction.
+    # context_window above remains the host's operational context budget;
+    # capabilities.max_input_tokens describes the provider's maximum.
+    capabilities: ModelCapabilities | None = None
+
+    @property
+    def request_capabilities(self) -> ModelCapabilities:
+        return self.capabilities or resolve_model_capabilities(self.model_id, protocol=self.protocol)
 
 
 @dataclass
