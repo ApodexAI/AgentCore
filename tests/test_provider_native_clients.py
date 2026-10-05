@@ -1332,3 +1332,171 @@ def test_anthropic_folds_every_trailing_per_call_message(monkeypatch):
     content = msgs[2]["content"]
     assert [b["type"] for b in content] == ["tool_result", "text", "text"]
     assert "cache_control" in content[0] and all("cache_control" not in b for b in content[1:])
+
+
+# ── Refusals: stop_reason / stop_details surfacing ───────────────────────
+#
+# A safety classifier decline is an HTTP 200 whose ``content`` is empty, so to
+# the loop it is indistinguishable from the model choosing to say nothing: no
+# text, no tool call, the no-tool exit, a run that looks clean. These pin the
+# detail onto ``response_metadata`` so a trajectory can say WHY.
+
+
+def _refusal_payload(**overrides):
+    payload = {
+        "id": "msg_r", "type": "message", "role": "assistant", "model": "claude-x",
+        "content": [],
+        "stop_reason": "refusal", "stop_sequence": None,
+        "stop_details": {
+            "type": "refusal", "category": "bio", "explanation": "declined",
+        },
+        "usage": {"input_tokens": 10, "output_tokens": 0},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_anthropic_refusal_surfaces_stop_reason_and_details():
+    raw = SimpleNamespace(
+        id="msg_r", model="claude-x", content=[], stop_reason="refusal",
+        stop_details=SimpleNamespace(
+            type="refusal", category="bio", explanation="declined",
+        ),
+        usage=SimpleNamespace(input_tokens=10, output_tokens=0),
+    )
+    response = ac._to_llm_response(raw)
+
+    assert response.finish_reason == "refusal"
+    assert response.response_metadata["stop_reason"] == "refusal"
+    assert response.response_metadata["stop_details"] == {
+        "type": "refusal", "category": "bio", "explanation": "declined",
+    }
+
+
+def test_anthropic_keeps_the_raw_stop_reason_next_to_the_normalised_one():
+    """``max_tokens`` normalises to ``length``; the provider's word survives."""
+    raw = SimpleNamespace(
+        id="msg_t", model="claude-x",
+        content=[SimpleNamespace(type="text", text="cut off")],
+        stop_reason="max_tokens",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+    response = ac._to_llm_response(raw)
+
+    assert response.finish_reason == "length"
+    assert response.response_metadata["stop_reason"] == "max_tokens"
+    assert "stop_details" not in response.response_metadata
+
+
+def test_anthropic_ordinary_turn_carries_no_stop_details():
+    """The common case stays lean — no empty key on every successful turn."""
+    raw = SimpleNamespace(
+        id="msg_1", model="claude-x",
+        content=[SimpleNamespace(type="text", text="hello")],
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+    response = ac._to_llm_response(raw)
+
+    assert response.response_metadata["stop_reason"] == "end_turn"
+    assert "stop_details" not in response.response_metadata
+
+
+@pytest.mark.parametrize("details", [
+    None,
+    {},
+    SimpleNamespace(type=None, category=None, explanation=None),
+])
+def test_anthropic_empty_stop_details_is_omitted_not_recorded_blank(details):
+    raw = SimpleNamespace(
+        id="msg_1", model="claude-x",
+        content=[SimpleNamespace(type="text", text="hi")],
+        stop_reason="end_turn", stop_details=details,
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+    )
+    assert "stop_details" not in ac._to_llm_response(raw).response_metadata
+
+
+def test_anthropic_stop_details_passes_through_an_unknown_category():
+    """``category`` is an open set; new models add to it. Never filter it."""
+    raw = SimpleNamespace(
+        id="msg_r", model="claude-x", content=[], stop_reason="refusal",
+        stop_details={"type": "refusal", "category": "some_future_category"},
+        usage=SimpleNamespace(input_tokens=1, output_tokens=0),
+    )
+    details = ac._to_llm_response(raw).response_metadata["stop_details"]
+    assert details["category"] == "some_future_category"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_refusal_through_the_real_sdk():
+    """End-to-end over the SDK's own parsing, not a hand-built namespace."""
+    from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
+
+    if issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
+        sdk_httpx = httpx
+    else:
+        import httpx2 as sdk_httpx
+
+    def respond(request):
+        return sdk_httpx.Response(200, json=_refusal_payload())
+
+    c = ac.AnthropicClient("claude-x", api_key="test")
+    await c._client.close()
+    async with AsyncAnthropic(
+        api_key="test", base_url="https://anthropic.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond)),
+    ) as sdk:
+        c._client = sdk
+        response = await c.chat([user_msg("hi")])
+
+    # The shape that used to be indistinguishable from "said nothing".
+    assert response.content == ""
+    assert response.tool_calls == []
+    # …and the evidence that it was a decline.
+    assert response.finish_reason == "refusal"
+    assert response.response_metadata["stop_reason"] == "refusal"
+    assert response.response_metadata["stop_details"]["category"] == "bio"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_streamed_refusal_reports_the_same_detail():
+    """A streamed decline must not be quieter than a non-streamed one."""
+    events = [
+        SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(
+                model="claude-x",
+                usage=SimpleNamespace(input_tokens=10, cache_read_input_tokens=0),
+            ),
+        ),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(
+                stop_reason="refusal",
+                stop_details=SimpleNamespace(
+                    type="refusal", category="cyber", explanation="declined",
+                ),
+            ),
+            usage=SimpleNamespace(output_tokens=0),
+        ),
+    ]
+
+    class _Stream:
+        def __aiter__(self):
+            async def gen():
+                for event in events:
+                    yield event
+            return gen()
+
+    c = ac.AnthropicClient("claude-x", api_key="x")
+    c._client = MagicMock()
+    c._client.messages.create = AsyncMock(return_value=_Stream())
+
+    deltas = [d async for d in c.stream([user_msg("hi")])]
+
+    terminal = deltas[-1]
+    assert terminal.finish_reason == "refusal"
+    assert terminal.stop_details == {
+        "type": "refusal", "category": "cyber", "explanation": "declined",
+    }

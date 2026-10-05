@@ -182,6 +182,7 @@ class AnthropicClient(LLMClient):
         reasoning_tokens: int | None = None
         model = ""
         stop_reason = ""
+        stop_details: dict[str, Any] = {}
         # Verbatim block list, in the provider's own emission order, rebuilt
         # from the event stream so the streamed turn replays exactly like the
         # non-streaming one (``_to_llm_response``). Keyed by the stream's block
@@ -278,6 +279,12 @@ class AnthropicClient(LLMClient):
             elif etype == "message_delta":
                 d = getattr(event, "delta", None)
                 stop_reason = getattr(d, "stop_reason", "") or stop_reason
+                # A classifier refusal ends the stream here, with the detail on
+                # the same delta that carries the stop reason. Captured so the
+                # streamed turn reports it exactly like the non-streaming one.
+                details = _anthropic_stop_details(d)
+                if details is not None:
+                    stop_details = details
                 u = getattr(event, "usage", None)
                 if u is not None:
                     ot = getattr(u, "output_tokens", None)
@@ -310,6 +317,7 @@ class AnthropicClient(LLMClient):
             finish_reason=normalize_finish_reason(stop_reason),
             model=model,
             reasoning_blocks=ordered if _has_thinking(ordered) else [],
+            stop_details=stop_details,
         )
 
 
@@ -683,6 +691,41 @@ def _anthropic_cache_write_tokens(usage: Any) -> int | None:
     return max(0, int(raw or 0)) + max(0, int(extension or 0))
 
 
+def _anthropic_stop_details(raw: Any) -> dict[str, Any] | None:
+    """Structured refusal detail off a response, or ``None`` when absent.
+
+    Anthropic populates ``stop_details`` ONLY when ``stop_reason ==
+    "refusal"`` — a safety classifier declined the request. That arrives as a
+    normal HTTP 200 with empty ``content``, so without this the turn is
+    indistinguishable from "the model chose to say nothing": the loop sees no
+    text and no tool call, takes its no-tool exit, and the run ends looking
+    clean. The 2026-10-05 gdpval triage had to rule a refusal in or out by
+    hand for exactly this reason.
+
+    ``category`` is an open set (``cyber``, ``bio``, ``reasoning_extraction``,
+    ``frontier_llm``, ``general_harms``, ``None``, …) and models keep adding
+    to it, so every field is passed through as-is rather than validated
+    against a list this module would have to chase. Returns ``None`` when the
+    payload carries nothing, which keeps the key out of ``response_metadata``
+    for the overwhelmingly common non-refusal turn.
+    """
+    details = getattr(raw, "stop_details", None)
+    if details is None and isinstance(raw, dict):
+        details = raw.get("stop_details")
+    if details is None:
+        return None
+    if isinstance(details, dict):
+        out = {k: v for k, v in details.items() if v is not None}
+        return out or None
+    # SDK model object: read the documented fields off it.
+    out = {}
+    for field in ("type", "category", "explanation"):
+        value = getattr(details, field, None)
+        if value is not None:
+            out[field] = value
+    return out or None
+
+
 def _anthropic_reasoning_tokens(usage: Any) -> int | None:
     """Best-effort extended-thinking token count off an Anthropic usage object.
 
@@ -787,6 +830,19 @@ def _to_llm_response(raw: Any) -> LLMResponse:
         _anthropic_reasoning_tokens(usage),
     )
 
+    # ``stop_reason`` is normalised for ``finish_reason`` (``max_tokens`` →
+    # ``length``), which is what the loop's truncation checks need. The RAW
+    # value is kept alongside it: ``refusal`` survives normalisation today,
+    # but a consumer asking "did the provider decline?" should not have to
+    # know which markers this function rewrites.
+    metadata: dict[str, Any] = {"id": getattr(raw, "id", "")}
+    stop_reason_raw = str(getattr(raw, "stop_reason", "") or "")
+    if stop_reason_raw:
+        metadata["stop_reason"] = stop_reason_raw
+    stop_details = _anthropic_stop_details(raw)
+    if stop_details is not None:
+        metadata["stop_details"] = stop_details
+
     return LLMResponse(
         content=content,
         tool_calls=tool_calls,
@@ -794,7 +850,7 @@ def _to_llm_response(raw: Any) -> LLMResponse:
         finish_reason=normalize_finish_reason(getattr(raw, "stop_reason", "")),
         model=getattr(raw, "model", "") or "",
         usage=usage_dict,
-        response_metadata={"id": getattr(raw, "id", "")},
+        response_metadata=metadata,
     )
 
 

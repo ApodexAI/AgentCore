@@ -61,6 +61,15 @@ class StreamDelta:
     reasoning_blocks: list[dict[str, Any]] = field(
         default_factory=list[dict[str, Any]],
     )
+    # Structured refusal detail, carried only by a provider that reports one
+    # (Anthropic populates ``stop_details`` solely when a safety classifier
+    # declined the request). A refusal arrives as a successful stream that
+    # simply produces no text and no tool call, so without this channel the
+    # streamed turn is indistinguishable from the model choosing to say
+    # nothing — the same blind spot the non-streaming path closes by putting
+    # it in ``response_metadata``. The assembler folds it into exactly that,
+    # so both paths expose a refusal identically.
+    stop_details: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @runtime_checkable

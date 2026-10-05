@@ -1261,6 +1261,7 @@ async def _process_llm_response(
 
     post_content = getattr(response, "content", None)
     ai_text = post_content if isinstance(post_content, str) else tr.visible_content
+    stop_details = rmd.get("stop_details")
     ctx = TurnContext(
         turn=turn, max_turns=cfg.max_turns, task_id=cfg.task_id, role_id=cfg.role_id,
         ai_text=ai_text, thinking=tr.thinking, tool_calls=parsed_calls, messages=messages,
@@ -1268,6 +1269,8 @@ async def _process_llm_response(
         thinking_blocks=tr.raw_content_blocks or [],
         blocked_tool_calls=blocked_landing_calls,
         tool_schemas_stripped=bool(strip_tools),
+        finish_reason=metadata["finish_reason"],
+        stop_details=dict(stop_details) if isinstance(stop_details, dict) else {},
     )
 
     llm_interventions = await notify_observers(obs, "on_llm_response", ctx)

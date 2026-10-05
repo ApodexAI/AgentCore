@@ -504,6 +504,17 @@ class TrajectoryFileObserver(BaseObserver):
             # encrypted_content / text) so the (sub-)agent trajectory stays
             # replay-able with signatures / encrypted reasoning intact.
             record["thinking_blocks"] = ctx.thinking_blocks
+        # Why the turn ended. Without it a trajectory cannot distinguish a
+        # finished answer from one the output cap truncated, or from a request
+        # a safety classifier declined — all three look like a turn whose text
+        # stops, and a refusal looks like a turn that said nothing at all.
+        # ``end_turn`` is the uninformative common case and is omitted to keep
+        # the line small; everything else (``length``, ``tool_use``,
+        # ``refusal``, …) is recorded.
+        if ctx.finish_reason and ctx.finish_reason != "end_turn":
+            record["finish_reason"] = ctx.finish_reason
+        if ctx.stop_details:
+            record["stop_details"] = ctx.stop_details
         self._write_jsonl(record)
 
         # JSON envelope: emit prior context once, then this turn.

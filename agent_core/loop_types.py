@@ -222,6 +222,22 @@ class TurnContext:
     # turn — the condition under which a leaked call can appear in
     # ``blocked_tool_calls``.
     tool_schemas_stripped: bool = False
+    # Why the provider stopped generating, normalised (``length`` for every
+    # transport's output-cap marker; other values pass through — ``end_turn``,
+    # ``tool_use``, ``refusal``, …).
+    #
+    # An observer could not previously tell a finished answer from a truncated
+    # one or a declined one: all three arrive as a turn whose text simply ends,
+    # and a refusal arrives with no text at all. Trajectory writers therefore
+    # recorded runs whose failure mode could not be reconstructed afterwards.
+    # Defaulted so every existing TurnContext construction stays valid; a
+    # producer that does not set it leaves consumers exactly as blind as before,
+    # never wrong.
+    finish_reason: str = ""
+    # Provider-reported detail for a declined request (Anthropic's
+    # ``stop_details``: ``type`` / ``category`` / ``explanation``). Empty for
+    # every other stop reason, and for providers that report nothing.
+    stop_details: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass

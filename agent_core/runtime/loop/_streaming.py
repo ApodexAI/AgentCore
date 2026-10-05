@@ -258,6 +258,10 @@ async def _stream_llm_response(
     # non-streaming path returns and what ``thinking_format="content_block"``
     # needs to replay the signed reasoning state on the next turn.
     final_reasoning_blocks: list[dict[str, Any]] = []
+    # Structured refusal detail, when the provider reports one. A declined
+    # request streams to a clean close with no text and no tool call, so this
+    # is the only signal separating it from a turn the model chose to end.
+    final_stop_details: dict[str, Any] = {}
     think_splitter = _ThinkTagSplitter()
     accepts_tool_call_chunks = _accepts_tool_call_arg_chunks(on_delta)
     reasoning_timeout_s = max(float(reasoning_only_timeout_s or 0), 0.0)
@@ -286,6 +290,8 @@ async def _stream_llm_response(
         response_metadata = (
             {"provider_actually_used": final_provider} if final_provider else {}
         )
+        if final_stop_details:
+            response_metadata["stop_details"] = final_stop_details
         visible_content = accumulated
         if visible_content:
             visible_content = (
@@ -387,6 +393,8 @@ async def _stream_llm_response(
                         final_provider = delta.provider
                     if getattr(delta, "reasoning_blocks", None):
                         final_reasoning_blocks = delta.reasoning_blocks
+                    if getattr(delta, "stop_details", None):
+                        final_stop_details = delta.stop_details
                     # Inline ``<think>...</think>`` tags (Qwen-style) are
                     # split out so ``delta`` carries answer-only text and
                     # ``thinking_delta`` collects both inline + typed
