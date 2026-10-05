@@ -56,6 +56,7 @@ class AnthropicClient(LLMClient):
         bedrock: bool = False,
         default_headers: dict[str, str] | None = None,
         capabilities: ModelCapabilities | None = None,
+        prompt_cache_ttl: str | None = "",
     ) -> None:
         self.model = model
         self.default_temperature = temperature
@@ -68,6 +69,9 @@ class AnthropicClient(LLMClient):
         # (low|medium|high|xhigh|max) → ``output_config.effort`` via extra_body.
         self._thinking = thinking or None
         self._effort = (effort or "").strip()
+        # Rejected here rather than per call: a bad value is a config error and
+        # should fail at construction, not on the first request of a long run.
+        self._prompt_cache_ttl = normalize_prompt_cache_ttl(prompt_cache_ttl)
         self.capabilities = capabilities or resolve_model_capabilities(
             model, protocol="bedrock" if bedrock else "anthropic",
         )
@@ -147,7 +151,9 @@ class AnthropicClient(LLMClient):
             kwargs["timeout"] = timeout
         elif self.default_timeout is not None:
             kwargs["timeout"] = self.default_timeout
-        _add_prompt_cache(kwargs, transient_tail=transient_tail)
+        _add_prompt_cache(
+            kwargs, transient_tail=transient_tail, ttl=self._prompt_cache_ttl,
+        )
         # After the cache breakpoint is placed, so it stays on the last
         # persistent block rather than moving onto the per-call text.
         kwargs["messages"] = _fold_transient_tail(kwargs["messages"], transient_tail)
@@ -547,7 +553,54 @@ def _split_system(messages: list[Message]) -> tuple[str, list[Message]]:
     return "", list(messages)
 
 
-def _add_prompt_cache(kwargs: dict[str, Any], *, transient_tail: int = 0) -> None:
+#: Cache lifetimes Anthropic accepts on ``cache_control``. The empty string is
+#: this adapter's "not configured", which omits the field and takes the API
+#: default of five minutes.
+PROMPT_CACHE_TTLS = frozenset({"5m", "1h"})
+
+#: Deployment-wide default when no client was configured with one, so an
+#: operator can turn the longer lifetime on for a whole run without a config
+#: path reaching every construction site. A client's own value wins.
+PROMPT_CACHE_TTL_ENV = "ANTHROPIC_PROMPT_CACHE_TTL"
+
+
+def normalize_prompt_cache_ttl(value: object) -> str:
+    """Normalize a configured cache TTL; ``""`` means "not configured".
+
+    Unknown values raise rather than falling back to the default, matching
+    :func:`agent_core.model_capabilities.normalize_thinking_mode`: a typo that
+    silently reverts to five minutes is the failure this whole knob exists to
+    fix, and it would only surface as a cache-hit-rate regression nobody is
+    watching.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("prompt cache ttl must be a string or null")
+    ttl = value.strip().lower()
+    if not ttl:
+        return ""
+    if ttl not in PROMPT_CACHE_TTLS:
+        raise ValueError(
+            f"unsupported prompt cache ttl {value!r}; use {sorted(PROMPT_CACHE_TTLS)}",
+        )
+    return ttl
+
+
+def _cache_control(ttl: str) -> dict[str, str]:
+    """The ``cache_control`` value for a breakpoint, with TTL when configured."""
+    resolved = ttl or normalize_prompt_cache_ttl(os.getenv(PROMPT_CACHE_TTL_ENV))
+    if not resolved or resolved == "5m":
+        # Omitted rather than sent explicitly: "5m" is the API default, and not
+        # sending the field keeps the request shape of every existing consumer
+        # byte-identical.
+        return {"type": "ephemeral"}
+    return {"type": "ephemeral", "ttl": resolved}
+
+
+def _add_prompt_cache(
+    kwargs: dict[str, Any], *, transient_tail: int = 0, ttl: str = "",
+) -> None:
     """Set Anthropic prompt-cache breakpoints on ``kwargs`` in place.
 
     Anthropic caching is opt-in per content block (unlike OpenAI's automatic
@@ -565,16 +618,30 @@ def _add_prompt_cache(kwargs: dict[str, Any], *, transient_tail: int = 0) -> Non
     so a cached prefix ending on one never matches again and every turn would
     re-write the whole conversation at the cache-write rate while reading only
     the static head.
+
+    ``ttl`` ("5m" default, or "1h") applies to BOTH breakpoints. A cached entry
+    expires that long after its last use, so the lifetime that matters is not
+    how long a run takes but how long one TURN takes: a gap longer than the TTL
+    loses the whole prefix and re-writes it. On a slow model that is a routine
+    event rather than an edge case — in ApodexHarness's 2026-10-05 GDPval batch,
+    12.9% of claude-opus-5-5 turn gaps exceeded five minutes (p90 355s) and
+    those calls missed the cache 35.7% of the time against 9.5% for the rest,
+    re-writing a median 81k tokens each. The trade is the write rate: 2x base
+    input for an hour against 1.25x for five minutes, so this pays off exactly
+    when turns are slow enough to straddle the shorter window and costs extra
+    when they are not. Writes land in ``cache_creation.ephemeral_1h_input_tokens``,
+    which :func:`_anthropic_cache_write_tokens` already counts.
     """
     if os.getenv("ANTHROPIC_PROMPT_CACHE", "1") == "0":
         return
+    cache_control = _cache_control(ttl)
     # System prefix (a plain string) -> one cache-controlled text block.
     system = kwargs.get("system")
     if isinstance(system, str) and system:
         kwargs["system"] = [{
             "type": "text",
             "text": system,
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": cache_control,
         }]
     # Rolling tail: mark the last persistent message's final content block.
     msgs = kwargs.get("messages")
@@ -587,10 +654,10 @@ def _add_prompt_cache(kwargs: dict[str, Any], *, transient_tail: int = 0) -> Non
             last["content"] = [{
                 "type": "text",
                 "text": content,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": cache_control,
             }]
     elif isinstance(content, list) and content and isinstance(content[-1], dict):
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        content[-1] = {**content[-1], "cache_control": cache_control}
 
 
 def _to_anthropic_msg(m: Message) -> dict[str, Any] | None:

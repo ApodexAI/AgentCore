@@ -187,6 +187,11 @@ def _build_anthropic(
         default_headers={"X-Title": title, **(cfg.get("default_headers") or {})},
         bedrock=bedrock,
         capabilities=capabilities,
+        # A profile-level key, so one model's declared cache lifetime travels
+        # with the model it was chosen for rather than with the deployment.
+        # Preserve invalid falsey values so the client rejects them instead of
+        # silently selecting the environment's default lifetime.
+        prompt_cache_ttl=cfg.get("prompt_cache_ttl"),
     )
 
 
