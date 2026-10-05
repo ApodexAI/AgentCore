@@ -56,7 +56,7 @@ class AnthropicClient(LLMClient):
         bedrock: bool = False,
         default_headers: dict[str, str] | None = None,
         capabilities: ModelCapabilities | None = None,
-        prompt_cache_ttl: str = "",
+        prompt_cache_ttl: str | None = "",
     ) -> None:
         self.model = model
         self.default_temperature = temperature

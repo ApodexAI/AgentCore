@@ -189,7 +189,9 @@ def _build_anthropic(
         capabilities=capabilities,
         # A profile-level key, so one model's declared cache lifetime travels
         # with the model it was chosen for rather than with the deployment.
-        prompt_cache_ttl=cfg.get("prompt_cache_ttl") or "",
+        # Preserve invalid falsey values so the client rejects them instead of
+        # silently selecting the environment's default lifetime.
+        prompt_cache_ttl=cfg.get("prompt_cache_ttl"),
     )
 
 

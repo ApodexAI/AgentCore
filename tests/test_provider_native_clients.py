@@ -1610,3 +1610,45 @@ def test_protocol_builder_forwards_the_profile_ttl(monkeypatch):
         "protocol": "anthropic", "model": "claude-x", "api_key": "k",
     }, title="t")
     assert plain._prompt_cache_ttl == ""
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "bedrock"])
+@pytest.mark.parametrize("env_ttl", [None, "1h"])
+@pytest.mark.parametrize("raw", [0, False, [], {}, "30m", 60])
+def test_protocol_builder_rejects_invalid_profile_ttl(monkeypatch, protocol, env_ttl, raw):
+    from agent_core.providers.protocol_client import build_protocol_client
+
+    if env_ttl is None:
+        monkeypatch.delenv(ac.PROMPT_CACHE_TTL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(ac.PROMPT_CACHE_TTL_ENV, env_ttl)
+    with pytest.raises(ValueError):
+        build_protocol_client({
+            "protocol": protocol, "model": "claude-x", "api_key": "k",
+            "prompt_cache_ttl": raw,
+        }, title="t")
+
+
+@pytest.mark.parametrize("raw", [None, "", "5m", "1h"])
+@pytest.mark.asyncio
+async def test_protocol_builder_ttl_request_smoke(monkeypatch, raw):
+    from agent_core.providers.protocol_client import build_protocol_client
+
+    monkeypatch.setenv(ac.PROMPT_CACHE_TTL_ENV, "1h")
+    monkeypatch.delenv("ANTHROPIC_PROMPT_CACHE", raising=False)
+    client = build_protocol_client({
+        "protocol": "anthropic", "model": "claude-x", "api_key": "k",
+        "prompt_cache_ttl": raw,
+    }, title="t")
+    try:
+        kwargs = client._build_kwargs(
+            [system_msg("s"), user_msg("q")],
+            tools=None, temperature=None, max_tokens=None,
+            extra_headers=None, timeout=None,
+        )
+        expected = {"type": "ephemeral"}
+        if raw != "5m":
+            expected["ttl"] = "1h"
+        assert _cache_controls(kwargs) == [expected] * 2
+    finally:
+        await client._client.close()
