@@ -23,7 +23,7 @@ import logging
 from typing import Any, get_args
 
 from agent_core.llm import LLMClient
-from agent_core.model_capabilities import resolve_model_capabilities
+from agent_core.model_capabilities import normalize_thinking_mode, resolve_model_capabilities
 
 # Single source of truth for the valid ``llm.protocol`` values. Duplicating the
 # set here would let the two drift, which is how a protocol becomes buildable
@@ -153,15 +153,7 @@ def _build_anthropic(
             "enabled" if "enabled" in capabilities.thinking_modes
             else "disabled" if "disabled" in capabilities.thinking_modes else None
         )
-    raw_mode = cfg.get("thinking_type")
-    if raw_mode is None or (isinstance(raw_mode, str) and not raw_mode.strip()):
-        ttype = default_mode
-    elif isinstance(raw_mode, str):
-        ttype = raw_mode.strip().lower()
-    else:
-        raise ValueError("thinking_type must be a string or null")
-    if ttype is not None and ttype not in ("adaptive", "enabled", "disabled"):
-        raise ValueError(f"unknown thinking_type {ttype!r}; use adaptive, enabled, or disabled")
+    ttype = normalize_thinking_mode(cfg.get("thinking_type")) or default_mode
     capabilities.validate_request(
         model=cfg["model"], thinking={"type": ttype} if ttype else None,
         effort=_effort_str(cfg),

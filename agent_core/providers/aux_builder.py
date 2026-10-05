@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from agent_core.model_capabilities import resolve_model_capabilities
+from agent_core.model_capabilities import normalize_thinking_mode, resolve_model_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +65,10 @@ def _anthropic_thinking(section: Mapping[str, Any]) -> dict[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
     thinking = {str(key): value for key, value in raw.items()}
-    kind = str(thinking.get("type") or "").strip().lower()
-    if kind in {"", "disabled", "off", "none", "false"}:
+    kind = normalize_thinking_mode(thinking.get("type"))
+    if kind is None or kind == "disabled":
         return None
+    thinking["type"] = kind
     return thinking
 
 
@@ -156,10 +157,11 @@ class AuxLLMFactory:
         # maps an explicit disabled/off configuration to no thinking field.
         raw_thinking = section.get("thinking")
         validation_thinking = kwargs["thinking"]
-        if isinstance(raw_thinking, Mapping):
-            kind = str(raw_thinking.get("type") or "").strip().lower()
-            if kind in {"disabled", "off", "none", "false"}:
-                validation_thinking = {"type": "disabled"}
+        if (
+            isinstance(raw_thinking, Mapping)
+            and normalize_thinking_mode(raw_thinking.get("type")) == "disabled"
+        ):
+            validation_thinking = {"type": "disabled"}
         maximum = section.get("max_completion_tokens") or section.get("max_tokens")
         capabilities.validate_request(
             model=str(section["model"]), thinking=validation_thinking,

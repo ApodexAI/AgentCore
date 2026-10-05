@@ -107,9 +107,10 @@ class AnthropicClient(LLMClient):
     ) -> dict[str, Any]:
         """Shared request-shape builder for :meth:`chat` and :meth:`stream`."""
         output_limit = max_tokens or self.default_max_tokens or 4096
+        # Thinking and effort are fixed and validated at construction; only
+        # the per-call output limit can change here.
         self.capabilities.validate_request(
-            model=self.model, thinking=self._thinking, effort=self._effort,
-            max_tokens=output_limit,
+            model=self.model, thinking=None, max_tokens=output_limit,
         )
         system, msgs = _split_system(messages)
         # ``_to_anthropic_msg`` returns None for a message with nothing

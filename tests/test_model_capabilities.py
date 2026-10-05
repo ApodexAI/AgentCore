@@ -176,3 +176,52 @@ def test_auxiliary_client_checks_explicit_modes_before_legacy_conversion(thinkin
 def test_known_legacy_model_rejects_effort_instead_of_silently_dropping_it():
     with pytest.raises(ValueError, match="effort"):
         build_protocol_client({"protocol": "anthropic", "model": "claude-sonnet-4-5", "effort": "high"}, title="test")
+
+
+async def test_profile_and_client_resolve_the_same_deployment_overrides():
+    overrides = {"max_output_tokens": 32_000}
+    client = build_protocol_client({
+        "protocol": "anthropic", "model": "claude-opus-5-5", "max_tokens": 16_000,
+        "model_capabilities": overrides,
+    }, title="test")
+    try:
+        profile = ModelProfile(model_id="claude-opus-5-5", provider="anthropic",
+                               protocol="anthropic", model_capabilities=overrides)
+        assert profile.request_capabilities == client.capabilities
+        assert profile.request_capabilities.max_output_tokens == 32_000
+    finally:
+        await client._client.close()
+
+
+@pytest.mark.parametrize("spelling", ["disabled", "off", "none", "False"])
+async def test_main_and_auxiliary_builders_share_disabled_spellings(spelling):
+    from agent_core.providers.aux_builder import AuxLLMFactory
+
+    client = build_protocol_client({"protocol": "anthropic", "model": "claude-haiku-4-5", "thinking_type": spelling}, title="test")
+    try:
+        assert client._thinking == {"type": "disabled"}
+    finally:
+        await client._client.close()
+    factory = AuxLLMFactory(openai_factory=lambda **kw: kw, anthropic_factory=lambda **kw: kw,
+                           provider_type=lambda _: "anthropic")
+    kwargs = factory.build({"provider": "anthropic", "model": "claude-haiku-4-5", "api_key": "x",
+                            "thinking": {"type": spelling}})
+    assert kwargs["thinking"] is None
+
+
+def test_main_and_auxiliary_builders_reject_the_same_unknown_mode():
+    from agent_core.providers.aux_builder import AuxLLMFactory
+
+    with pytest.raises(ValueError, match="unknown thinking type"):
+        build_protocol_client({"protocol": "anthropic", "model": "claude-x", "thinking_type": "auto"}, title="test")
+    factory = AuxLLMFactory(openai_factory=lambda **kw: kw, anthropic_factory=lambda **kw: kw,
+                           provider_type=lambda _: "anthropic")
+    with pytest.raises(ValueError, match="unknown thinking type"):
+        factory.build({"provider": "anthropic", "model": "claude-x", "api_key": "x", "thinking": {"type": "auto"}})
+
+
+@pytest.mark.parametrize("model_id", [
+    "jp.anthropic.claude-opus-5-5", "au.anthropic.claude-opus-5-5-v1:0", "us-gov.anthropic.claude-opus-5-5",
+])
+def test_additional_bedrock_regional_prefixes_resolve(model_id):
+    assert resolve_model_capabilities(model_id, protocol="bedrock") is MODEL_CAPABILITIES["claude-opus-5-5"]

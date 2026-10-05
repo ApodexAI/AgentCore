@@ -125,7 +125,9 @@ overrides. This first table covers Fable 5.1, Opus 5.5, and the legacy 4.5 model
 other providers and models remain unknown until verified facts are added.
 
 Known thinking modes select builder defaults and reject unsupported explicit
-modes. Effort and output limits are validated in direct clients, native profile
+modes. Every native builder normalizes the configured thinking type the same
+way: `adaptive`, `enabled`, and `disabled` (also spelled `off`, `none`, or
+`false`); blank means unset, and any other value raises `ValueError`. Effort and output limits are validated in direct clients, native profile
 clients, and per-call overrides. No parameter is silently clamped. The existing
 legacy thinking-budget adjustment remains in place. Empty thinking support
 omits the thinking field; unknown native models keep the prior adaptive default.
@@ -134,8 +136,8 @@ protocol field conversion, SDK transport limitations, and error recovery stay
 in adapters. The Anthropic adapter still omits sampling fields for SDK 1.x
 compatibility. This PR does not add forced tool-choice parameters.
 
-Resolution applies verified model facts after unknown protocol defaults, then
-applies a per-client host override. The `model_capabilities` profile key is a
+Resolution starts from verified model facts (or unknown), then applies a
+per-client host override. The `model_capabilities` profile key is a
 mapping with the capability field names; omitted fields inherit, explicit null
 clears a fact to unknown, and empty lists declare unsupported values. Unknown
 keys, malformed values, and contradictory defaults raise `ValueError`.
@@ -151,6 +153,11 @@ llm:
   model_capabilities:
     max_output_tokens: 32768  # gateway limit overrides the model maximum
 ```
+
+A profile must see the same overrides as its client. Pass the profile the same
+mapping (`ModelProfile(..., model_capabilities=cfg.get("model_capabilities"))`)
+or the client's resolved record (`capabilities=client.capabilities`); a profile
+built with neither resolves the unoverridden model facts.
 
 For a custom alias, specify its supported modes and effort levels explicitly:
 

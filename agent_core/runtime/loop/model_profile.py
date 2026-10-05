@@ -213,11 +213,19 @@ class ModelProfile:
     # Request constraints use the same records as provider construction.
     # context_window above remains the host's operational context budget;
     # capabilities.max_input_tokens describes the provider's maximum.
+    # ``capabilities`` takes a resolved record (e.g. ``client.capabilities``);
+    # otherwise ``model_capabilities`` carries the same per-deployment override
+    # mapping the client config uses, so both sides resolve identically.
     capabilities: ModelCapabilities | None = None
+    model_capabilities: Mapping[str, object] | None = None
 
     @property
     def request_capabilities(self) -> ModelCapabilities:
-        return self.capabilities or resolve_model_capabilities(self.model_id, protocol=self.protocol)
+        if self.capabilities is not None:
+            return self.capabilities
+        return resolve_model_capabilities(
+            self.model_id, protocol=self.protocol, overrides=self.model_capabilities,
+        )
 
 
 @dataclass

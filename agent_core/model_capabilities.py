@@ -1,7 +1,7 @@
 """Typed model request constraints, separate from credentials and deployment catalogs.
 
 None means unknown, an empty set means unsupported. Resolution is explicit and
-local to a client/profile: protocol defaults < exact model facts < host overrides.
+local to a client/profile: exact model facts, then per-deployment host overrides.
 No network access or mutable process-wide registration is performed here.
 """
 
@@ -68,6 +68,11 @@ _LEGACY_CLAUDE = ModelCapabilities(
     source_urls=("https://platform.claude.com/docs/en/build-with-claude/extended-thinking",),
     verified_on="2026-10-05",
 )
+# The only manual-thinking model with effort; it combines with budget_tokens.
+_OPUS_4_5 = replace(
+    _LEGACY_CLAUDE, effort_levels=frozenset({"low", "medium", "high"}), default_effort="high",
+    source_urls=(*_LEGACY_CLAUDE.source_urls, "https://platform.claude.com/docs/en/build-with-claude/effort"),
+)
 
 # These are request facts, not an endpoint, credential, price, or routing catalog.
 # Only documented exact IDs/aliases match; a new version never inherits a guessed
@@ -85,15 +90,33 @@ MODEL_CAPABILITIES: Mapping[str, ModelCapabilities] = MappingProxyType({
     "claude-sonnet-4-5-20250929": _LEGACY_CLAUDE,
     "claude-haiku-4-5": _LEGACY_CLAUDE,
     "claude-haiku-4-5-20251001": _LEGACY_CLAUDE,
-    "claude-opus-4-5": replace(_LEGACY_CLAUDE,
-        effort_levels=frozenset({"low", "medium", "high"}), default_effort="high",
-        source_urls=(*_LEGACY_CLAUDE.source_urls, "https://platform.claude.com/docs/en/build-with-claude/effort"),
-    ),
-    "claude-opus-4-5-20251101": replace(_LEGACY_CLAUDE,
-        effort_levels=frozenset({"low", "medium", "high"}), default_effort="high",
-        source_urls=(*_LEGACY_CLAUDE.source_urls, "https://platform.claude.com/docs/en/build-with-claude/effort"),
-    ),
+    "claude-opus-4-5": _OPUS_4_5,
+    "claude-opus-4-5-20251101": _OPUS_4_5,
 })
+
+_DISABLED_ALIASES = frozenset({"disabled", "off", "none", "false"})
+
+
+def normalize_thinking_mode(value: object) -> ThinkingMode | None:
+    """Normalize a configured thinking type; None/blank means "not configured".
+
+    Shared by every native builder so one spelling means the same thing on the
+    main, auxiliary, and direct paths. Unknown values raise instead of silently
+    falling back to a mode the operator did not choose.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("thinking type must be a string or null")
+    mode = value.strip().lower()
+    if not mode:
+        return None
+    if mode in _DISABLED_ALIASES:
+        return "disabled"
+    if mode in ("adaptive", "enabled"):
+        return cast(ThinkingMode, mode)
+    raise ValueError(f"unknown thinking type {value!r}; use adaptive, enabled, or disabled")
+
 
 _SET_FIELDS = frozenset({"thinking_modes", "effort_levels", "sampling_parameters", "tool_choice_modes"})
 _LIMIT_FIELDS = frozenset({"max_input_tokens", "max_output_tokens"})
@@ -119,7 +142,7 @@ def _canonical_model_id(model_id: str, protocol: WireProtocol) -> str:
         return model_id
     # Bedrock inference-profile regional prefixes and documented version suffix.
     # Arbitrary proxy aliases and ARNs require explicit host overrides.
-    match = re.fullmatch(r"(?:(?:us|eu|apac|global)\.)?anthropic\.(claude-[a-z0-9-]+?)(?:-v\d+:\d+)?", model_id)
+    match = re.fullmatch(r"(?:(?:us|us-gov|eu|apac|jp|au|global)\.)?anthropic\.(claude-[a-z0-9-]+?)(?:-v\d+:\d+)?", model_id)
     return match.group(1) if match else model_id
 
 
@@ -171,4 +194,7 @@ def resolve_model_capabilities(
     return result
 
 
-__all__ = ["MODEL_CAPABILITIES", "ModelCapabilities", "SignatureBinding", "ThinkingMode", "WireProtocol", "resolve_model_capabilities"]
+__all__ = [
+    "MODEL_CAPABILITIES", "ModelCapabilities", "SignatureBinding", "ThinkingMode",
+    "WireProtocol", "normalize_thinking_mode", "resolve_model_capabilities",
+]
