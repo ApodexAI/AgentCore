@@ -28,6 +28,9 @@ from agent_core.tool_content import redacted_for_trace, redacted_tool_result_con
 
 _FORMATS: tuple[str, ...] = ("json", "jsonl")
 _DEFAULT_FORMATS: tuple[str, ...] = _FORMATS
+# Normal completion markers (Anthropic / OpenAI-compatible). They carry no
+# information and appear on almost every turn, so trajectories omit them.
+_ORDINARY_FINISH_REASONS = frozenset({"end_turn", "stop"})
 _STREAM_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
 _DEFAULT_FORMAT_ENV_VARS = (
     "AGENT_CORE_TRAJECTORY_FORMATS",
@@ -504,6 +507,17 @@ class TrajectoryFileObserver(BaseObserver):
             # encrypted_content / text) so the (sub-)agent trajectory stays
             # replay-able with signatures / encrypted reasoning intact.
             record["thinking_blocks"] = ctx.thinking_blocks
+        # Why the turn ended. Without it a trajectory cannot distinguish a
+        # finished answer from one the output cap truncated, or from a request
+        # a safety classifier declined — all three look like a turn whose text
+        # stops, and a refusal looks like a turn that said nothing at all.
+        # ``end_turn`` / ``stop`` are the uninformative common case and are
+        # omitted to keep the line small; everything else (``length``, ``tool_use``,
+        # ``refusal``, …) is recorded.
+        if ctx.finish_reason and ctx.finish_reason not in _ORDINARY_FINISH_REASONS:
+            record["finish_reason"] = ctx.finish_reason
+        if ctx.stop_details:
+            record["stop_details"] = ctx.stop_details
         self._write_jsonl(record)
 
         # JSON envelope: emit prior context once, then this turn.
@@ -531,6 +545,10 @@ class TrajectoryFileObserver(BaseObserver):
                 # Verbatim thinking / reasoning blocks (signatures /
                 # encrypted_content) so the JSON envelope stays replay-able.
                 msg["thinking_blocks"] = ctx.thinking_blocks
+            if ctx.finish_reason and ctx.finish_reason not in _ORDINARY_FINISH_REASONS:
+                msg["finish_reason"] = ctx.finish_reason
+            if ctx.stop_details:
+                msg["stop_details"] = ctx.stop_details
             if ctx.tool_calls:
                 ids: list[str] = []
                 tcs: list[dict] = []

@@ -385,3 +385,79 @@ async def test_streaming_without_reasoning_blocks_keeps_the_flat_string(monkeypa
     )
     assert result is not None
     assert result.content == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_streaming_folds_stop_details_for_a_refusal(monkeypatch):
+    """A streamed classifier decline must surface the same detail as a
+    non-streamed one.
+
+    A refusal streams to a clean close carrying no content and no tool call,
+    so without this the assembled response is identical to a turn the model
+    chose to end — the loop takes its no-tool exit and the run looks finished.
+    """
+    real_sleep = asyncio.sleep
+
+    async def _noop(_):
+        await real_sleep(0)
+
+    monkeypatch.setattr("asyncio.sleep", _noop)
+
+    deltas = [
+        StreamDelta(
+            usage={"prompt_tokens": 10, "completion_tokens": 0},
+            finish_reason="refusal",
+            model="claude-x",
+            stop_details={"type": "refusal", "category": "bio"},
+        ),
+    ]
+    llm = _StubStreamingLLM(deltas=deltas)
+
+    async def _on_delta(*_):
+        pass
+
+    result = await call_llm(
+        llm, [user_msg("hi")],
+        timeout=10, max_retries=1, turn=0,
+        on_delta=_on_delta,
+    )
+
+    assert result is not None
+    assert result.content == ""
+    assert result.finish_reason == "refusal"
+    assert result.response_metadata["stop_details"] == {
+        "type": "refusal", "category": "bio",
+    }
+
+
+@pytest.mark.asyncio
+async def test_streaming_without_stop_details_adds_no_key(monkeypatch):
+    """The ordinary path keeps its metadata exactly as it was."""
+    real_sleep = asyncio.sleep
+
+    async def _noop(_):
+        await real_sleep(0)
+
+    monkeypatch.setattr("asyncio.sleep", _noop)
+
+    deltas = [
+        StreamDelta(content="hi"),
+        StreamDelta(
+            usage={"prompt_tokens": 7, "completion_tokens": 2},
+            finish_reason="stop",
+            model="claude-x",
+        ),
+    ]
+    llm = _StubStreamingLLM(deltas=deltas)
+
+    async def _on_delta(*_):
+        pass
+
+    result = await call_llm(
+        llm, [user_msg("hi")],
+        timeout=10, max_retries=1, turn=0,
+        on_delta=_on_delta,
+    )
+
+    assert result is not None
+    assert "stop_details" not in result.response_metadata

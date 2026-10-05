@@ -23,6 +23,9 @@ jobs:
       # a product worded from it vanishes on adoption. See the script's docstring.
       - run: python3 scripts/check_unconsumed_fields.py
       - run: uv run pytest -q
+      # Keep current-model request/response handling usable at our SDK floor,
+      # including SDK 0.x (httpx) versus 1.x (httpx2) parsing and transport.
+      - run: uv run --isolated --with 'anthropic[bedrock]==0.69.0' --extra dev pytest -q tests/test_anthropic_latest_models.py tests/test_provider_native_clients.py tests/test_provider_protocol_reasoning.py
       # The gate pins tiktoken's own cache key and content hash, and only a real
       # tiktoken can falsify them. Scope that optional dependency to this contract
       # test; the isolated run uses the tokenizer version pinned in uv.lock.
