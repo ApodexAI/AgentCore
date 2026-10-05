@@ -184,3 +184,45 @@ Defaults such as `default_effort` are descriptive; callers who omit effort keep
 the provider's own default. Beta/platform-specific limits require a host override
 paired with the appropriate headers. Models API discovery/caching can be added
 by hosts later; this PR does not introduce a background synchronization service.
+
+## Anthropic prompt-cache lifetime
+
+Anthropic caching is opt-in per content block, so `AnthropicClient` places two
+`ephemeral` breakpoints itself: the system prefix and the last persistent
+message's final block. `ANTHROPIC_PROMPT_CACHE=0` disables both.
+
+The lifetime of those breakpoints is configurable with the `prompt_cache_ttl`
+profile key (`5m`, the API default, or `1h`), forwarded by
+`build_protocol_client`; `normalize_prompt_cache_ttl` accepts a blank value as
+"not configured" and raises `ValueError` on anything else, including `30m` and
+numbers. `5m` and blank both OMIT the field, so an unconfigured client's request
+is unchanged. `ANTHROPIC_PROMPT_CACHE_TTL` sets a deployment-wide default for
+construction sites a profile does not reach; a client's own value wins. A TTL
+applies to both breakpoints and never places one — with the cache disabled it
+has no effect.
+
+```yaml
+llm:
+  protocol: anthropic
+  model: claude-opus-5-5
+  prompt_cache_ttl: 1h  # turns are slower than the 5m default window
+```
+
+Which lifetime pays off is a property of TURN duration, not run duration: a
+cached entry expires that long after its last use, so a gap longer than the TTL
+loses the whole prefix and rewrites it at the cache-write rate. An hour costs 2x
+base input to write against 1.25x for five minutes, so it wins only where turns
+are slow enough to straddle the shorter window. Measured on ApodexHarness's
+2026-10-05 GDPval batch (6056 `claude-opus-5-5` calls at `effort=max`): 12.9% of
+turn gaps exceeded 300s (p90 355s), and those calls missed the cache 35.7% of the
+time against 9.5% for the rest, rewriting a median 81k tokens each. A fast model
+whose gaps sit well inside five minutes has no such rewrites to avoid and only
+pays the higher write rate.
+
+Writes land in `cache_creation.ephemeral_1h_input_tokens`, which the adapter's
+cache-write accounting already includes, so `cache_write_tokens` stays correct
+across both lifetimes. Gateways must forward the field for it to take effect:
+verified against llm-hub on 2026-10-05 — `ttl: "1h"` returned HTTP 200, the
+write was billed to the 1h bucket rather than the 5m one, and a read 548s later
+still hit in full while the unconfigured control had expired and rewritten. The
+`extended-cache-ttl-2025-04-11` beta header was not required.

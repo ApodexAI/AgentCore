@@ -1500,3 +1500,113 @@ async def test_anthropic_streamed_refusal_reports_the_same_detail():
     assert terminal.stop_details == {
         "type": "refusal", "category": "cyber", "explanation": "declined",
     }
+
+
+# ── prompt-cache TTL (5m default, opt-in 1h) ──
+
+
+def _cache_controls(kwargs):
+    """Every ``cache_control`` value in the request, system block first."""
+    found = [
+        b["cache_control"] for b in kwargs.get("system", [])
+        if isinstance(b, dict) and "cache_control" in b
+    ]
+    for m in kwargs["messages"]:
+        if isinstance(m["content"], list):
+            found += [
+                b["cache_control"] for b in m["content"]
+                if isinstance(b, dict) and "cache_control" in b
+            ]
+    return found
+
+
+def _build_cached(monkeypatch, **client_kwargs):
+    monkeypatch.delenv("ANTHROPIC_PROMPT_CACHE", raising=False)
+    c = ac.AnthropicClient("claude-x", api_key="x", **client_kwargs)
+    return c._build_kwargs(
+        [system_msg("s"), user_msg("q")],
+        tools=None, temperature=None, max_tokens=None,
+        extra_headers=None, timeout=None,
+    )
+
+
+def test_prompt_cache_omits_ttl_by_default(monkeypatch):
+    """Five minutes is the API default, so an unconfigured client must send a
+    request byte-identical to the one it sent before this knob existed."""
+    monkeypatch.delenv(ac.PROMPT_CACHE_TTL_ENV, raising=False)
+    kwargs = _build_cached(monkeypatch)
+    assert _cache_controls(kwargs) == [{"type": "ephemeral"}] * 2
+
+
+def test_prompt_cache_ttl_applies_to_both_breakpoints(monkeypatch):
+    """The static head AND the rolling tail, or the conversation prefix — the
+    part that actually grows — still expires after five minutes."""
+    monkeypatch.delenv(ac.PROMPT_CACHE_TTL_ENV, raising=False)
+    kwargs = _build_cached(monkeypatch, prompt_cache_ttl="1h")
+    assert _cache_controls(kwargs) == [{"type": "ephemeral", "ttl": "1h"}] * 2
+
+
+def test_explicit_five_minutes_stays_off_the_wire(monkeypatch):
+    """Naming the default must not change the request shape."""
+    monkeypatch.delenv(ac.PROMPT_CACHE_TTL_ENV, raising=False)
+    assert _cache_controls(_build_cached(monkeypatch, prompt_cache_ttl="5m")) == [
+        {"type": "ephemeral"},
+    ] * 2
+
+
+def test_env_sets_the_ttl_and_the_client_outranks_it(monkeypatch):
+    """The env var is the deployment-wide escape hatch for a run whose config
+    path does not reach every construction site; a client that states its own
+    lifetime is not overridden by the environment it happens to run in."""
+    monkeypatch.setenv(ac.PROMPT_CACHE_TTL_ENV, "1h")
+    assert _cache_controls(_build_cached(monkeypatch))[0] == {
+        "type": "ephemeral", "ttl": "1h",
+    }
+    assert _cache_controls(_build_cached(monkeypatch, prompt_cache_ttl="5m")) == [
+        {"type": "ephemeral"},
+    ] * 2
+
+
+@pytest.mark.parametrize("raw", ["30m", "1 h", "3600", "forever", 60])
+def test_unsupported_ttl_is_refused_at_construction(raw):
+    """A typo that silently reverted to five minutes would show up only as a
+    cache-hit-rate regression nobody is watching."""
+    with pytest.raises(ValueError):
+        ac.AnthropicClient("claude-x", api_key="x", prompt_cache_ttl=raw)
+
+
+def test_unsupported_ttl_in_env_fails_loudly(monkeypatch):
+    monkeypatch.setenv(ac.PROMPT_CACHE_TTL_ENV, "90m")
+    with pytest.raises(ValueError):
+        _build_cached(monkeypatch)
+
+
+def test_ttl_does_not_resurrect_a_disabled_cache(monkeypatch):
+    """``ANTHROPIC_PROMPT_CACHE=0`` is the kill switch; a TTL is a lifetime for
+    breakpoints that exist, not a second way to place them."""
+    monkeypatch.setenv("ANTHROPIC_PROMPT_CACHE", "0")
+    monkeypatch.setenv(ac.PROMPT_CACHE_TTL_ENV, "1h")
+    c = ac.AnthropicClient("claude-x", api_key="x", prompt_cache_ttl="1h")
+    kwargs = c._build_kwargs(
+        [system_msg("s"), user_msg("q")],
+        tools=None, temperature=None, max_tokens=None,
+        extra_headers=None, timeout=None,
+    )
+    assert _cache_controls(kwargs) == []
+
+
+def test_protocol_builder_forwards_the_profile_ttl(monkeypatch):
+    """The lifetime belongs to the model a profile chose, so it has to survive
+    the builder rather than only being reachable by constructing by hand."""
+    monkeypatch.delenv(ac.PROMPT_CACHE_TTL_ENV, raising=False)
+    from agent_core.providers.protocol_client import build_protocol_client
+
+    client = build_protocol_client({
+        "protocol": "anthropic", "model": "claude-x", "api_key": "k",
+        "prompt_cache_ttl": "1h",
+    }, title="t")
+    assert client._prompt_cache_ttl == "1h"
+    plain = build_protocol_client({
+        "protocol": "anthropic", "model": "claude-x", "api_key": "k",
+    }, title="t")
+    assert plain._prompt_cache_ttl == ""
