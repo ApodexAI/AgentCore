@@ -73,7 +73,9 @@ this normalization silently disables truncation recovery for its protocol.
 Native profiles for `claude-fable-5-1` and `claude-opus-5-5` use
 `thinking_type: adaptive` and default to `thinking_display: summarized`.
 These models also think adaptively when `thinking` is omitted; the direct
-client forwards `effort` in that case. Manual budgets and disabled thinking
+client forwards `effort` in that case. A direct `AnthropicClient` built with
+`effort` but no `thinking` now sends `output_config.effort`; models without
+effort support reject it, so leave `effort` empty for them. Manual budgets and disabled thinking
 are unsupported by these models. Sampling parameters and forced tool choice
 are omitted. Model selection and output-token budgets remain host-owned.
 
@@ -83,15 +85,16 @@ otherwise later signatures can become invalid when replayed. Canonical tool
 calls remain authoritative after runtime filtering or repair.
 
 These models bind thinking signatures to the preceding system prompt, tools,
-and conversation. If a 400 explicitly reports a thinking signature bound to
-a different conversation (for example after client-side compaction), the
-adapter retries once without historical thinking or redacted-thinking blocks.
+and conversation. If a 400 reports an invalid thinking signature (for example
+a signature bound to a different conversation after client-side compaction),
+the adapter retries once without historical thinking or redacted-thinking blocks.
 It logs the recovery and reports `thinking_history_reset` in response metadata
 (carried by `StreamDelta.thinking_history_reset` when streaming). After success,
 the agent loop removes invalid historical thinking before storing the new
 response. Direct client consumers must apply that reset to their own history;
-the client does not mutate caller-owned messages. Other 400s and a failed retry
-propagate. Hosts should keep conversation prefixes stable to preserve reasoning.
+the client does not mutate caller-owned messages. A consumer that ignores it
+keeps replaying the stale signatures, so every later request pays a rejected
+call plus the retry. Other 400s and a failed retry propagate. Hosts should keep conversation prefixes stable to preserve reasoning.
 
 See Anthropic's [Fable 5.1 migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide),
 [Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide),

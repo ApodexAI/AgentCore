@@ -139,12 +139,17 @@ class AnthropicClient(LLMClient):
         return kwargs
 
     async def _create_message(self, kwargs: dict[str, Any]) -> tuple[Any, bool]:
-        """Retry once when a history edit invalidated signed thinking.
+        """Retry once when the API rejects a historical thinking signature.
 
         Fable 5.1 / Opus 5.5 bind thinking to its conversation prefix. Runtime
         compaction, tool filtering, or a changed system prompt can invalidate
         that prefix. Remove all thinking for this request only, leaving durable
         history intact; unrelated 400s and a second rejection propagate.
+
+        Matching is on "signature" + "thinking" rather than one exact wording:
+        the phrasing is not a documented contract, and omitting historical
+        thinking is always a valid request, so any signature rejection is
+        recoverable the same way. A narrower match fails silently on rewording.
         """
         from anthropic import BadRequestError
 
@@ -152,10 +157,7 @@ class AnthropicClient(LLMClient):
             return await self._client.messages.create(**kwargs), False
         except BadRequestError as exc:
             error = str(exc).lower()
-            if not (
-                "signature" in error and "thinking" in error
-                and "bound to a different conversation" in error
-            ):
+            if not ("signature" in error and "thinking" in error):
                 raise
             messages, stripped = _without_thinking_blocks(kwargs["messages"])
             if not stripped:

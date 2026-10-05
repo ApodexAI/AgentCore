@@ -76,10 +76,11 @@ async def test_a_truncated_turn_is_distinguishable_from_a_finished_one(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_an_ordinary_turn_stays_lean(tmp_path):
-    """No empty keys on the overwhelmingly common path."""
+@pytest.mark.parametrize("finish_reason", ["end_turn", "stop"])
+async def test_an_ordinary_turn_stays_lean(tmp_path, finish_reason):
+    """No empty keys on the overwhelmingly common path, for either protocol."""
     record = await _record(tmp_path, _ctx(
-        ai_text="hello", finish_reason="end_turn",
+        ai_text="hello", finish_reason=finish_reason,
     ))
 
     assert "finish_reason" not in record

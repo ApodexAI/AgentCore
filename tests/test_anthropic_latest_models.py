@@ -202,7 +202,8 @@ async def test_prefix_bound_signature_retry_is_once_and_does_not_edit_history(mo
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("message,expected_calls", [
     ("max_tokens is too large", 1),
-    ("Invalid signature in thinking block", 1),
+    ("thinking.budget_tokens must be less than max_tokens", 1),
+    ("Invalid signature in thinking block", 2),
     ("Invalid `signature` in `thinking` block. The block is bound to a different conversation.", 2),
 ])
 async def test_unrelated_or_repeated_bad_requests_propagate(streaming, message, expected_calls):
