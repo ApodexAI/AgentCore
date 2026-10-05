@@ -7,6 +7,13 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.13.0] - 2026-10-05
+
+### Added
+
+- Expose Anthropic refusal details and original stop reasons consistently in ordinary and streamed responses, and record finish reasons and refusal details in JSON and JSONL trajectories. Preserve signed thinking and tool-call ordering for Claude Fable 5.1 and Opus 5.5, forward effort independently of thinking configuration (direct clients that set effort without thinking now send it), and recover once from thinking signatures the API rejects after conversation edits.
+- Add typed, source-documented model capability records shared by model profiles and Anthropic request construction. Known models select compatible thinking defaults and reject unsupported thinking, effort, or output-token settings before API calls; unknown models retain pass-through behavior and hosts can override deployment-specific facts without global mutable state. Enable CI for stacked pull requests. Behavior changes: an unrecognized `thinking_type` now raises instead of falling back to adaptive (`off`/`none`/`false` mean disabled on every builder); configuring `effort` for Sonnet 4.5 or Haiku 4.5 now raises instead of being dropped; and Sonnet/Haiku/Opus 4.5 without an explicit `thinking_type` now default to `enabled` (budget 8192, which may raise `max_tokens`) instead of the rejected adaptive mode.
+
 ## [0.12.3] - 2026-10-01
 
 ### Fixed
