@@ -70,6 +70,11 @@ class StreamDelta:
     # it in ``response_metadata``. The assembler folds it into exactly that,
     # so both paths expose a refusal identically.
     stop_details: dict[str, Any] = field(default_factory=dict[str, Any])
+    # Provider's original marker, before finish_reason normalization.
+    stop_reason: str = ""
+    # A successful provider recovery discarded historical signed reasoning.
+    # The loop must reset it before appending the newly generated blocks.
+    thinking_history_reset: bool = False
 
 
 @runtime_checkable

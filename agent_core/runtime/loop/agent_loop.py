@@ -1097,6 +1097,26 @@ async def _notify_context_compacted(
     )
 
 
+def _reset_signed_thinking_history(messages: list[Message]) -> None:
+    """Commit a provider's successful signature recovery to loop-owned history."""
+    retained: list[Message] = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            retained.append(message)
+            continue
+        kept = [
+            block for block in content
+            if not isinstance(block, dict)
+            or block.get("type") not in ("thinking", "redacted_thinking")
+        ]
+        if len(kept) == len(content):
+            retained.append(message)
+        elif kept or message.get("tool_calls"):
+            retained.append({**message, "content": kept})
+    messages[:] = retained
+
+
 async def _process_llm_response(
     cfg: LoopConfig, obs: list, tc_parser: Any, profile: Any, policy: Any, thinking_parser: Any, normalizer: Any,
     tool_names: set[str], messages: list[Message], metadata: dict[str, Any], turn: int,
@@ -1106,6 +1126,12 @@ async def _process_llm_response(
 ) -> tuple[list[dict], TurnContext, str, bool, bool, int, int]:
     metadata["llm_duration_ms"] = int((llm_call_finished - llm_call_started) * 1000)
     metadata["llm_ttft_ms"] = int(((first_delta_at or llm_call_finished) - llm_call_started) * 1000)
+
+    if (getattr(response, "response_metadata", None) or {}).get("thinking_history_reset"):
+        # Only after recovery succeeds, and before storing its new signed blocks.
+        # Otherwise the next call replays the known-invalid signatures, fails
+        # again, and discards the newly generated valid reasoning too.
+        _reset_signed_thinking_history(messages)
 
     tr = thinking_parser.extract(response, profile)
     history_msg = normalizer.to_history(response, tr, policy, profile.thinking_format)

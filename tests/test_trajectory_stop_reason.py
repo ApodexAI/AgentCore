@@ -104,3 +104,15 @@ async def test_tool_use_turns_record_their_stop_reason(tmp_path):
     ))
 
     assert record["finish_reason"] == "tool_use"
+
+
+@pytest.mark.parametrize("formats", [["json"], ["json", "jsonl"]])
+async def test_json_snapshot_records_refusal_details(tmp_path, formats):
+    obs = TrajectoryFileObserver(tmp_path, filename="t", formats=formats)
+    await obs.on_llm_response(_ctx(
+        finish_reason="refusal", stop_details={"type": "refusal", "category": "bio"},
+    ))
+    msg = json.loads((tmp_path / "t.json").read_text())["messages"][0]
+    assert msg["finish_reason"] == "refusal"
+    assert msg["stop_details"] == {"type": "refusal", "category": "bio"}
+    assert (tmp_path / "t.jsonl").exists() == ("jsonl" in formats)

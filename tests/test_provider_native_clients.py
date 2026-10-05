@@ -706,7 +706,7 @@ def test_anthropic_build_kwargs_matches_installed_sdk_signature(thinking):
     assert {"temperature", "top_p", "top_k"}.isdisjoint(kwargs.get("extra_body", {}))
     if thinking:
         assert kwargs["thinking"] == thinking
-        assert kwargs["extra_body"] == {"output_config": {"effort": "high"}}
+    assert kwargs["extra_body"] == {"output_config": {"effort": "high"}}
 
 
 @pytest.mark.asyncio

@@ -119,11 +119,11 @@ class AnthropicClient(LLMClient):
         if system:
             kwargs["system"] = system
         if self._thinking:
-            # ``effort`` rides on ``extra_body.output_config`` so any value (incl. ``xhigh``)
-            # reaches ``messages.create`` without the SDK's stricter validation.
             kwargs["thinking"] = self._thinking
-            if self._effort:
-                kwargs["extra_body"] = {"output_config": {"effort": self._effort}}
+        # Current Claude models think adaptively even when thinking is omitted.
+        # Keep effort independent of that optional display/configuration field.
+        if self._effort:
+            kwargs["extra_body"] = {"output_config": {"effort": self._effort}}
         if tools:
             kwargs["tools"] = [_to_anthropic_tool(t) for t in tools]
         if extra_headers:
@@ -137,6 +137,35 @@ class AnthropicClient(LLMClient):
         # persistent block rather than moving onto the per-call text.
         kwargs["messages"] = _fold_transient_tail(kwargs["messages"], transient_tail)
         return kwargs
+
+    async def _create_message(self, kwargs: dict[str, Any]) -> tuple[Any, bool]:
+        """Retry once when a history edit invalidated signed thinking.
+
+        Fable 5.1 / Opus 5.5 bind thinking to its conversation prefix. Runtime
+        compaction, tool filtering, or a changed system prompt can invalidate
+        that prefix. Remove all thinking for this request only, leaving durable
+        history intact; unrelated 400s and a second rejection propagate.
+        """
+        from anthropic import BadRequestError
+
+        try:
+            return await self._client.messages.create(**kwargs), False
+        except BadRequestError as exc:
+            error = str(exc).lower()
+            if not (
+                "signature" in error and "thinking" in error
+                and "bound to a different conversation" in error
+            ):
+                raise
+            messages, stripped = _without_thinking_blocks(kwargs["messages"])
+            if not stripped:
+                raise
+            logger.warning(
+                "Anthropic thinking signature no longer matches the conversation; "
+                "retrying once without historical thinking blocks",
+            )
+            raw = await self._client.messages.create(**{**kwargs, "messages": messages})
+            return raw, True
 
     async def chat(
         self,
@@ -152,8 +181,11 @@ class AnthropicClient(LLMClient):
             messages, tools=tools, temperature=temperature,
             max_tokens=max_tokens, extra_headers=extra_headers, timeout=timeout,
         )
-        raw = await self._client.messages.create(**kwargs)
-        return _to_llm_response(raw)
+        raw, reset = await self._create_message(kwargs)
+        response = _to_llm_response(raw)
+        if reset:
+            response.response_metadata["thinking_history_reset"] = True
+        return response
 
     async def stream(
         self,
@@ -196,7 +228,7 @@ class AnthropicClient(LLMClient):
         # string, so a streamed thinking turn used to yield reasoning that
         # ``thinking_format="content_block"`` could not replay.
         blocks: dict[int, dict[str, Any]] = {}
-        stream = await self._client.messages.create(**kwargs)
+        stream, reset = await self._create_message(kwargs)
         async for event in stream:
             etype = getattr(event, "type", "")
             if etype == "message_start":
@@ -218,10 +250,13 @@ class AnthropicClient(LLMClient):
                 if cbtype == "tool_use":
                     # Open a tool-call slot: id + name set once; arguments
                     # arrive as ``input_json_delta`` partial-JSON fragments.
-                    # Deliberately NOT recorded in ``blocks``: tool calls ride
-                    # the ``tool_call_deltas`` channel and are re-emitted from
-                    # ``Message.tool_calls`` on replay, exactly as the
-                    # non-streaming ``_to_llm_response`` does.
+                    # Also keep its position among signed thinking blocks.
+                    # Reordering tool calls changes the prefix of later thinking.
+                    blocks[idx] = {
+                        "type": "tool_use", "id": getattr(cb, "id", "") or "",
+                        "name": getattr(cb, "name", "") or "",
+                        "input": getattr(cb, "input", {}) or {},
+                    }
                     yield StreamDelta(tool_call_deltas=[{
                         "index": idx,
                         "id": getattr(cb, "id", "") or "",
@@ -270,6 +305,12 @@ class AnthropicClient(LLMClient):
                     if blk is not None and blk.get("type") == "thinking":
                         blk["signature"] += getattr(d, "signature", "") or ""
                 elif dtype == "input_json_delta":
+                    blk = blocks.get(idx)
+                    if blk is not None and blk.get("type") == "tool_use":
+                        blk["_partial_json"] = (
+                            blk.get("_partial_json", "")
+                            + (getattr(d, "partial_json", "") or "")
+                        )
                     yield StreamDelta(tool_call_deltas=[{
                         "index": idx,
                         "id": None,
@@ -304,6 +345,15 @@ class AnthropicClient(LLMClient):
         # text turn the flattened ``content`` string is the faithful shape and
         # the assembler should keep using it.
         ordered = _ordered_blocks(blocks)
+        for block in ordered:
+            partial = block.pop("_partial_json", None)
+            if partial is not None:
+                try:
+                    block["input"] = json.loads(partial)
+                except (ValueError, TypeError):
+                    # The tool-call channel retains truncated arguments for
+                    # the runtime's repair/replay logic.
+                    block["input"] = {}
         yield StreamDelta(
             usage=_anthropic_usage_dict(
                 input_tokens,
@@ -318,6 +368,8 @@ class AnthropicClient(LLMClient):
             model=model,
             reasoning_blocks=ordered if _has_thinking(ordered) else [],
             stop_details=stop_details,
+            stop_reason=stop_reason,
+            thinking_history_reset=reset,
         )
 
 
@@ -385,6 +437,26 @@ def _build_bedrock_client(
 
 
 # ── Conversion helpers ───────────────────────────────────────────────────
+
+
+def _without_thinking_blocks(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    out: list[dict[str, Any]] = []
+    stripped = False
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        kept = [b for b in content if b.get("type") not in ("thinking", "redacted_thinking")]
+        if len(kept) == len(content):
+            out.append(message)
+            continue
+        stripped = True
+        if kept:
+            out.append({**message, "content": kept})
+    return out, stripped
 
 
 def _merge_tool_results(
@@ -517,6 +589,11 @@ def _to_anthropic_msg(m: Message) -> dict[str, Any] | None:
         }
     if role == "assistant":
         blocks: list[dict[str, Any]] = []
+        calls = [
+            converted for tc in (m.get("tool_calls") or [])
+            if (converted := _to_anthropic_tool_use(tc)) is not None
+        ]
+        remaining = {call["id"]: call for call in calls}
         raw = m.get("content")
         if isinstance(raw, list):
             # Extended-thinking continuation: history kept the VERBATIM block
@@ -546,14 +623,17 @@ def _to_anthropic_msg(m: Message) -> dict[str, Any] | None:
                     txt = block.get("text", "") or ""
                     if txt:
                         blocks.append({"type": "text", "text": txt})
+                elif bt == "tool_use":
+                    # The canonical tool-call channel remains authoritative
+                    # after runtime repair/filtering; native blocks supply order.
+                    call = remaining.pop(block.get("id"), None)
+                    if call is not None:
+                        blocks.append(call)
         else:
             body = text_of(raw or "")
             if body:
                 blocks.append({"type": "text", "text": body})
-        for tc in m.get("tool_calls", []) or []:
-            block = _to_anthropic_tool_use(tc)
-            if block is not None:
-                blocks.append(block)
+        blocks.extend(remaining.values())
         if not blocks:
             # Nothing to say and nothing to call. An empty ``text`` block is
             # NOT a usable placeholder — Anthropic rejects zero-length text
@@ -717,6 +797,11 @@ def _anthropic_stop_details(raw: Any) -> dict[str, Any] | None:
     if isinstance(details, dict):
         out = {k: v for k, v in details.items() if v is not None}
         return out or None
+    model_dump = getattr(details, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(mode="json", exclude_none=True)
+        if isinstance(dumped, dict):
+            return dumped or None
     # SDK model object: read the documented fields off it.
     out = {}
     for field in ("type", "category", "explanation"):
@@ -803,6 +888,11 @@ def _to_llm_response(raw: Any) -> LLMResponse:
                 "data": getattr(block, "data", "") or "",
             })
         elif btype == "tool_use":
+            blocks_out.append({
+                "type": "tool_use", "id": getattr(block, "id", ""),
+                "name": getattr(block, "name", ""),
+                "input": getattr(block, "input", {}) or {},
+            })
             tool_calls.append({
                 "id": getattr(block, "id", ""),
                 "type": "function",

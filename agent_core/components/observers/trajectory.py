@@ -542,6 +542,10 @@ class TrajectoryFileObserver(BaseObserver):
                 # Verbatim thinking / reasoning blocks (signatures /
                 # encrypted_content) so the JSON envelope stays replay-able.
                 msg["thinking_blocks"] = ctx.thinking_blocks
+            if ctx.finish_reason and ctx.finish_reason != "end_turn":
+                msg["finish_reason"] = ctx.finish_reason
+            if ctx.stop_details:
+                msg["stop_details"] = ctx.stop_details
             if ctx.tool_calls:
                 ids: list[str] = []
                 tcs: list[dict] = []
