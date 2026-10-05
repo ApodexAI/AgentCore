@@ -12,6 +12,7 @@ from agent_core.messages import (
     tool_msg,
     user_msg,
 )
+from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
 from agent_core.types import TaskStatus
 
 __all__ = [
@@ -21,11 +22,13 @@ __all__ = [
     "LLMClient",
     "LLMResponse",
     "Message",
+    "ModelCapabilities",
     "StreamDelta",
     "TaskStatus",
     "ToolCall",
     "assistant_msg",
     "build_execution_scope",
+    "resolve_model_capabilities",
     "system_msg",
     "tool_msg",
     "user_msg",

@@ -107,3 +107,80 @@ Unknown detail fields/categories pass through, including with older SDKs.
 Observers receive `TurnContext.finish_reason` and `TurnContext.stop_details`;
 the trajectory observer writes them to JSON snapshots and JSONL events.
 This telemetry does not change loop termination or choose a fallback model.
+
+## Model capabilities and deployment overrides
+
+`agent_core.model_capabilities` holds immutable request facts keyed by exact
+model IDs and documented aliases. Each record has source URLs and a verification
+date. `ModelProfile.request_capabilities` and the Anthropic client use this same
+resolver; the host still owns endpoints, credentials, routing, prices, and model
+catalog discovery. No network request occurs during resolution.
+
+`None` means unknown; an empty set means a feature has no supported values.
+Unknown IDs, newer versions, and Claude names served over Chat Completions do
+not inherit native Anthropic restrictions. Bedrock's documented regional model
+prefixes and version suffixes resolve to the same underlying model facts; the
+outbound model ID is never rewritten. Arbitrary aliases and ARNs require host
+overrides. This first table covers Fable 5.1, Opus 5.5, and the legacy 4.5 models;
+other providers and models remain unknown until verified facts are added.
+
+Known thinking modes select builder defaults and reject unsupported explicit
+modes. Every native builder normalizes the configured thinking type the same
+way: `adaptive`, `enabled`, and `disabled` (also spelled `off`, `none`, or
+`false`); blank means unset, and any other value raises `ValueError`. Effort and output limits are validated in direct clients, native profile
+clients, and per-call overrides. No parameter is silently clamped. The existing
+legacy thinking-budget adjustment remains in place. Empty thinking support
+omits the thinking field; unknown native models keep the prior adaptive default.
+Only thinking modes, required thinking, effort levels, and output limits are
+enforced. `default_effort`, `sampling_parameters`, `tool_choice_modes`,
+`thinking_signature_binding`, and `max_input_tokens` are descriptive until an
+adapter consumes them. Sampling, tool-choice, and signature-binding facts are available to hosts;
+protocol field conversion, SDK transport limitations, and error recovery stay
+in adapters. The Anthropic adapter still omits sampling fields for SDK 1.x
+compatibility. This PR does not add forced tool-choice parameters.
+
+Resolution starts from verified model facts (or unknown), then applies a
+per-client host override. The `model_capabilities` profile key is a
+mapping with the capability field names; omitted fields inherit, explicit null
+clears a fact to unknown, and empty lists declare unsupported values. Unknown
+keys, malformed values, and contradictory defaults raise `ValueError`.
+`overridden_fields` identifies which facts the host supplied; `source_urls`
+describes inherited facts, not proof of a host override. Hosts own the evidence
+for their deployment overrides. Records never mutate a global registry.
+
+```yaml
+llm:
+  protocol: anthropic
+  model: claude-opus-5-5
+  effort: medium
+  model_capabilities:
+    max_output_tokens: 32768  # gateway limit overrides the model maximum
+```
+
+A profile must see the same overrides as its client. Pass the profile the same
+mapping (`ModelProfile(..., model_capabilities=cfg.get("model_capabilities"))`)
+or the client's resolved record (`capabilities=client.capabilities`); a profile
+built with neither resolves the unoverridden model facts.
+
+For a custom alias, specify its supported modes and effort levels explicitly:
+
+```python
+from agent_core import resolve_model_capabilities
+from agent_core.runtime.loop.model_profile import ModelProfile
+
+caps = resolve_model_capabilities(
+    "gateway-alias", protocol="anthropic",
+    overrides={"thinking_modes": ["adaptive"], "effort_levels": ["low", "high"]},
+)
+profile = ModelProfile(
+    model_id="gateway-alias", provider="gateway", protocol="anthropic",
+    capabilities=caps, context_window=64000,
+)
+```
+
+`context_window` remains a host-selected operational budget. The capability's
+`max_input_tokens` is the provider's maximum, and does not overwrite that budget.
+Defaults such as `default_effort` are descriptive; callers who omit effort keep
+the provider's own default. Beta/platform-specific limits require a host override
+paired with the appropriate headers. Models API discovery/caching can be added
+by hosts later; this PR does not introduce a background synchronization service.
