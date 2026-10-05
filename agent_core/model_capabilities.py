@@ -20,6 +20,19 @@ SignatureBinding = Literal["none", "model", "conversation_prefix"]
 
 @dataclass(frozen=True)
 class ModelCapabilities:
+    """Request facts for one model, resolved for one client/profile.
+
+    Enforced before API calls by :meth:`validate_request`: ``thinking_modes``,
+    ``thinking_required``, ``effort_levels`` and ``max_output_tokens``.
+    Descriptive only, for hosts to read: ``default_effort`` (an omitted effort
+    keeps the provider default), ``sampling_parameters`` (the Anthropic adapter
+    omits sampling for every model regardless), ``tool_choice_modes`` (no
+    adapter sends ``tool_choice`` yet), ``thinking_signature_binding`` and
+    ``max_input_tokens`` (``ModelProfile.context_window`` stays the operational
+    budget). A field moves to the enforced list only together with the adapter
+    code that consumes it.
+    """
+
     thinking_modes: frozenset[str] | None = None
     thinking_required: bool | None = None
     effort_levels: frozenset[str] | None = None

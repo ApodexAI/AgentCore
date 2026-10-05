@@ -131,7 +131,10 @@ way: `adaptive`, `enabled`, and `disabled` (also spelled `off`, `none`, or
 clients, and per-call overrides. No parameter is silently clamped. The existing
 legacy thinking-budget adjustment remains in place. Empty thinking support
 omits the thinking field; unknown native models keep the prior adaptive default.
-Sampling, tool-choice, and signature-binding facts are available to hosts;
+Only thinking modes, required thinking, effort levels, and output limits are
+enforced. `default_effort`, `sampling_parameters`, `tool_choice_modes`,
+`thinking_signature_binding`, and `max_input_tokens` are descriptive until an
+adapter consumes them. Sampling, tool-choice, and signature-binding facts are available to hosts;
 protocol field conversion, SDK transport limitations, and error recovery stay
 in adapters. The Anthropic adapter still omits sampling fields for SDK 1.x
 compatibility. This PR does not add forced tool-choice parameters.
