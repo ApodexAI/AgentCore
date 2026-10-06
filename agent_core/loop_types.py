@@ -150,6 +150,14 @@ class LoopConfig:
     # Abort reasoning-only streams after either enabled bound.
     reasoning_only_timeout_s: float | None = None
     reasoning_only_max_tokens: int | None = None
+    # Stream LLM tokens, overriding what the run would decide on its own.
+    # ``None`` (default) keeps the existing behaviour: stream when something
+    # needs the deltas and the protocol's streamed replay is verified. ``True``
+    # streams regardless — the transport, not the observers, is then the reason
+    # (a gateway that times out waiting for a non-streaming response's headers
+    # leaves no other option). ``False`` never streams. An explicit value makes
+    # the host responsible for its protocol's streamed-replay fidelity.
+    stream_llm_tokens: bool | None = None
     # Total budget across admission, attempts, backoff, and recovery.
     logical_call_timeout_s: float | None = None
     context_token_limit: int = 120_000

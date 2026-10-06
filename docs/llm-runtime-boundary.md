@@ -72,3 +72,37 @@ hosts are known to add, for anyone who wants to describe such a mapping as a
 
 `tests/test_loop_types.py` asserts these fields stay an open mapping, so a
 later well-meant tightening fails loudly.
+
+## Who decides whether a turn streams
+
+Streaming is opt-in and, by default, the RUN decides: it is selected when the
+reasoning-only watchdog is configured (`reasoning_only_timeout_s` /
+`reasoning_only_max_tokens` — the guard reads the stream) or when an observer
+declares `wants_llm_delta = True`. Implementing `on_llm_delta` without that
+attribute gets silence.
+
+`LoopConfig.stream_llm_tokens` overrides that decision: `True` streams, `False`
+does not, `None` (the default) keeps the automatic choice. An explicit value
+exists because the TRANSPORT can be the reason rather than any observer — a
+gateway that abandons a non-streaming request while waiting for its response
+headers leaves no other option, and for a non-streaming Anthropic request those
+headers arrive only once generation is complete. Measured on llm-hub's "Claude
+Code" channel, 2026-10-05: an identical `claude-opus-5-5` request at
+`effort=max` returned HTTP 502 `upstream_unreachable — first byte timeout` after
+76s non-streaming, and HTTP 200 streamed, first byte at 3.9s and the generation
+taking 242s. Concurrency was ruled out (five light requests in flight all
+succeeded; five heavy ones failed at the same 76s mark).
+
+In automatic mode the choice is also gated by protocol:
+`UNVERIFIED_STREAM_PROTOCOLS` (`responses`, `bedrock`) stays non-streaming
+because no test here proves their streamed turn replays like its non-streaming
+twin. `anthropic` is NOT in that set: its `stream` rebuilds the provider's
+verbatim block list — including a thinking block's trailing `signature_delta`
+and a `redacted_thinking` payload that arrives with no deltas — and
+`test_anthropic_latest_models.py` exercises the signature round-trip, the
+prefix-bound retry and the reset commit parametrized over streaming. An
+explicit `stream_llm_tokens` ignores the gate; the host then owns that fidelity.
+
+When automatic mode suppresses deltas something asked for, the loop logs a
+warning. It used to be silent, which meant a profile configuring the
+reasoning-only watchdog on a gated protocol got no watchdog and no sign of it.

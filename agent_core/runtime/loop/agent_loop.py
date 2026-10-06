@@ -93,6 +93,27 @@ logger = logging.getLogger(__name__)
 # loops (e.g. a flaky LLM that keeps emitting refusals/duplicates).
 EXTRA_ATTEMPTS_BUFFER = 200
 
+#: Protocols whose STREAMED turn is not proven here to replay like its
+#: non-streaming twin, so ``stream_llm_tokens`` stays off for them unless the
+#: host states otherwise.
+#:
+#: Every one of these clients implements ``stream``; the question is fidelity of
+#: the replayed turn, and the bar is a test in this repository. ``anthropic``
+#: clears it — ``stream`` rebuilds the provider's verbatim block list, including
+#: the ``signature_delta`` that arrives after a thinking block's text and the
+#: payload a ``redacted_thinking`` block carries with no deltas at all, and
+#: ``test_anthropic_latest_models.py`` runs the signature round-trip, the
+#: prefix-bound retry and the reset commit parametrized over streaming.
+#: ``responses`` has one streaming test and it only covers error routing;
+#: ``bedrock`` has none, and its transport is a different SDK client.
+#:
+#: The three were suppressed together and unconditionally when the loop engine
+#: was extracted (2026-09-01), one day BEFORE the provider substrate landed
+#: that block-list fidelity (2026-09-02) — so this was once correct for all
+#: three and nobody revisited it. Removing a protocol from this set is a matter
+#: of writing the test that proves its streamed replay.
+UNVERIFIED_STREAM_PROTOCOLS = frozenset({"responses", "bedrock"})
+
 
 # Signature: (turn_index, messages_snapshot, metadata) -> awaitable None.
 # Fires once per completed turn, after observer `on_turn_end` and any
@@ -423,16 +444,33 @@ async def _run_loop_inner(
     last_input_tokens = 0
     last_output_tokens = 0
 
-    stream_llm_tokens = bool(
+    # Something in the run needs the token deltas: the reasoning-only watchdog
+    # reads the stream, and so does any observer that declares it.
+    stream_requested = bool(
         cfg.reasoning_only_timeout_s or cfg.reasoning_only_max_tokens
     ) or any(
         bool(getattr(observer, "wants_llm_delta", False))
         for observer in obs
     )
-    if getattr(profile, "protocol", "chat_completions") in (
-        "anthropic", "responses", "bedrock",
-    ):
-        stream_llm_tokens = False
+    protocol = getattr(profile, "protocol", "chat_completions")
+    if cfg.stream_llm_tokens is not None:
+        # The host stated it; the transport may be the reason (see LoopConfig).
+        stream_llm_tokens = cfg.stream_llm_tokens
+    else:
+        stream_llm_tokens = (
+            stream_requested and protocol not in UNVERIFIED_STREAM_PROTOCOLS
+        )
+        if stream_requested and not stream_llm_tokens:
+            # Previously silent, and silence here is expensive: a profile that
+            # configures the reasoning-only watchdog on one of these protocols
+            # gets no watchdog at all, and nothing says so.
+            logger.warning(
+                "agent_loop: deltas were requested but protocol %r streams "
+                "unverified here, so the run is non-streaming and any "
+                "reasoning-only watchdog is inert; set "
+                "LoopConfig.stream_llm_tokens=True to stream anyway",
+                protocol,
+            )
 
     max_attempts = cfg.max_turns + EXTRA_ATTEMPTS_BUFFER
     turn = 0
