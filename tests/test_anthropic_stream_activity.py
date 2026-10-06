@@ -179,6 +179,58 @@ async def test_heartbeat_does_not_commit_fallback_leg_before_sdk_error():
     assert response.finish_reason == "end_turn"
 
 
+async def test_proxy_smoke_retries_sdk_error_after_heartbeats_before_output():
+    from agent_core.components.middleware.llm.base import LLMMiddleware, LLMMiddlewareChain
+    from agent_core.components.middleware.llm.proxy import LLMProxy
+
+    bodies, requests, chunks, after_calls, errors = [], [], [], [], []
+
+    class RetryRecorder(LLMMiddleware):
+        name = "retry_recorder"
+
+        async def on_llm_error(self, ctx, error, attempt):
+            errors.append((error, attempt))
+            return attempt == 0
+
+        async def on_chunk(self, ctx, delta, accumulated):
+            chunks.append(delta)
+            return False
+
+        async def after_llm(self, ctx, response):
+            after_calls.append((response, dict(ctx.metadata)))
+            return response
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        body = _Body("error" if len(requests) == 1 else "healthy")
+        bodies.append(body)
+        return sdk_httpx.Response(200, stream=body, headers={"content-type": "text/event-stream"})
+
+    client = AnthropicClient("claude-x", api_key="k",
+                             thinking={"type": "adaptive", "display": "omitted"})
+    await client._client.close()
+    async with AsyncAnthropic(api_key="k", max_retries=0, http_client=sdk_httpx.AsyncClient(
+        transport=sdk_httpx.MockTransport(respond),
+    )) as sdk:
+        client._client = sdk
+        chain = LLMMiddlewareChain()
+        chain.add(RetryRecorder())
+        proxy = LLMProxy(client, chain)
+        response = await _stream_llm_response(proxy, [user_msg("hi")], 2, _ignore)
+
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    assert len(errors) == 1 and errors[0][1] == 0
+    assert all(body.pings == 30 and body.closed and not body.reading for body in bodies)
+    assert all(not delta.transport_activity for delta in chunks)
+    assert len(after_calls) == 1
+    assert after_calls[0][0].content == "done"
+    assert "error" not in after_calls[0][1]
+    assert response.usage["completion_tokens"] == 20
+    assert response.finish_reason == "end_turn"
+    assert response.content[-1] == {"type": "text", "text": "done"}
+
+
 async def test_loop_smoke_omitted_thinking_tool_then_final_answer():
     from agent_core.loop_types import LoopConfig, LoopPolicy
     from agent_core.runtime.loop.agent_loop import run_agent_loop
