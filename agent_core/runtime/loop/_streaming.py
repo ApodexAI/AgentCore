@@ -15,10 +15,12 @@ from agent_core.errors import (
 )
 from agent_core.llm import LLMResponse
 from agent_core.messages import Message, ToolCall
+from agent_core.runtime.async_utils import await_bounded
 
 from ._runaway import _env_float, _env_int
 
 logger = logging.getLogger(__name__)
+_CLEANUP_TIMEOUT_S = 5.0
 # ── Stream-stall watchdog ─────────────────────────────────────────────
 # A streaming request can be black-holed without a chunk, error, or connection
 # close. Inter-chunk deadlines distinguish that state from slow decoding.
@@ -376,7 +378,9 @@ async def _stream_llm_response(
 
     async def _close_chunk_stream() -> None:
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(chunk_stream.aclose(), timeout=5.0)
+            await await_bounded(
+                chunk_stream.aclose(), _CLEANUP_TIMEOUT_S, hold=True,
+            )
 
     try:
         async with asyncio.timeout(timeout):
@@ -568,6 +572,8 @@ async def _stream_llm_response(
                 time.monotonic() - stream_started,
             ) from exc
         raise
+    finally:
+        await _close_chunk_stream()
 
     # Drain any bytes the splitter held back at a partial-tag boundary.
     visible_flush, thinking_flush = think_splitter.flush()

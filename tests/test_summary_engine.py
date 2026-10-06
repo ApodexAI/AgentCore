@@ -243,3 +243,108 @@ def test_error_body_excerpt_truncates() -> None:
     out = summary_mod._error_body_excerpt(httpx.Response(400, text=long))
     assert out.endswith("[truncated 50 chars]")
     assert summary_mod._error_body_excerpt(httpx.Response(400, text="")) == "(empty)"
+
+
+@pytest.mark.asyncio
+async def test_slow_drip_body_hits_total_timeout_and_advances_candidate(monkeypatch):
+    requests, cancelled, closed = [], [], []
+    original_client = httpx.AsyncClient
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            try:
+                for _ in range(100):
+                    yield b" "
+                    await asyncio.sleep(0.01)
+                yield b'{"choices":[{"message":{"content":"too late"}}]}'
+            finally:
+                cancelled.append(True)
+
+        async def aclose(self):
+            closed.append(True)
+
+    def respond(request):
+        requests.append(str(request.url))
+        if request.url.host == "slow":
+            return httpx.Response(200, stream=Drip())
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    def client(**kwargs):
+        return original_client(**kwargs, transport=httpx.MockTransport(respond))
+
+    monkeypatch.setattr(summary_mod.httpx, "AsyncClient", client)
+    engine = SummaryLLMEngine(request_timeout=0.03, max_retries=1)
+    result = await asyncio.wait_for(engine.summarize("content", "focus", [
+        {"endpoint": "https://slow/chat/completions", "model": "slow"},
+        {"endpoint": "https://fast/chat/completions", "model": "fast"},
+    ]), 0.3)
+    assert result == "ok" and len(requests) == 2
+    assert cancelled == [True] and closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_summary_external_cancellation_does_not_retry(monkeypatch):
+    started, closed = asyncio.Event(), asyncio.Event()
+    posts = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            closed.set()
+
+        async def post(self, *args, **kwargs):
+            posts.append(True)
+            started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(summary_mod.httpx, "AsyncClient", Client)
+    task = asyncio.create_task(SummaryLLMEngine(max_retries=3).summarize(
+        "content", "focus", [{"endpoint": "https://slow", "model": "slow"}],
+    ))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(closed.wait(), 0.2)
+    assert posts == [True]
+
+
+@pytest.mark.asyncio
+async def test_total_timeout_is_an_httpx_timeout_and_separately_configurable(monkeypatch):
+    seen = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            seen.append(kwargs["timeout"])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            await asyncio.sleep(1)
+
+    errors = []
+
+    def retryable(error):
+        errors.append(error)
+        return isinstance(error, httpx.TimeoutException)
+
+    monkeypatch.setattr(summary_mod.httpx, "AsyncClient", Client)
+    engine = SummaryLLMEngine(request_timeout=30, total_timeout=0.03, max_retries=2,
+                              retryable=retryable, sleep=lambda s: asyncio.sleep(0))
+    result = await asyncio.wait_for(engine.summarize(
+        "content", "focus", [{"endpoint": "https://slow", "model": "slow"}],
+    ), 0.5)
+    assert seen == [30, 30]  # Per-phase httpx timeout is unchanged.
+    assert len(errors) == 2  # Host predicates written for httpx still retry.
+    assert all(isinstance(e, summary_mod.SummaryRequestTimeout) for e in errors)
+    assert all(isinstance(e, TimeoutError) for e in errors)
+    assert result == "content"  # Truncation fallback.

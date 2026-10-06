@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import time
@@ -34,6 +35,7 @@ from agent_core.runtime.retriable import (
     is_transient_network,
 )
 
+from ..async_utils import await_bounded, hold_until_settled
 from ._bind import _ensure_bound
 from ._response import _visible_response_text, extract_usage
 from ._runaway import (
@@ -42,6 +44,7 @@ from ._runaway import (
     _RUNAWAY_MAX_RETRIES,
     _bind_expanded_max_tokens,
     _bind_reduced_max_tokens,
+    _env_float,
     _env_int,
     _is_runaway_response,
     _phase_reasoning_guard,
@@ -55,6 +58,7 @@ from ._streaming import (
 from .tool_call_recovery import stream_tool_calls_missing_required_arguments
 
 logger = logging.getLogger(__name__)
+_OBSERVATION_TIMEOUT_S = 5.0
 
 
 def _get_retry_after(exc: Exception) -> float | None:
@@ -112,7 +116,15 @@ def _default_rate_limit_backoff(attempt: int) -> float:
 # Suffix resolved through the shared ``AGENT_CORE_`` / compatibility-prefix
 # cascade by ``_env_int``.
 _LLM_GATE_ENV = "LLM_MAX_CONCURRENT"
+# Optional admission wait cap. Unset / <= 0 preserves the FIFO wait until an
+# explicit logical/wall deadline or cancellation. Queue time never shrinks
+# generation, and admission expiry never spends provider retries.
+_LLM_GATE_WAIT_ENV = "LLM_GATE_WAIT_S"
 _llm_gate_state: tuple[Any, asyncio.Semaphore] | None = None
+
+
+class _GateWaitTimeout(TimeoutError):
+    """The concurrency gate stayed saturated for the admission budget."""
 
 
 def _llm_gate() -> asyncio.Semaphore | None:
@@ -271,6 +283,14 @@ async def call_llm(
     deadline through ``wall_deadline_remaining``; AgentCore never imports a
     product's context-local storage.
 
+    Admission queueing is bounded separately (``LLM_GATE_WAIT_S``, disabled by
+    default) and never shrinks the generation budget; admission expiry ends
+    the call with reason ``gate_wait`` without retrying. The per-attempt
+    ``timeout`` starts once a slot is held and also covers any same-attempt tool-argument replay. A
+    slot is released only after an abandoned provider request settles.
+    Cleanup and passive observation have separate bounded grace periods so
+    cancellation cannot wait indefinitely for I/O finalizers.
+
     Callers wrap with try/except :class:`LLMCallExhausted` and decide
     whether to surface (chain advance) or degrade (partial content).
     """
@@ -367,7 +387,7 @@ async def call_llm(
         if on_attempt is None:
             return
         try:
-            await on_attempt(event)
+            await await_bounded(on_attempt(event), _OBSERVATION_TIMEOUT_S)
         except Exception:
             # Attempt observability is passive. A broken consumer must not
             # turn a valid provider response into an LLM failure.
@@ -541,51 +561,69 @@ async def call_llm(
             # Opt-in global admission gate — excess attempts wait HERE
             # (client-side, visible) rather than queueing blind inside
             # the gateway. Backoff sleeps run outside the gate so a
-            # waiting retry never holds a slot. The wait itself is
-            # bounded by the wall deadline reserve, and the provider
-            # timeout is recomputed after the slot is acquired so queue
-            # time cannot leak past the loop budget.
+            # waiting retry never holds a slot. The wait is bounded by its
+            # own admission budget and the wall deadline reserve; the
+            # provider timeout is recomputed after the slot is acquired so
+            # queue time cannot leak past the loop budget, but it is not
+            # charged against generation (a long queue must not turn into
+            # a doomed, slot-holding request).
             gate = _llm_gate()
-            gate_acquired = False
+            slot_lease = contextlib.ExitStack()
             try:
                 if gate is not None:
                     deadline_remaining, _deadline_reason = _nearest_deadline()
-                    gate_wait_timeout = None
+                    configured_gate_wait = _env_float(_LLM_GATE_WAIT_ENV, 0.0)
+                    gate_wait_timeout: float | None = (
+                        configured_gate_wait if configured_gate_wait > 0 else None
+                    )
+                    gate_wait_reason = ""
                     if deadline_remaining is not None:
-                        gate_wait_timeout = (
+                        deadline_wait_timeout = (
                             deadline_remaining - _WALL_DEADLINE_FLOOR_S
                         )
-                        if gate_wait_timeout <= 0:
+                        if deadline_wait_timeout <= 0:
                             _effective_timeout_or_deadline_exhausted(
                                 attempt=attempt, reason="gate_wait",
                             )
-                    if gate_wait_timeout is None:
-                        await gate.acquire()
-                    else:
-                        try:
-                            await asyncio.wait_for(
-                                gate.acquire(), timeout=gate_wait_timeout,
-                            )
-                        except TimeoutError as exc:
+                        if gate_wait_timeout is None or deadline_wait_timeout <= gate_wait_timeout:
+                            gate_wait_timeout = deadline_wait_timeout
+                            gate_wait_reason = _deadline_reason
+                    try:
+                        await asyncio.wait_for(
+                            gate.acquire(), timeout=gate_wait_timeout,
+                        )
+                    except TimeoutError as exc:
+                        if gate_wait_reason:
                             deadline_exc = LLMDeadlineExceeded(
-                                _deadline_reason,
+                                gate_wait_reason,
                                 "concurrency-gate wait consumed the remaining budget",
                             )
                             raise LLMCallExhausted(
                                 deadline_exc,
-                                _deadline_reason,
+                                gate_wait_reason,
                                 prior_exc=last_exc,
                             ) from exc
-                    gate_acquired = True
+                        admission_exc = _GateWaitTimeout(
+                            f"concurrency gate stayed saturated for "
+                            f"{gate_wait_timeout:.0f}s",
+                        )
+                        raise LLMCallExhausted(
+                            admission_exc, "gate_wait", prior_exc=last_exc,
+                        ) from exc
+                    slot_lease.enter_context(hold_until_settled(gate.release))
                     effective_timeout, attempt_deadline_reason = (
                         _effective_timeout_or_deadline_exhausted(
                             attempt=attempt, reason="post_gate",
                         )
                     )
+                # Generation budget starts once a slot is held; a same-attempt
+                # replay below draws from what is left of it.
+                attempt_deadline = time.monotonic() + effective_timeout
                 if attempt_delta is None:
-                    response = await asyncio.wait_for(
+                    response = await await_bounded(
                         _chat_active(effective_timeout),
-                        timeout=effective_timeout,
+                        effective_timeout,
+                        hold=True,
                     )
                 else:
                     response = await _stream_active(effective_timeout)
@@ -620,8 +658,7 @@ async def call_llm(
                                     reason="stream_empty_tool_arguments",
                                 )[0],
                                 max(
-                                    effective_timeout
-                                    - (stream_ended_at - attempt_started),
+                                    attempt_deadline - stream_ended_at,
                                     0.0,
                                 ),
                             )
@@ -633,9 +670,10 @@ async def call_llm(
                                     f"{effective_timeout:.0f}s attempt budget "
                                     f"left for the replay",
                                 )
-                            recovered = await asyncio.wait_for(
+                            recovered = await await_bounded(
                                 _chat_active(recovery_timeout),
-                                timeout=recovery_timeout,
+                                recovery_timeout,
+                                hold=True,
                             )
                         except Exception as exc:
                             # Recovery is opportunistic. Anything it raises —
@@ -707,8 +745,7 @@ async def call_llm(
                                 ),
                             }
             finally:
-                if gate is not None and gate_acquired:
-                    gate.release()
+                slot_lease.close()
             if _is_runaway_response(response):
                 last_runaway_reason = "reasoning_runaway"
                 if runaway_state is not None:

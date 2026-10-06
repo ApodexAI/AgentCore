@@ -11,8 +11,11 @@ from functools import partial
 from typing import Any, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from agent_core.messages import Message
+from agent_core.runtime.async_utils import await_bounded
 
 logger = logging.getLogger(__name__)
+# Passive observer tasks may be abandoned after this grace period.
+_OBSERVER_DRAIN_TIMEOUT_S = 5.0
 
 # Absolute monotonic soft deadline stored in execution-scope metadata.
 WALL_DEADLINE_MONOTONIC_KEY = "wall_deadline_monotonic"
@@ -654,14 +657,27 @@ async def notify_observers(
     return interventions
 
 
-async def drain_background_observers() -> None:
-    """Drain passive observer tasks owned by the current agent loop."""
+async def drain_background_observers(timeout_s: float = _OBSERVER_DRAIN_TIMEOUT_S) -> None:
+    """Drain passive observer tasks owned by the current agent loop.
+
+    A background observer that never returns must not hold loop teardown: the
+    tasks are abandoned (still tracked, their failures retrieved on
+    completion) once the grace period expires.
+    """
     owner = asyncio.current_task()
     if owner is None:
         return
     pending = [task for task in _background_tasks_by_owner.get(owner, ()) if not task.done()]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    if not pending:
+        return
+    drain = asyncio.gather(*pending, return_exceptions=True)
+    try:
+        await await_bounded(drain, timeout_s)
+    except TimeoutError:
+        logger.warning(
+            "%d background observer task(s) exceeded %.0fs and were abandoned",
+            len(pending), timeout_s,
+        )
 
 
 def merge_interventions(interventions: list[Intervention]) -> Intervention:

@@ -344,3 +344,80 @@ async def test_signature_only_byte_progress_preserves_stall_and_first_chunk_boun
             assert response.content[-1] == {"type": "text", "text": "done"}
             assert observed == ([("", "thinking")] if visible_reasoning else []) + [("done", "")]
         assert body.closed and not body.reading
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "chain", "cooldown_primary", "cooldown_fallback", "cooldown_degraded"])
+async def test_middleware_abort_keeps_gate_until_sdk_body_closes(monkeypatch, wrapper):
+    import contextlib
+
+    from agent_core.components.middleware.llm.base import LLMMiddleware, LLMMiddlewareChain
+    from agent_core.components.middleware.llm.proxy import LLMProxy
+    from agent_core.providers import _stream_activity as activity_module
+    from agent_core.providers.fallback import CooldownFallbackLLM
+    from agent_core.runtime import async_utils
+    from agent_core.runtime.loop import _call as call_module
+
+    entered, release, closed = (asyncio.Event() for _ in range(3))
+
+    class Body(_Body):
+        async def __aiter__(self):
+            yield _sse(_opening())
+            yield _sse({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""}})
+            yield _sse({"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": "hello"}})
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            entered.set()
+            while not release.is_set():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await release.wait()
+            await super().aclose()
+            closed.set()
+
+    class Abort(LLMMiddleware):
+        name = "abort"
+
+        async def on_chunk(self, *args):
+            return True
+
+    class Unavailable:
+        model = "unavailable"
+
+        async def stream(self, *args, **kwargs):
+            raise RuntimeError("unavailable")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(f"{__name__}._Body", Body)
+    monkeypatch.setattr(activity_module, "_CLEANUP_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(async_utils, "_STREAM_CLOSE_TIMEOUT_S", 0.03)
+    gate = asyncio.Semaphore(1)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    async with _client() as (client, body, _):
+        inner = client
+        if wrapper == "chain":
+            inner = LLMFallbackChain([FallbackEntry(model=client)])
+        elif wrapper.startswith("cooldown"):
+            inner = CooldownFallbackLLM(
+                Unavailable() if wrapper == "cooldown_degraded" else client,
+                client, max_retries=1,
+            )
+            if wrapper == "cooldown_fallback":
+                inner._cooldown_until = float("inf")
+        chain = LLMMiddlewareChain()
+        chain.add(Abort())
+        try:
+            response = await asyncio.wait_for(call_module.call_llm(
+                LLMProxy(inner, chain), [user_msg("hi")], 1, 1, 1, on_delta=_ignore,
+            ), 0.5)
+            assert response.content == "hello"
+            assert entered.is_set()
+            assert not closed.is_set() and not body.closed
+            assert gate._value == 0  # Cleanup is still live after the caller returns.
+        finally:
+            release.set()
+            await asyncio.wait_for(closed.wait(), 0.5)
+            for _ in range(10):
+                await asyncio.sleep(0)
+        assert gate._value == 1  # Released exactly once when all held I/O settles.
