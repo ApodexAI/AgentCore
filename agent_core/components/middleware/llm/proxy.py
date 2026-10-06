@@ -202,6 +202,11 @@ class LLMProxy:
                         extra_headers=extra_headers,
                         timeout=timeout,
                     ):
+                        if delta.transport_activity:
+                            # Keep the caller's stall watchdog alive without
+                            # committing this attempt or invoking output hooks.
+                            yield delta
+                            continue
                         full_content += delta.content or ""
                         full_reasoning += delta.reasoning_content or ""
                         any_chunk_yielded = True

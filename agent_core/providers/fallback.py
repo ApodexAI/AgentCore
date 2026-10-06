@@ -514,7 +514,8 @@ class CooldownFallbackLLM:
                     streaming=True,
                 )
                 async for delta in self.primary.stream(messages, **kwargs):
-                    yielded = True
+                    if not delta.transport_activity:
+                        yielded = True
                     yield delta
                 return
             except Exception as error:
@@ -689,7 +690,7 @@ class LLMFallbackChain:
         extra_headers: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> AsyncIterator[StreamDelta]:
-        # Try entries in order. We can only fail over BEFORE any chunk
+        # Try entries in order. We can only fail over BEFORE any model-output chunk
         # has been forwarded to the caller — once we yield, the consumer
         # has committed to that entry.
         last_exc: BaseException | None = None
@@ -710,14 +711,15 @@ class LLMFallbackChain:
                     # ``LLMResponse.response_metadata["provider_actually_used"]``
                     # (matching the non-streaming ``chat`` path's
                     # ``_stamp_metadata``). Constant for the whole stream —
-                    # failover only fires before the first yield, so every
-                    # delta below comes from this single committed entry.
+                    # transport activity alone does not commit an entry; output
+                    # and metadata below come from a single committed entry.
                     # ``fallback_used`` / ``model_actually_used`` still have no
                     # streaming landing spot; only the billing-critical provider
                     # is carried here.
-                    if entry.provider:
+                    if entry.provider and not delta.transport_activity:
                         delta.provider = entry.provider
-                    yielded_any = True
+                    if not delta.transport_activity:
+                        yielded_any = True
                     yield delta
                 return
             except Exception as exc:

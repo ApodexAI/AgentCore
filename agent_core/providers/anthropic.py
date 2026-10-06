@@ -21,6 +21,7 @@ Replaces ``langchain_anthropic.ChatAnthropic``. Anthropic gotchas handled here:
 from __future__ import annotations
 
 # pyright: basic, reportPrivateImportUsage=false
+import contextlib
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from typing import Any
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
+from agent_core.providers._stream_activity import stream_events_with_activity
 from agent_core.providers.finish_reason import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
@@ -252,116 +254,122 @@ class AnthropicClient(LLMClient):
         # ``thinking_format="content_block"`` could not replay.
         blocks: dict[int, dict[str, Any]] = {}
         stream, reset = await self._create_message(kwargs)
-        async for event in stream:
-            etype = getattr(event, "type", "")
-            if etype == "message_start":
-                msg = getattr(event, "message", None)
-                model = getattr(msg, "model", "") or model
-                u = getattr(msg, "usage", None)
-                if u is not None:
-                    input_tokens = getattr(u, "input_tokens", input_tokens)
-                    cr = getattr(u, "cache_read_input_tokens", None)
-                    if cr is not None:
-                        cache_read = cr
-                    cw = _anthropic_cache_write_tokens(u)
-                    if cw is not None:
-                        cache_write = cw
-            elif etype == "content_block_start":
-                cb = getattr(event, "content_block", None)
-                idx = getattr(event, "index", 0)
-                cbtype = getattr(cb, "type", "")
-                if cbtype == "tool_use":
-                    # Open a tool-call slot: id + name set once; arguments
-                    # arrive as ``input_json_delta`` partial-JSON fragments.
-                    # Also keep its position among signed thinking blocks.
-                    # Reordering tool calls changes the prefix of later thinking.
-                    blocks[idx] = {
-                        "type": "tool_use", "id": getattr(cb, "id", "") or "",
-                        "name": getattr(cb, "name", "") or "",
-                        "input": getattr(cb, "input", {}) or {},
-                    }
-                    yield StreamDelta(tool_call_deltas=[{
-                        "index": idx,
-                        "id": getattr(cb, "id", "") or "",
-                        "name": getattr(cb, "name", "") or "",
-                        "arguments": "",
-                    }])
-                elif cbtype == "text":
-                    blocks[idx] = {
-                        "type": "text",
-                        "text": getattr(cb, "text", "") or "",
-                    }
-                elif cbtype == "thinking":
-                    blocks[idx] = {
-                        "type": "thinking",
-                        "thinking": getattr(cb, "thinking", "") or "",
-                        "signature": getattr(cb, "signature", "") or "",
-                    }
-                elif cbtype == "redacted_thinking":
-                    # Whole payload lands on the start event — no deltas follow.
-                    blocks[idx] = {
-                        "type": "redacted_thinking",
-                        "data": getattr(cb, "data", "") or "",
-                    }
-            elif etype == "content_block_delta":
-                d = getattr(event, "delta", None)
-                dtype = getattr(d, "type", "")
-                idx = getattr(event, "index", 0)
-                if dtype == "text_delta":
-                    chunk = getattr(d, "text", "") or ""
-                    blk = blocks.get(idx)
-                    if blk is not None and blk.get("type") == "text":
-                        blk["text"] += chunk
-                    yield StreamDelta(content=chunk)
-                elif dtype == "thinking_delta":
-                    chunk = getattr(d, "thinking", "") or ""
-                    blk = blocks.get(idx)
-                    if blk is not None and blk.get("type") == "thinking":
-                        blk["thinking"] += chunk
-                    yield StreamDelta(reasoning_content=chunk)
-                elif dtype == "signature_delta":
-                    # The signature is a single opaque token, not an
-                    # incremental text stream, but it is appended rather than
-                    # assigned so a provider that ever chunks it still
-                    # reassembles correctly.
-                    blk = blocks.get(idx)
-                    if blk is not None and blk.get("type") == "thinking":
-                        blk["signature"] += getattr(d, "signature", "") or ""
-                elif dtype == "input_json_delta":
-                    blk = blocks.get(idx)
-                    if blk is not None and blk.get("type") == "tool_use":
-                        blk["_partial_json"] = (
-                            blk.get("_partial_json", "")
-                            + (getattr(d, "partial_json", "") or "")
-                        )
-                    yield StreamDelta(tool_call_deltas=[{
-                        "index": idx,
-                        "id": None,
-                        "name": None,
-                        "arguments": getattr(d, "partial_json", "") or "",
-                    }])
-            elif etype == "message_delta":
-                d = getattr(event, "delta", None)
-                stop_reason = getattr(d, "stop_reason", "") or stop_reason
-                # A classifier refusal ends the stream here, with the detail on
-                # the same delta that carries the stop reason. Captured so the
-                # streamed turn reports it exactly like the non-streaming one.
-                details = _anthropic_stop_details(d)
-                if details is not None:
-                    stop_details = details
-                u = getattr(event, "usage", None)
-                if u is not None:
-                    ot = getattr(u, "output_tokens", None)
-                    if ot is not None:
-                        output_tokens = ot
-                    # ``output_tokens_details.thinking_tokens`` when the payload
-                    # carries it; without this the streamed path reported no
-                    # ``reasoning_tokens`` at all while the non-streaming path
-                    # did, splitting one model's thinking spend across two
-                    # differently-shaped usage dicts.
-                    rt = _anthropic_reasoning_tokens(u)
-                    if rt is not None:
-                        reasoning_tokens = rt
+        async with contextlib.aclosing(stream_events_with_activity(stream)) as events:
+            async for event in events:
+                if event is None:
+                    # Transport activity resets the loop's stall timer without
+                    # fabricating text, reasoning, tool calls or observer deltas.
+                    yield StreamDelta(transport_activity=True)
+                    continue
+                etype = getattr(event, "type", "")
+                if etype == "message_start":
+                    msg = getattr(event, "message", None)
+                    model = getattr(msg, "model", "") or model
+                    u = getattr(msg, "usage", None)
+                    if u is not None:
+                        input_tokens = getattr(u, "input_tokens", input_tokens)
+                        cr = getattr(u, "cache_read_input_tokens", None)
+                        if cr is not None:
+                            cache_read = cr
+                        cw = _anthropic_cache_write_tokens(u)
+                        if cw is not None:
+                            cache_write = cw
+                elif etype == "content_block_start":
+                    cb = getattr(event, "content_block", None)
+                    idx = getattr(event, "index", 0)
+                    cbtype = getattr(cb, "type", "")
+                    if cbtype == "tool_use":
+                        # Open a tool-call slot: id + name set once; arguments
+                        # arrive as ``input_json_delta`` partial-JSON fragments.
+                        # Also keep its position among signed thinking blocks.
+                        # Reordering tool calls changes the prefix of later thinking.
+                        blocks[idx] = {
+                            "type": "tool_use", "id": getattr(cb, "id", "") or "",
+                            "name": getattr(cb, "name", "") or "",
+                            "input": getattr(cb, "input", {}) or {},
+                        }
+                        yield StreamDelta(tool_call_deltas=[{
+                            "index": idx,
+                            "id": getattr(cb, "id", "") or "",
+                            "name": getattr(cb, "name", "") or "",
+                            "arguments": "",
+                        }])
+                    elif cbtype == "text":
+                        blocks[idx] = {
+                            "type": "text",
+                            "text": getattr(cb, "text", "") or "",
+                        }
+                    elif cbtype == "thinking":
+                        blocks[idx] = {
+                            "type": "thinking",
+                            "thinking": getattr(cb, "thinking", "") or "",
+                            "signature": getattr(cb, "signature", "") or "",
+                        }
+                    elif cbtype == "redacted_thinking":
+                        # Whole payload lands on the start event — no deltas follow.
+                        blocks[idx] = {
+                            "type": "redacted_thinking",
+                            "data": getattr(cb, "data", "") or "",
+                        }
+                elif etype == "content_block_delta":
+                    d = getattr(event, "delta", None)
+                    dtype = getattr(d, "type", "")
+                    idx = getattr(event, "index", 0)
+                    if dtype == "text_delta":
+                        chunk = getattr(d, "text", "") or ""
+                        blk = blocks.get(idx)
+                        if blk is not None and blk.get("type") == "text":
+                            blk["text"] += chunk
+                        yield StreamDelta(content=chunk)
+                    elif dtype == "thinking_delta":
+                        chunk = getattr(d, "thinking", "") or ""
+                        blk = blocks.get(idx)
+                        if blk is not None and blk.get("type") == "thinking":
+                            blk["thinking"] += chunk
+                        yield StreamDelta(reasoning_content=chunk)
+                    elif dtype == "signature_delta":
+                        # The signature is a single opaque token, not an
+                        # incremental text stream, but it is appended rather than
+                        # assigned so a provider that ever chunks it still
+                        # reassembles correctly.
+                        blk = blocks.get(idx)
+                        if blk is not None and blk.get("type") == "thinking":
+                            blk["signature"] += getattr(d, "signature", "") or ""
+                    elif dtype == "input_json_delta":
+                        blk = blocks.get(idx)
+                        if blk is not None and blk.get("type") == "tool_use":
+                            blk["_partial_json"] = (
+                                blk.get("_partial_json", "")
+                                + (getattr(d, "partial_json", "") or "")
+                            )
+                        yield StreamDelta(tool_call_deltas=[{
+                            "index": idx,
+                            "id": None,
+                            "name": None,
+                            "arguments": getattr(d, "partial_json", "") or "",
+                        }])
+                elif etype == "message_delta":
+                    d = getattr(event, "delta", None)
+                    stop_reason = getattr(d, "stop_reason", "") or stop_reason
+                    # A classifier refusal ends the stream here, with the detail on
+                    # the same delta that carries the stop reason. Captured so the
+                    # streamed turn reports it exactly like the non-streaming one.
+                    details = _anthropic_stop_details(d)
+                    if details is not None:
+                        stop_details = details
+                    u = getattr(event, "usage", None)
+                    if u is not None:
+                        ot = getattr(u, "output_tokens", None)
+                        if ot is not None:
+                            output_tokens = ot
+                        # ``output_tokens_details.thinking_tokens`` when the payload
+                        # carries it; without this the streamed path reported no
+                        # ``reasoning_tokens`` at all while the non-streaming path
+                        # did, splitting one model's thinking spend across two
+                        # differently-shaped usage dicts.
+                        rt = _anthropic_reasoning_tokens(u)
+                        if rt is not None:
+                            reasoning_tokens = rt
         # Terminal delta: fold the accumulated usage/finish/model onto the
         # assembled ``LLMResponse`` (mirrors OpenAI's empty-choices chunk).
         # ``reasoning_blocks`` is sent ONLY for a thinking turn — for a plain

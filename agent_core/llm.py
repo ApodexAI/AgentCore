@@ -75,6 +75,9 @@ class StreamDelta:
     # A successful provider recovery discarded historical signed reasoning.
     # The loop must reset it before appending the newly generated blocks.
     thinking_history_reset: bool = False
+    # HTTP progress without model output (e.g. Anthropic SSE pings). Keeps
+    # stall guards alive without committing a provider fallback leg.
+    transport_activity: bool = False
 
 
 @runtime_checkable
