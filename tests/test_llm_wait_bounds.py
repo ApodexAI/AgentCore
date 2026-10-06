@@ -131,28 +131,81 @@ async def test_gate_wait_without_optional_deadlines_is_bounded_and_reusable(monk
             await task
 
 
-async def test_gate_wait_and_provider_share_one_attempt_budget(monkeypatch):
+async def test_gate_wait_does_not_shrink_generation_budget(monkeypatch):
     gate = asyncio.Semaphore(0)
     monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
     provider_timeouts = []
 
     async def chat(messages, **kwargs):
         provider_timeouts.append(kwargs["timeout"])
-        await asyncio.sleep(0.1)
-        return LLMResponse(content="late")
+        await asyncio.sleep(0.06)
+        return LLMResponse(content="ok")
 
     async def release_slot():
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0.06)
+        gate.release()
+
+    release = asyncio.create_task(release_slot())
+    response = await call_module.call_llm(SimpleNamespace(model="test", chat=chat),
+                                          [user_msg("hi")], 0.09, 1, 1)
+    await release
+    # Queued 0.06s of a 0.09s attempt, then generated for 0.06s: queue time
+    # is not charged to generation.
+    assert response.content == "ok"
+    assert provider_timeouts == [0.09]
+    assert gate._value == 1
+
+
+async def test_gate_wait_timeout_requeues_without_backoff(monkeypatch):
+    gate = asyncio.Semaphore(0)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    monkeypatch.setenv("AGENT_CORE_LLM_GATE_WAIT_S", "0.03")
+    monkeypatch.setattr(call_module, "_default_backoff", lambda attempt: 60.0)
+    events = []
+
+    async def on_attempt(event):
+        events.append(event)
+
+    async def chat(messages, **kwargs):
+        return LLMResponse(content="ok")
+
+    async def release_slot():
+        await asyncio.sleep(0.05)
         gate.release()
 
     release = asyncio.create_task(release_slot())
     start = time.monotonic()
+    response = await call_module.call_llm(SimpleNamespace(model="test", chat=chat),
+                                          [user_msg("hi")], 5, 3, 1,
+                                          on_attempt=on_attempt)
+    await release
+    assert response.content == "ok"
+    assert time.monotonic() - start < 1, "admission timeout must not back off"
+    finished = [e for e in events if e["phase"] == "finished"]
+    assert finished[0]["reason"] == "gate_wait"
+    assert gate._value == 1
+
+
+async def test_gate_slot_held_until_abandoned_provider_settles(monkeypatch):
+    gate = asyncio.Semaphore(1)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    release = asyncio.Event()
+
+    async def chat(messages, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()  # Cancellation-resistant transport cleanup.
+            raise
+
     with pytest.raises(LLMCallExhausted):
         await call_module.call_llm(SimpleNamespace(model="test", chat=chat),
-                                   [user_msg("hi")], 0.09, 1, 1)
-    await release
-    assert 0 < provider_timeouts[0] < 0.07
-    assert time.monotonic() - start < 0.2
+                                   [user_msg("hi")], 0.03, 1, 1)
+    # The caller returned at its deadline, but the request is still live.
+    assert gate._value == 0
+    release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
     assert gate._value == 1
 
 
@@ -217,23 +270,29 @@ async def test_real_sdk_blocked_close_cannot_hold_total_timeout(monkeypatch, pro
             def stream(self, *_args, **_kwargs):
                 return stream
 
-        task = asyncio.create_task(streaming_module._stream_llm_response(
-            AlreadyOpened(), [user_msg("hi")], 0.03, _ignore,
-        ))
+        from agent_core.runtime.async_utils import hold_until_settled
+
+        slot_released = []
+        # As under the concurrency gate: the slot outlives the caller's return
+        # until the abandoned transport close actually finishes.
         try:
-            await asyncio.wait_for(entered.wait(), 0.2)
-            done, _ = await asyncio.wait({task}, timeout=0.2)
-            assert task in done
-            with pytest.raises(TimeoutError):
-                await task
+            with hold_until_settled(lambda: slot_released.append(True)):
+                task = asyncio.create_task(streaming_module._stream_llm_response(
+                    AlreadyOpened(), [user_msg("hi")], 0.03, _ignore,
+                ))
+                await asyncio.wait_for(entered.wait(), 0.2)
+                done, _ = await asyncio.wait({task}, timeout=0.2)
+                assert task in done
+                with pytest.raises(TimeoutError):
+                    await task
             assert not finished.is_set()
+            assert slot_released == []
         finally:
             release.set()
             await asyncio.wait_for(finished.wait(), 0.2)
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
-                await task
+        for _ in range(10):
             await asyncio.sleep(0)
+        assert slot_released == [True]
         assert body.closed and not body.reading
 
 
@@ -274,7 +333,7 @@ async def test_gate_time_is_not_subtracted_twice_from_tool_argument_replay(monke
 
     class Gate:
         async def acquire(self):
-            clock[0] += 40
+            clock[0] += 40  # Queue time: must not shrink either budget.
 
         def release(self):
             pass
@@ -297,7 +356,7 @@ async def test_gate_time_is_not_subtracted_twice_from_tool_argument_replay(monke
         SimpleNamespace(model="test", chat=chat), [user_msg("hi")], 100, 1, 1,
         on_delta=_ignore,
     )
-    assert read_timeouts == [60, 30]
+    assert read_timeouts == [100, 70]
     assert response.content == "repaired"
     assert response.response_metadata["stream_empty_args_fallback"] is True
 
@@ -310,11 +369,11 @@ async def test_external_cancellation_during_normal_eof_cleanup_propagates(monkey
     entered = asyncio.Event()
     original_wait = _stream_activity.await_bounded
 
-    async def wait_at_reader_cleanup(operation, timeout):
+    async def wait_at_reader_cleanup(operation, timeout, **kwargs):
         if isinstance(operation, asyncio.Task):
             entered.set()
             await asyncio.Event().wait()
-        return await original_wait(operation, timeout)
+        return await original_wait(operation, timeout, **kwargs)
 
     monkeypatch.setattr(_stream_activity, "await_bounded", wait_at_reader_cleanup)
 
@@ -362,3 +421,89 @@ async def test_cancelled_bounded_waiter_retrieves_already_failed_future():
         await task
     # asyncio would otherwise report "Future exception was never retrieved".
     assert not future._log_traceback
+
+
+async def test_slow_stream_after_hook_does_not_starve_later_hooks(monkeypatch):
+    from agent_core.components.middleware.llm.base import LLMMiddleware
+
+    monkeypatch.setattr(proxy_module, "_HOOK_TIMEOUT_S", 0.03)
+    ran = []
+
+    class Slow(LLMMiddleware):
+        name = "slow"
+
+        async def after_llm(self, ctx, response):
+            await asyncio.Event().wait()
+
+    class Accounting(LLMMiddleware):
+        name = "accounting"
+
+        async def after_llm(self, ctx, response):
+            ran.append(response.content)
+            return response
+
+    class Inner:
+        model = "test"
+
+        async def stream(self, messages, **kwargs):
+            yield StreamDelta(content="done")
+
+    chain = LLMMiddlewareChain()
+    chain.add(Accounting())  # after hooks run in reverse: Slow first.
+    chain.add(Slow())
+    start = time.monotonic()
+    deltas = [d async for d in LLMProxy(Inner(), chain).stream([user_msg("hi")])]
+    assert [d.content for d in deltas] == ["done"]
+    assert ran == ["done"]
+    assert time.monotonic() - start < 0.5
+
+
+async def test_background_observer_drain_is_bounded():
+    from agent_core import loop_types as lt
+
+    release = asyncio.Event()
+
+    async def stuck():
+        await release.wait()
+
+    owner = asyncio.current_task()
+    task = asyncio.create_task(stuck())
+    lt._background_tasks_by_owner.setdefault(owner, set()).add(task)
+    try:
+        start = time.monotonic()
+        await lt.drain_background_observers(timeout_s=0.03)
+        assert time.monotonic() - start < 0.5
+    finally:
+        lt._background_tasks_by_owner.pop(owner, None)
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_lease_releases_once_after_block_and_held_tasks():
+    from agent_core.runtime.async_utils import hold_until_settled
+
+    released = []
+    gate = asyncio.Event()
+
+    async def resistant():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await gate.wait()
+            raise
+
+    with hold_until_settled(lambda: released.append(True)):
+        with pytest.raises(TimeoutError):
+            await await_bounded(resistant(), 0.01, hold=True)
+        with pytest.raises(TimeoutError):
+            await await_bounded(resistant(), 0.01)  # Not held: no effect.
+    assert released == []
+    gate.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert released == [True]
+
+    with hold_until_settled(lambda: released.append(True)):
+        pass
+    assert released == [True, True]

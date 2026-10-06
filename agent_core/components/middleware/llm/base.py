@@ -11,6 +11,7 @@ from typing import Any
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
 from agent_core.retry_policy import LEGACY_RETRYABLE_KEYWORDS, legacy_retryable
+from agent_core.runtime.async_utils import await_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -175,11 +176,29 @@ class LLMMiddlewareChain:
         self,
         ctx: LLMCallContext,
         response: LLMResponse,
+        *,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
+        """Run ``after_llm`` hooks in reverse order.
+
+        ``timeout_s`` bounds each hook separately: a slow hook is skipped
+        (its input passes through) without starving the hooks after it.
+        """
         for mw in reversed(self._middlewares):
             if mw.enabled:
                 try:
-                    response = await mw.after_llm(ctx, response)
+                    if timeout_s is None:
+                        response = await mw.after_llm(ctx, response)
+                    else:
+                        try:
+                            response = await await_bounded(
+                                mw.after_llm(ctx, response), timeout_s,
+                            )
+                        except TimeoutError:
+                            logger.warning(
+                                "LLMMiddleware %s.after_llm exceeded %.1fs; skipped",
+                                mw.name, timeout_s,
+                            )
                 except Exception:
                     logger.exception(
                         "LLMMiddleware %s.after_llm failed",

@@ -378,7 +378,9 @@ async def _stream_llm_response(
 
     async def _close_chunk_stream() -> None:
         with contextlib.suppress(Exception):
-            await await_bounded(chunk_stream.aclose(), _CLEANUP_TIMEOUT_S)
+            await await_bounded(
+                chunk_stream.aclose(), _CLEANUP_TIMEOUT_S, hold=True,
+            )
 
     try:
         async with asyncio.timeout(timeout):

@@ -150,7 +150,7 @@ async def stream_events_with_activity(
         reader.cancel()
         try:
             try:
-                await await_bounded(reader, _CLEANUP_TIMEOUT_S)
+                await await_bounded(reader, _CLEANUP_TIMEOUT_S, hold=True)
             except asyncio.CancelledError:
                 # The reader is intentionally cancelled; a NEW cancellation of
                 # the consumer during this wait must still propagate.
@@ -161,4 +161,4 @@ async def stream_events_with_activity(
         finally:
             remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
             with contextlib.suppress(TimeoutError):
-                await await_bounded(stream.close(), remaining)
+                await await_bounded(stream.close(), remaining, hold=True)

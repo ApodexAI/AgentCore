@@ -265,16 +265,19 @@ class LLMProxy:
             ctx.metadata["duration_ms"] = duration_ms
             if stream_error:
                 ctx.metadata["error"] = str(stream_error)
-            try:
-                await await_bounded(self.chain.run_after(
-                    ctx,
-                    LLMResponse(
-                        content=full_content,
-                        reasoning_content=full_reasoning,
-                    ),
-                ), _HOOK_TIMEOUT_S)
-            except TimeoutError:
-                logger.warning("LLM stream after hooks exceeded their cleanup deadline")
+            # Stream after hooks are passive (their result is discarded), so
+            # each one gets a bounded grace period instead of the whole chain
+            # sharing one: a slow hook cannot starve rate-limit or usage
+            # accounting hooks behind it. Non-streaming hooks may rewrite the
+            # response (e.g. output repair) and stay unbounded.
+            await self.chain.run_after(
+                ctx,
+                LLMResponse(
+                    content=full_content,
+                    reasoning_content=full_reasoning,
+                ),
+                timeout_s=_HOOK_TIMEOUT_S,
+            )
 
     def __getattr__(self, name: str) -> Any:
         # Defer unknown attributes to the inner client so callers that

@@ -312,3 +312,39 @@ async def test_summary_external_cancellation_does_not_retry(monkeypatch):
         await task
     await asyncio.wait_for(closed.wait(), 0.2)
     assert posts == [True]
+
+
+@pytest.mark.asyncio
+async def test_total_timeout_is_an_httpx_timeout_and_separately_configurable(monkeypatch):
+    seen = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            seen.append(kwargs["timeout"])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            await asyncio.sleep(1)
+
+    errors = []
+
+    def retryable(error):
+        errors.append(error)
+        return isinstance(error, httpx.TimeoutException)
+
+    monkeypatch.setattr(summary_mod.httpx, "AsyncClient", Client)
+    engine = SummaryLLMEngine(request_timeout=30, total_timeout=0.03, max_retries=2,
+                              retryable=retryable, sleep=lambda s: asyncio.sleep(0))
+    result = await asyncio.wait_for(engine.summarize(
+        "content", "focus", [{"endpoint": "https://slow", "model": "slow"}],
+    ), 0.5)
+    assert seen == [30, 30]  # Per-phase httpx timeout is unchanged.
+    assert len(errors) == 2  # Host predicates written for httpx still retry.
+    assert all(isinstance(e, summary_mod.SummaryRequestTimeout) for e in errors)
+    assert all(isinstance(e, TimeoutError) for e in errors)
+    assert result == "content"  # Truncation fallback.
