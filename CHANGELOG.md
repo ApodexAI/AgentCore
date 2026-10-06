@@ -13,6 +13,11 @@ Versioning follows [docs/versioning.md](docs/versioning.md).
 
 - Anthropic streaming now forwards actual HTTP activity, including SSE heartbeats that the SDK filters out, as empty progress deltas. Healthy requests using omitted thinking can exceed the stream stall window while retaining their configured total call timeout. Silent connections still trigger the stall guard, and cancellation closes both the response and the event-reader task. No configuration migration is required.
 
+- Bound LLM admission waits, tracing and cancellation cleanup, and enforce total summary request deadlines so stalled hooks, transports or slow response bytes cannot indefinitely hold a call. Concurrency-gate admission is bounded by `LLM_GATE_WAIT_S` (disabled by default; logical/wall deadlines still apply) without shrinking the generation budget, ends with reason `gate_wait` on explicit admission expiry without re-queueing or spending provider retries, and a gate slot is returned only after an abandoned provider request or stream close settles. Streamed `after_llm` hooks get a per-hook grace period; background observer drain at loop end is bounded. `SummaryLLMEngine` gains `total_timeout` (default `request_timeout`) and raises `SummaryRequestTimeout`, an `httpx.TimeoutException` and `TimeoutError`. Bounded closes finalize async generators in a helper task, so provider/LLM wrapper generators must not hold an `asyncio.timeout` or anyio cancel scope across a `yield`.
+
+  Middleware and fallback stream wrappers explicitly close their delegated streams before leaving the admission lease, retaining the slot until abandoned provider cleanup settles even when middleware truncates a stream.
+- Preserve OpenAI-compatible Chat Completions and Responses streaming transport heartbeats through SDK filtering, preventing false stall timeouts during silent reasoning while retaining total deadlines, cleanup, retry and fallback semantics. Transport heartbeats no longer satisfy an armed first-chunk (TTFT) bound or count toward `chunks_seen`; they extend the inter-chunk stall window only after real output, or when no first-chunk bound is set. Unrecognised response byte streams are left unobserved instead of failing, and heartbeats are no longer emitted alongside every parsed event.
+
 ## [0.14.0] - 2026-10-06
 
 ### Added
