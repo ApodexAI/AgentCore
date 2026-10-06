@@ -17,9 +17,11 @@ from agent_core.execution_context import (
 )
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
+from agent_core.runtime.async_utils import await_bounded
 
 logger = logging.getLogger(__name__)
 __all__ = ["LLMProxy"]
+_HOOK_TIMEOUT_S = 5.0
 
 
 async def _log_llm_exception(
@@ -40,7 +42,7 @@ async def _log_llm_exception(
         tracer: TraceSink | None = registry.get_optional(TraceSink)
         if not tracer:
             return
-        await tracer.log_api_error(
+        await await_bounded(tracer.log_api_error(
             task_id=ctx.task_id or "unknown",
             agent_role_id=ctx.role_id or "default",
             error=str(error),
@@ -51,7 +53,7 @@ async def _log_llm_exception(
                 "phase_id": ctx.phase_id,
                 "call_index": ctx.call_index,
             },
-        )
+        ), _HOOK_TIMEOUT_S)
     except Exception:
         logger.debug("Failed to log LLM exception", exc_info=True)
 
@@ -263,13 +265,16 @@ class LLMProxy:
             ctx.metadata["duration_ms"] = duration_ms
             if stream_error:
                 ctx.metadata["error"] = str(stream_error)
-            await self.chain.run_after(
-                ctx,
-                LLMResponse(
-                    content=full_content,
-                    reasoning_content=full_reasoning,
-                ),
-            )
+            try:
+                await await_bounded(self.chain.run_after(
+                    ctx,
+                    LLMResponse(
+                        content=full_content,
+                        reasoning_content=full_reasoning,
+                    ),
+                ), _HOOK_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning("LLM stream after hooks exceeded their cleanup deadline")
 
     def __getattr__(self, name: str) -> Any:
         # Defer unknown attributes to the inner client so callers that

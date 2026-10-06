@@ -1,0 +1,1 @@
+Bound LLM admission waits, tracing and cancellation cleanup, share attempt budgets between queueing and generation, and enforce total summary request deadlines so stalled hooks, transports or slow response bytes cannot indefinitely hold a call.

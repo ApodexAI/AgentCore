@@ -34,6 +34,7 @@ from agent_core.runtime.retriable import (
     is_transient_network,
 )
 
+from ..async_utils import await_bounded
 from ._bind import _ensure_bound
 from ._response import _visible_response_text, extract_usage
 from ._runaway import (
@@ -55,6 +56,7 @@ from ._streaming import (
 from .tool_call_recovery import stream_tool_calls_missing_required_arguments
 
 logger = logging.getLogger(__name__)
+_OBSERVATION_TIMEOUT_S = 5.0
 
 
 def _get_retry_after(exc: Exception) -> float | None:
@@ -271,6 +273,10 @@ async def call_llm(
     deadline through ``wall_deadline_remaining``; AgentCore never imports a
     product's context-local storage.
 
+    The per-attempt ``timeout`` includes admission queueing and any same-attempt
+    tool-argument replay. Cleanup and passive observation have separate bounded
+    grace periods so cancellation cannot wait indefinitely for I/O finalizers.
+
     Callers wrap with try/except :class:`LLMCallExhausted` and decide
     whether to surface (chain advance) or degrade (partial content).
     """
@@ -367,7 +373,7 @@ async def call_llm(
         if on_attempt is None:
             return
         try:
-            await on_attempt(event)
+            await await_bounded(on_attempt(event), _OBSERVATION_TIMEOUT_S)
         except Exception:
             # Attempt observability is passive. A broken consumer must not
             # turn a valid provider response into an LLM failure.
@@ -425,6 +431,7 @@ async def call_llm(
         physical_attempt_index += 1
         attempt_index = physical_attempt_index
         attempt_started = time.monotonic()
+        attempt_deadline = attempt_started + effective_timeout
         attempt_first_delta: float | None = None
         active_cap = (
             getattr(llm_active, "max_tokens", None)
@@ -550,42 +557,55 @@ async def call_llm(
             try:
                 if gate is not None:
                     deadline_remaining, _deadline_reason = _nearest_deadline()
-                    gate_wait_timeout = None
+                    # Admission consumes this physical attempt's budget even
+                    # without an opt-in logical or product wall deadline.
+                    gate_wait_timeout = max(
+                        attempt_deadline - time.monotonic(), 0.0,
+                    )
+                    gate_wait_reason = ""
                     if deadline_remaining is not None:
-                        gate_wait_timeout = (
+                        deadline_wait_timeout = (
                             deadline_remaining - _WALL_DEADLINE_FLOOR_S
                         )
-                        if gate_wait_timeout <= 0:
+                        if deadline_wait_timeout <= 0:
                             _effective_timeout_or_deadline_exhausted(
                                 attempt=attempt, reason="gate_wait",
                             )
-                    if gate_wait_timeout is None:
-                        await gate.acquire()
-                    else:
-                        try:
-                            await asyncio.wait_for(
-                                gate.acquire(), timeout=gate_wait_timeout,
-                            )
-                        except TimeoutError as exc:
+                        if deadline_wait_timeout < gate_wait_timeout:
+                            gate_wait_timeout = deadline_wait_timeout
+                            gate_wait_reason = _deadline_reason
+                    try:
+                        await asyncio.wait_for(
+                            gate.acquire(), timeout=gate_wait_timeout,
+                        )
+                    except TimeoutError as exc:
+                        if gate_wait_reason:
                             deadline_exc = LLMDeadlineExceeded(
-                                _deadline_reason,
+                                gate_wait_reason,
                                 "concurrency-gate wait consumed the remaining budget",
                             )
                             raise LLMCallExhausted(
                                 deadline_exc,
-                                _deadline_reason,
+                                gate_wait_reason,
                                 prior_exc=last_exc,
                             ) from exc
+                        raise
                     gate_acquired = True
                     effective_timeout, attempt_deadline_reason = (
                         _effective_timeout_or_deadline_exhausted(
                             attempt=attempt, reason="post_gate",
                         )
                     )
+                    effective_timeout = min(
+                        effective_timeout,
+                        attempt_deadline - time.monotonic(),
+                    )
+                    if effective_timeout <= 0:
+                        raise TimeoutError("admission consumed the attempt budget")
                 if attempt_delta is None:
-                    response = await asyncio.wait_for(
+                    response = await await_bounded(
                         _chat_active(effective_timeout),
-                        timeout=effective_timeout,
+                        effective_timeout,
                     )
                 else:
                     response = await _stream_active(effective_timeout)
@@ -620,22 +640,21 @@ async def call_llm(
                                     reason="stream_empty_tool_arguments",
                                 )[0],
                                 max(
-                                    effective_timeout
-                                    - (stream_ended_at - attempt_started),
+                                    attempt_deadline - stream_ended_at,
                                     0.0,
                                 ),
                             )
                             if _stream_recovery_budget_too_small(
-                                recovery_timeout, float(effective_timeout),
+                                recovery_timeout, attempt_deadline - attempt_started,
                             ):
                                 raise TimeoutError(
                                     f"only {recovery_timeout:.0f}s of the "
                                     f"{effective_timeout:.0f}s attempt budget "
                                     f"left for the replay",
                                 )
-                            recovered = await asyncio.wait_for(
+                            recovered = await await_bounded(
                                 _chat_active(recovery_timeout),
-                                timeout=recovery_timeout,
+                                recovery_timeout,
                             )
                         except Exception as exc:
                             # Recovery is opportunistic. Anything it raises —

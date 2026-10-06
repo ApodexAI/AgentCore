@@ -9,6 +9,10 @@ from typing import Any
 
 import httpx
 
+from agent_core.runtime.async_utils import await_bounded
+
+_CLEANUP_TIMEOUT_S = 5.0
+
 
 class _ActivityByteStream(httpx.AsyncByteStream):
     def __init__(self, inner: Any, on_bytes: Callable[[], None]) -> None:
@@ -87,7 +91,21 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
                 break
             yield event
     finally:
+        deadline = asyncio.get_running_loop().time() + _CLEANUP_TIMEOUT_S
+        caller = asyncio.current_task()
+        cancellations = caller.cancelling() if caller is not None else 0
         reader.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await reader
-        await stream.close()
+        try:
+            try:
+                await await_bounded(reader, _CLEANUP_TIMEOUT_S)
+            except asyncio.CancelledError:
+                # The reader is intentionally cancelled; a NEW cancellation of
+                # the consumer during this wait must still propagate.
+                if caller is not None and caller.cancelling() > cancellations:
+                    raise
+            except Exception:
+                pass
+        finally:
+            remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
+            with contextlib.suppress(TimeoutError):
+                await await_bounded(stream.close(), remaining)

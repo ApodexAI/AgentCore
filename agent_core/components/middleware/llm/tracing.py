@@ -10,9 +10,11 @@ from agent_core.components.middleware.llm.base import (
 )
 from agent_core.llm import LLMResponse
 from agent_core.messages import Message, text_of
+from agent_core.runtime.async_utils import await_bounded
 
 logger = logging.getLogger(__name__)
 _START_TIME_KEY = "_llm_tracing_start_monotonic"
+_TRACE_TIMEOUT_S = 5.0
 
 
 class LLMTracingMiddleware(LLMMiddleware):
@@ -75,7 +77,7 @@ class LLMTracingMiddleware(LLMMiddleware):
                     metadata["correlation_id"] = ctx.metadata["correlation_id"]
 
                 output_text = text_of(response.content)
-                await self._trace.log_llm_call(
+                await await_bounded(self._trace.log_llm_call(
                     task_id=ctx.task_id or "unknown",
                     agent_role_id=ctx.role_id,
                     action=f"llm_call:{ctx.call_index}",
@@ -86,7 +88,7 @@ class LLMTracingMiddleware(LLMMiddleware):
                     prompt_id=ctx.metadata.get("prompt_id"),
                     step_id=ctx.metadata.get("step_id"),
                     metadata=metadata,
-                )
+                ), _TRACE_TIMEOUT_S)
             except Exception:
                 logger.debug("LLMTracingMiddleware.after_llm logging failed", exc_info=True)
         return response

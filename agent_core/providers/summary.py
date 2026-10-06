@@ -11,6 +11,8 @@ from typing import Any, NotRequired, TypedDict
 
 import httpx
 
+from agent_core.runtime.async_utils import await_bounded
+
 logger = logging.getLogger(__name__)
 
 
@@ -195,14 +197,14 @@ class SummaryLLMEngine:
         headers.update(candidate.get("extra_headers") or {})
 
         current_content = content
+
+        async def post_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                return await client.post(endpoint, headers=headers, json=payload)
+
         for attempt in range(self.max_retries):
             try:
-                async with httpx.AsyncClient(timeout=self.request_timeout) as client:
-                    response = await client.post(
-                        endpoint,
-                        headers=headers,
-                        json=payload,
-                    )
+                response = await await_bounded(post_request(), self.request_timeout)
                 body = response.text
                 if response.status_code >= 400 and (
                     "maximum context length" in body
