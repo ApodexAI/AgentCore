@@ -16,7 +16,7 @@ from anthropic import AsyncAnthropic, BadRequestError, DefaultAsyncHttpxClient
 
 from agent_core.components.observers.trajectory import TrajectoryFileObserver
 from agent_core.loop_types import LoopConfig, LoopPolicy
-from agent_core.messages import assistant_msg, tool_msg, user_msg
+from agent_core.messages import assistant_msg, text_of, tool_msg, user_msg
 from agent_core.providers.anthropic import AnthropicClient, _to_anthropic_msg
 from agent_core.providers.protocol_client import build_protocol_client
 from agent_core.runtime.loop._streaming import _stream_llm_response
@@ -307,3 +307,40 @@ async def test_partial_refusal_reaches_both_trajectory_formats(model, streaming,
         assert item["content"] == "Partial output"
         assert item["finish_reason"] == "refusal"
         assert item["stop_details"] == details
+
+
+@pytest.mark.parametrize("blank", ["", " \n\t"])
+async def test_blank_wrapper_response_retries_with_valid_anthropic_history(blank):
+    """A product-rebuilt blank must not become an invalid assistant prefill."""
+    from agent_core.llm import LLMResponse
+
+    async with _client("claude-fable-5-1", _payload(
+        "claude-fable-5-1", content=[{"type": "text", "text": "finished"}],
+    )) as (client, requests):
+        class BlankFirst:
+            model = client.model
+            calls = 0
+
+            async def chat(self, messages, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(content=blank)
+                return await client.chat(messages, **kwargs)
+
+        llm = BlankFirst()
+        result = await run_agent_loop(
+            system_prompt="s", user_message="u", llm=llm, tools=[],
+            config=LoopConfig(max_turns=1, max_llm_retries=1),
+            model_profile=ModelProfile(
+                model_id=client.model, provider="anthropic", protocol="anthropic",
+                thinking_format="content_block",
+            ),
+        )
+    assert result.final_content == "finished"
+    assert result.turns_used == 1
+    assert llm.calls == 2
+    assert len(requests) == 1
+    assert len(requests[0]["messages"]) == 1
+    assert requests[0]["messages"][0]["role"] == "user"
+    assert text_of(requests[0]["messages"][0]["content"]) == "u"
+    assert all(m.get("content") != blank for m in result.messages if m["role"] == "assistant")

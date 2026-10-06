@@ -128,7 +128,17 @@ blank stream never becomes an `LLMResponse`; `is_empty_completion` then
 resamples on the same key and advances the chain, which is the recovery it has
 always documented for "an empty stream". `run_agent_loop` repeats the test for
 anything that reaches it by another path — a non-streamed reply, or one a
-product wrapper rebuilt.
+product wrapper rebuilt. Both guards use the same predicate on the original
+response, before reasoning extraction or display normalization. Signed or
+opaque reasoning blocks, reported usage (even zero-valued), and structured
+refusal details are not transport blanks.
+
+The loop rejects a blank before appending it to history or notifying response
+observers. A resample replays the existing conversation without an empty or
+whitespace assistant prefill; exhausting the retry budget likewise leaves
+history intact. The budget applies to consecutive blank responses and resets
+as soon as a non-empty response arrives, so separate failures in a productive
+run each get their own recovery allowance.
 
 Why it is worth two guards: without them a blank reply takes the no-tool exit,
 so the run ends with `stopped_by="no_tool"` and a trajectory that reads as a

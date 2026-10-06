@@ -18,6 +18,7 @@ from agent_core.llm import LLMResponse
 from agent_core.messages import Message, ToolCall
 from agent_core.runtime.async_utils import await_bounded
 
+from ._response import is_wholly_empty_response
 from ._runaway import _env_float, _env_int
 
 logger = logging.getLogger(__name__)
@@ -179,25 +180,6 @@ def _has_text_block(blocks: list[dict[str, Any]]) -> bool:
     return any(
         block.get("type") == "text" and str(block.get("text") or "").strip()
         for block in blocks
-    )
-
-
-def _is_wholly_empty(response: LLMResponse) -> bool:
-    """No text, no tool call, no reasoning and no usage — nothing at all."""
-    if response.tool_calls:
-        return False
-    if (response.reasoning_content or "").strip():
-        return False
-    if response.usage:
-        return False
-    content = response.content
-    if isinstance(content, str):
-        return not content.strip()
-    # Block-list content: any block carrying text or an opaque payload counts.
-    return not any(
-        str(block.get("text", "")).strip() or block.get("type") not in ("text", "")
-        for block in content or []
-        if isinstance(block, dict)
     )
 
 
@@ -632,7 +614,7 @@ async def _stream_llm_response(
     # no-tool handling that already reason about it; only the wholly blank
     # response — the shape measured 10 times in 19 streamed GDPval trials on
     # 2026-10-06, usage absent and backfilled as ``estimated`` zeros — raises.
-    if _is_wholly_empty(assembled):
+    if is_wholly_empty_response(assembled):
         raise LLMEmptyCompletion(
             chunks_seen=chunks_seen,
             elapsed_s=time.monotonic() - stream_started,
