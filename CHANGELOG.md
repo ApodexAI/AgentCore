@@ -7,6 +7,19 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.14.0] - 2026-10-06
+
+### Added
+
+- `AnthropicClient` and `build_protocol_client` accept `prompt_cache_ttl` (`5m`, the API default, or `1h`), which sets the lifetime of both prompt-cache breakpoints the adapter places. Blank and `5m` omit the field, so an unconfigured consumer's requests are byte-identical to before; `ANTHROPIC_PROMPT_CACHE_TTL` provides a deployment-wide default for construction sites a profile does not reach, and a client's own value outranks it. Unsupported values (`30m`, numbers, a stray unit) raise `ValueError` at construction rather than silently reverting to five minutes, which would only surface as a cache-hit-rate regression. The existing `ANTHROPIC_PROMPT_CACHE=0` kill switch still wins, and 1h writes were already counted by the adapter's cache-write accounting.
+  
+  Consumers should set this per model, not globally: an hour costs 2x base input to write against 1.25x for five minutes, and it pays off only when one TURN can take longer than the shorter window — a cached entry expires relative to its last use. In ApodexHarness's 2026-10-05 GDPval batch, 12.9% of `claude-opus-5-5` turn gaps at `effort=max` exceeded 300s and those calls missed the cache 35.7% of the time against 9.5% for the rest, rewriting a median 81k tokens each; a fast model has no such rewrites to avoid and would only pay the higher write rate. A gateway has to forward the field: llm-hub was verified on 2026-10-05 (HTTP 200, write billed to the 1h bucket, a read at 548s still hitting while the 5m control had expired), and the `extended-cache-ttl-2025-04-11` beta header was not required.
+- `LoopConfig.stream_llm_tokens` (`None` by default) overrides the loop's own choice of transport: `True` streams the turn, `False` does not, `None` keeps the existing automatic selection (the reasoning-only watchdog or an observer's `wants_llm_delta`). It exists because the transport can be the reason to stream rather than any observer — a gateway that abandons a non-streaming request while waiting for response headers leaves no alternative, and for native Anthropic those headers arrive only when generation finishes. Measured on llm-hub's "Claude Code" channel on 2026-10-05, an identical `claude-opus-5-5` request at `effort=max` returned `502 upstream_unreachable — first byte timeout` after 76s non-streaming and HTTP 200 when streamed (first byte 3.9s, generation 242s); concurrency was ruled out.
+  
+  Behaviour change in automatic mode: `anthropic` now streams when deltas are requested, where all three native protocols were previously suppressed unconditionally. That suppression predated, by one day, the provider substrate work that made `AnthropicClient.stream` rebuild the verbatim block list (trailing `signature_delta`, `redacted_thinking`) so a streamed turn replays like its non-streaming twin — `test_anthropic_latest_models.py` has covered it parametrized over streaming ever since. `responses` and `bedrock` keep the old behaviour as `UNVERIFIED_STREAM_PROTOCOLS` (exported) until a test proves their streamed replay; removing one from that set is that test's job. Consumers whose Anthropic-protocol profiles set `reasoning_only_*` or register a `wants_llm_delta` observer will now actually stream — their client must implement `stream`, since there is no fallback to `chat`.
+  
+  The suppression is also no longer silent: when automatic mode drops deltas something asked for, the loop warns. ApodexHarness's `tests/contract/test_streaming_deltas.py` documents the old selection expression verbatim in its docstring and should be updated when the pin moves.
+
 ## [0.13.0] - 2026-10-05
 
 ### Added
