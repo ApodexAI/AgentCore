@@ -5,20 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
-from anthropic import DefaultAsyncHttpxClient
-
-# Anthropic SDK v1 uses httpx2; older supported SDKs use httpx. The response
-# requires its own transport's AsyncByteStream, not merely a duck-typed one.
-if TYPE_CHECKING or issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
-    from httpx import AsyncByteStream
-else:
-    from httpx2 import AsyncByteStream
 
 
-class _ActivityByteStream(AsyncByteStream):
+class _ActivityByteStream(httpx.AsyncByteStream):
     def __init__(self, inner: Any, on_bytes: Callable[[], None]) -> None:
         self._inner = inner
         self._on_bytes = on_bytes
@@ -33,11 +25,25 @@ class _ActivityByteStream(AsyncByteStream):
         await self._inner.aclose()
 
 
+def _wrap_byte_stream(inner: Any, on_bytes: Callable[[], None]) -> Any:
+    # SDKs can use different transports in the same process. Match the actual
+    # response stream, rather than selecting a base from one SDK's version.
+    if isinstance(inner, httpx.AsyncByteStream):
+        return _ActivityByteStream(inner, on_bytes)
+
+    from httpx2 import AsyncByteStream
+
+    class _Httpx2ActivityByteStream(_ActivityByteStream, AsyncByteStream):
+        pass
+
+    return _Httpx2ActivityByteStream(inner, on_bytes)
+
+
 async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
     """Yield SDK events and ``None`` for real HTTP progress, including pings.
 
-    Anthropic's SDK drops SSE pings before yielding typed events. Observe the
-    public response byte stream before that filtering, and let the SDK continue
+    SDKs drop SSE comments or pings before yielding typed events. Observe the
+    public response byte stream before that filtering, and let each SDK continue
     to own parsing, errors, signatures and Bedrock event decoding. A bounded
     queue preserves event order without accumulating tokens or heartbeats.
     No timer invents activity: a silent socket still trips the caller's guard.
@@ -56,7 +62,7 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
         with contextlib.suppress(asyncio.QueueFull):
             queue.put_nowait(None)
 
-    response.stream = _ActivityByteStream(response.stream, on_bytes)
+    response.stream = _wrap_byte_stream(response.stream, on_bytes)
 
     async def read_events() -> None:
         try:

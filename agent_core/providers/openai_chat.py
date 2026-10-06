@@ -13,6 +13,7 @@ ChatOpenAI request — see migration gotchas #3/#4. Do not "simplify" them.
 from __future__ import annotations
 
 # pyright: basic, reportPrivateImportUsage=false
+import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -22,6 +23,7 @@ from openai import AsyncOpenAI, BadRequestError
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, for_wire
 from agent_core.providers._api_key import resolve_openai_api_key
+from agent_core.providers._stream_activity import stream_events_with_activity
 from agent_core.runtime.llm_request_overrides import (
     current_thinking_retry_override,
 )
@@ -388,26 +390,31 @@ class OpenAIClient(LLMClient):
         elif self.default_timeout is not None:
             kwargs["timeout"] = self.default_timeout
 
-        async for chunk in await self._open_stream(kwargs):
-            chunk_usage = _usage_dict(getattr(chunk, "usage", None))
-            chunk_model = getattr(chunk, "model", "") or ""
-            if not chunk.choices:
-                # Terminal ``include_usage`` chunk: empty ``choices`` but carries
-                # the final token usage. Forward it (was previously dropped, so
-                # streaming usage/billing read 0).
-                if chunk_usage or chunk_model:
-                    yield StreamDelta(usage=chunk_usage, model=chunk_model)
-                continue
-            choice = chunk.choices[0]
-            delta = choice.delta
-            yield StreamDelta(
-                content=getattr(delta, "content", None) or "",
-                reasoning_content=_reasoning_text(delta),
-                tool_call_deltas=_tool_call_deltas(getattr(delta, "tool_calls", None)),
-                finish_reason=getattr(choice, "finish_reason", None) or "",
-                model=chunk_model,
-                usage=chunk_usage,
-            )
+        stream = await self._open_stream(kwargs)
+        async with contextlib.aclosing(stream_events_with_activity(stream)) as events:
+            async for chunk in events:
+                if chunk is None:
+                    yield StreamDelta(transport_activity=True)
+                    continue
+                chunk_usage = _usage_dict(getattr(chunk, "usage", None))
+                chunk_model = getattr(chunk, "model", "") or ""
+                if not chunk.choices:
+                    # Terminal ``include_usage`` chunk: empty ``choices`` but carries
+                    # the final token usage. Forward it (was previously dropped, so
+                    # streaming usage/billing read 0).
+                    if chunk_usage or chunk_model:
+                        yield StreamDelta(usage=chunk_usage, model=chunk_model)
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+                yield StreamDelta(
+                    content=getattr(delta, "content", None) or "",
+                    reasoning_content=_reasoning_text(delta),
+                    tool_call_deltas=_tool_call_deltas(getattr(delta, "tool_calls", None)),
+                    finish_reason=getattr(choice, "finish_reason", None) or "",
+                    model=chunk_model,
+                    usage=chunk_usage,
+                )
 
     async def _open_stream(self, kwargs: dict[str, Any]) -> Any:
         """Open the stream, retrying once past a rejected ``reasoning_effort``."""

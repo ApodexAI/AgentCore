@@ -1,0 +1,1 @@
+Preserve OpenAI-compatible Chat Completions and Responses streaming transport heartbeats through SDK filtering, preventing false stall timeouts during silent reasoning while retaining total deadlines, cleanup, retry and fallback semantics.
