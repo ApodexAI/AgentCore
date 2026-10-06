@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.14.1] - 2026-10-06
+
+### Fixed
+
+- Anthropic streaming now forwards actual HTTP activity, including SSE heartbeats that the SDK filters out, as empty progress deltas. Healthy requests using omitted thinking can exceed the stream stall window while retaining their configured total call timeout. Silent connections still trigger the stall guard, and cancellation closes both the response and the event-reader task. No configuration migration is required.
+
 ## [0.14.0] - 2026-10-06
 
 ### Added
