@@ -106,3 +106,32 @@ explicit `stream_llm_tokens` ignores the gate; the host then owns that fidelity.
 When automatic mode suppresses deltas something asked for, the loop logs a
 warning. It used to be silent, which meant a profile configuring the
 reasoning-only watchdog on a gated protocol got no watchdog and no sign of it.
+
+## A blank reply is a failure, not an answer
+
+Three signals arrive in the same shape — a reply with no tool call — and need
+opposite treatment:
+
+| signal | what it means | handling |
+|---|---|---|
+| truncation (`finish_reason="length"` with text) | stopped mid-sentence | continue from the partial text (`truncation_max_continuations`) |
+| a tool-less turn with text | the model chose to stop | `no_tool_behavior` decides |
+| **nothing whatsoever** | the transport returned nothing | **resample** (`empty_completion_max_retries`), then `stopped_by="empty_completion"` |
+
+"Nothing whatsoever" means no visible text, no tool call, no reasoning AND no
+usage. The usage test is what separates it from a real 0-token reply, which
+still reports prompt tokens; a reasoning-only stream likewise stays with the
+runaway guard. Only the wholly blank response is treated as a fault.
+
+It is caught twice. `_stream_llm_response` raises `LLMEmptyCompletion` so a
+blank stream never becomes an `LLMResponse`; `is_empty_completion` then
+resamples on the same key and advances the chain, which is the recovery it has
+always documented for "an empty stream". `run_agent_loop` repeats the test for
+anything that reaches it by another path — a non-streamed reply, or one a
+product wrapper rebuilt.
+
+Why it is worth two guards: without them a blank reply takes the no-tool exit,
+so the run ends with `stopped_by="no_tool"` and a trajectory that reads as a
+clean finish, while every turn of work already done is discarded. On
+ApodexHarness's 2026-10-06 GDPval batch over llm-hub that cost 10 of 19
+streamed trials, six of them inside five minutes and one on turn 1 after 37s.

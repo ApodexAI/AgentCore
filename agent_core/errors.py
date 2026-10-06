@@ -74,6 +74,40 @@ class LLMReasoningRunaway(LLMError):
         )
 
 
+class LLMEmptyCompletion(LLMError):
+    """A streamed call completed cleanly and produced nothing at all.
+
+    Not a stall (chunks did arrive, or the stream closed without ever going
+    silent) and not a runaway (no reasoning was spent either). The provider
+    simply ended the stream with no visible text, no tool call, no reasoning
+    and — the tell — no usage, so there is nothing to bill and nothing to act
+    on. :func:`agent_core.runtime.retriable.is_empty_completion` has always
+    named this case ("reasoning-runaway, all-tokens-in-thinking, or an empty
+    stream") and routes it through ``is_retriable_with_fallback``, which
+    resamples on the same key and then advances the chain; what was missing is
+    the raise, so the assembled empty response reached the loop as a VALID
+    answer instead.
+
+    Why that is worse than an error: an empty reply with no tool call is
+    shaped exactly like "the model chose to stop talking", so under
+    ``no_tool_behavior="stop"`` the run ENDS. Measured on ApodexHarness's
+    2026-10-06 GDPval batch over llm-hub: 10 of 19 streamed trials died this
+    way, six of them inside five minutes (one on turn 1 after 37s), each
+    discarding every turn of work it had already done. The message wording is
+    matched by ``_EMPTY_COMPLETION_PATTERNS`` so existing classification picks
+    it up without a registry edit.
+    """
+
+    def __init__(self, *, chunks_seen: int, elapsed_s: float) -> None:
+        self.chunks_seen = int(chunks_seen)
+        self.elapsed_s = float(elapsed_s)
+        super().__init__(
+            "empty completion: stream returned no content, no tool call and "
+            f"no usage (chunks_seen={self.chunks_seen}, "
+            f"elapsed={self.elapsed_s:.1f}s)",
+        )
+
+
 class LLMStreamStalled(LLMError, TimeoutError):
     """A streaming LLM call went silent mid-flight.
 
@@ -155,6 +189,7 @@ __all__ = [
     "KernelError",
     "LLMCallExhausted",
     "LLMDeadlineExceeded",
+    "LLMEmptyCompletion",
     "LLMError",
     "LLMReasoningRunaway",
     "LLMStreamStalled",

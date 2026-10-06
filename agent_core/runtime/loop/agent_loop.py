@@ -439,6 +439,7 @@ async def _run_loop_inner(
     total_tool_calls = 0
     no_tool_retries = 0
     truncation_continuations = 0
+    empty_completions = 0
     truncated_text_parts: list[str] = []
 
     last_input_tokens = 0
@@ -589,6 +590,35 @@ async def _run_loop_inner(
             logger.warning(
                 "turn=%d response truncated after %d continuation(s) — stopping",
                 turn, cfg.truncation_max_continuations,
+            )
+            break
+
+        # Second line, for the response that arrived with nothing in it at all.
+        # ``_stream_llm_response`` now raises on a wholly empty stream, so this
+        # catches what that cannot see: a NON-streamed reply, or one a product
+        # wrapper rebuilt, that carries no text, no tool call and no usage. Same
+        # argument as the truncation guard directly above — a blank reply and "I
+        # am done" arrive in the same shape, and only one of them is a decision.
+        # Without this the run ends on a transport artifact with
+        # ``stopped_by="no_tool"``, which reads as a clean finish in the
+        # trajectory; that is how 10 of 19 GDPval trials lost all their work on
+        # 2026-10-06, six of them within five minutes.
+        if not parsed_calls and not ctx.ai_text.strip() and extract_usage(response) is None:
+            empty_completions += 1
+            if empty_completions <= cfg.empty_completion_max_retries:
+                logger.warning(
+                    "turn=%d response carried no content, no tool call and no "
+                    "usage — resampling (%d/%d)",
+                    turn, empty_completions, cfg.empty_completion_max_retries,
+                )
+                # No work to preserve and nothing to tell the model: just ask
+                # again. The turn budget is not spent on a non-answer.
+                turn -= 1
+                continue
+            stop_reason = "empty_completion"
+            logger.warning(
+                "turn=%d still empty after %d resample(s) — stopping",
+                turn, cfg.empty_completion_max_retries,
             )
             break
 

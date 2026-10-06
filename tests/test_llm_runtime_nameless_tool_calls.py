@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
+from agent_core.errors import LLMEmptyCompletion
 from agent_core.llm import StreamDelta
 from agent_core.runtime.loop._streaming import _stream_llm_response
 
@@ -52,13 +55,21 @@ async def test_index_only_chunk_does_not_become_a_tool_call() -> None:
     assert resp.content == "thinking about it"
 
 
-async def test_stream_cut_before_the_name_arrives_is_dropped() -> None:
-    """Arguments streamed, then the stream ended — the call is unexecutable."""
-    resp = await _run([
-        StreamDelta(tool_call_deltas=[{"index": 0, "id": "call_1"}]),
-        StreamDelta(tool_call_deltas=[{"index": 0, "arguments": '{"command":'}]),
-    ])
-    assert resp.tool_calls == []
+async def test_stream_cut_before_the_name_arrives_raises_rather_than_returning_blank() -> None:
+    """Arguments streamed, then the stream ended — the call is unexecutable.
+
+    Dropping it keeps the unrenderable ``name=""`` out of history, which is
+    what this module was written for. But dropping the ONLY thing the stream
+    produced leaves a blank response, and this module's own docstring names
+    where that goes: the run ends "looking like an ordinary empty submission
+    rather than the infrastructure fault it is". So the drop now ends in a
+    raise, which ``is_empty_completion`` routes to a resample and then to the
+    next provider in the chain. Nothing reaches history either way."""
+    with pytest.raises(LLMEmptyCompletion):
+        await _run([
+            StreamDelta(tool_call_deltas=[{"index": 0, "id": "call_1"}]),
+            StreamDelta(tool_call_deltas=[{"index": 0, "arguments": '{"command":'}]),
+        ])
 
 
 async def test_a_named_call_still_survives() -> None:
@@ -102,7 +113,10 @@ async def test_only_the_nameless_slot_is_dropped_from_a_mixed_turn() -> None:
 async def test_the_drop_is_logged_not_silent(caplog) -> None:
     """A provider emitting these consistently is an upstream defect, and this
     is the only place left that can see it."""
-    with caplog.at_level(logging.WARNING):
+    # Nothing but the malformed delta, so the drop empties the response and the
+    # empty-completion guard fires. The log must still name the drop: the raise
+    # says "nothing arrived", only this line says WHY.
+    with caplog.at_level(logging.WARNING), pytest.raises(LLMEmptyCompletion):
         await _run([StreamDelta(tool_call_deltas=[{"index": 0}])])
     assert any("no function name" in r.getMessage() for r in caplog.records)
     assert any("dropped 1 " in r.getMessage() for r in caplog.records)

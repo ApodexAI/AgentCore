@@ -172,6 +172,14 @@ class LoopConfig:
     # a tool-less turn is the model choosing to stop, a truncated one is the
     # model being stopped, so a truncation must not spend the nudge budget.
     truncation_max_continuations: int = 2
+    # Resamples offered to a reply that arrived with nothing in it: no text, no
+    # tool call, no usage. Separate from both budgets above because it is a
+    # third signal — truncation is "stopped mid-sentence", a tool-less turn is
+    # "chose to stop", and this is "the transport returned nothing", which is
+    # not the model's statement at all. Two is enough: the failure is
+    # per-request, and a provider that returns blank three times running is
+    # down, not slow.
+    empty_completion_max_retries: int = 2
     max_llm_retries: int = 5
     # Fixed retry delay; None uses exponential backoff.
     retry_wait_fixed: int | None = None
