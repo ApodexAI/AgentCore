@@ -23,7 +23,7 @@ from openai import AsyncOpenAI, BadRequestError
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, for_wire
 from agent_core.providers._api_key import resolve_openai_api_key
-from agent_core.providers._stream_activity import stream_events_with_activity
+from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
 from agent_core.runtime.llm_request_overrides import (
     current_thinking_retry_override,
 )
@@ -391,7 +391,8 @@ class OpenAIClient(LLMClient):
             kwargs["timeout"] = self.default_timeout
 
         stream = await self._open_stream(kwargs)
-        async with contextlib.aclosing(stream_events_with_activity(stream)) as events:
+        activity = StreamActivity()
+        async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for chunk in events:
                 if chunk is None:
                     yield StreamDelta(transport_activity=True)
@@ -403,10 +404,12 @@ class OpenAIClient(LLMClient):
                     # the final token usage. Forward it (was previously dropped, so
                     # streaming usage/billing read 0).
                     if chunk_usage or chunk_model:
+                        activity.mark_output()
                         yield StreamDelta(usage=chunk_usage, model=chunk_model)
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
+                activity.mark_output()
                 yield StreamDelta(
                     content=getattr(delta, "content", None) or "",
                     reasoning_content=_reasoning_text(delta),

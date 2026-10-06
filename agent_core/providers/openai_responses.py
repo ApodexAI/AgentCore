@@ -40,7 +40,7 @@ from agent_core.errors import LLMError
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.providers._api_key import resolve_openai_api_key
-from agent_core.providers._stream_activity import stream_events_with_activity
+from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
 from agent_core.providers.finish_reason import (
     normalize_finish_reason,
     responses_finish_reason,
@@ -189,18 +189,21 @@ class OpenAIResponsesClient(LLMClient):
         )
         kwargs["stream"] = True
         stream = await self._client.responses.create(**kwargs)
-        async with contextlib.aclosing(stream_events_with_activity(stream)) as events:
+        activity = StreamActivity()
+        async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
                     yield StreamDelta(transport_activity=True)
                     continue
                 etype = getattr(event, "type", "")
                 if etype == "response.output_text.delta":
+                    activity.mark_output()
                     yield StreamDelta(content=getattr(event, "delta", "") or "")
                 elif etype in (
                     "response.reasoning_summary_text.delta",
                     "response.reasoning_text.delta",
                 ):
+                    activity.mark_output()
                     yield StreamDelta(reasoning_content=getattr(event, "delta", "") or "")
                 elif etype == "response.failed":
                     raise _response_failure(
@@ -212,6 +215,7 @@ class OpenAIResponsesClient(LLMClient):
                     reason = normalize_finish_reason(
                         _get(_get(resp, "incomplete_details", None) or {}, "reason", ""),
                     )
+                    activity.mark_output()
                     yield StreamDelta(
                         usage=usage,
                         model=getattr(resp, "model", "") or "",
