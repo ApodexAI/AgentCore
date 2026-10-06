@@ -97,7 +97,8 @@ class _Body(sdk_httpx.AsyncByteStream):
                     yield _sse({"type": "response.reasoning_summary_text.delta", "item_id": "r1",
                                 "output_index": 0, "summary_index": 0, "delta": "thinking",
                                 "sequence_number": 0}, "response.reasoning_summary_text.delta")
-            for _ in range(30):
+            beats = {"dense": 0, "long": 100}.get(self.mode, 30)
+            for _ in range(beats):
                 await asyncio.sleep(0.01)
                 self.pings += 1
                 # Comments are valid SSE heartbeats, filtered by the SDK.
@@ -318,3 +319,63 @@ async def test_activity_wrapper_matches_each_response_transport(transport_name):
     events = [event async for event in stream_events_with_activity(Stream())]
     assert "event" in events and None in events
     assert seen == [b"ping"] and body.closed
+
+
+async def test_heartbeats_do_not_satisfy_first_chunk_bound(profile):
+    async with _client(profile, ("long",)) as (client, bodies, _):
+        with pytest.raises(LLMStreamStalled) as exc_info:
+            await _stream_llm_response(client, [user_msg("hi")], 5, _ignore,
+                                       first_chunk_s=0.3)
+        assert exc_info.value.chunks_seen == 0
+        assert 0 < bodies[0].pings < 100
+        assert bodies[0].closed and not bodies[0].reading
+
+
+async def test_heartbeats_extend_stall_after_first_real_chunk(profile):
+    async with _client(profile, ("reasoning",)) as (client, bodies, _):
+        response = await _stream_llm_response(client, [user_msg("hi")], 2, _ignore,
+                                               first_chunk_s=0.1)
+    assert bodies[0].pings == 30
+    assert response.content == "done"
+    assert response.reasoning_content == "thinking"
+
+
+async def test_dense_stream_does_not_pair_events_with_heartbeats(profile):
+    async with _client(profile, ("dense",)) as (client, bodies, _):
+        deltas = [delta async for delta in client.stream([user_msg("hi")])]
+    activity = sum(delta.transport_activity for delta in deltas)
+    events = len(deltas) - activity
+    # Headers, plus at most the event-less ``[DONE]`` sentinel.
+    assert activity <= 2 and events >= 2
+    assert bodies[0].closed
+
+
+async def test_unknown_byte_stream_is_left_untouched():
+    from agent_core.providers._stream_activity import stream_events_with_activity
+
+    class Body:  # neither httpx nor httpx2: e.g. a MagicMock or custom stream
+        pass
+
+    body = Body()
+
+    class Stream:
+        response = type("Response", (), {"stream": body})()
+
+        async def __aiter__(self):
+            yield "event"
+
+    assert [event async for event in stream_events_with_activity(Stream())] == ["event"]
+    assert Stream.response.stream is body
+
+
+def test_httpx2_wrapper_class_is_built_once():
+    httpx2 = pytest.importorskip("httpx2")
+    from agent_core.providers._stream_activity import _wrap_byte_stream
+
+    class Body(httpx2.AsyncByteStream):
+        pass
+
+    first = _wrap_byte_stream(Body(), lambda: None)
+    second = _wrap_byte_stream(Body(), lambda: None)
+    assert isinstance(first, httpx2.AsyncByteStream)
+    assert type(first) is type(second)
