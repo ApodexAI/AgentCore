@@ -116,9 +116,9 @@ def _default_rate_limit_backoff(attempt: int) -> float:
 # Suffix resolved through the shared ``AGENT_CORE_`` / compatibility-prefix
 # cascade by ``_env_int``.
 _LLM_GATE_ENV = "LLM_MAX_CONCURRENT"
-# Admission wait cap per attempt. Unset / <= 0 defaults to the attempt's own
-# timeout, so a saturated gate cannot hold a call forever even without a
-# logical or wall deadline. Queue time never shrinks the generation budget.
+# Optional admission wait cap. Unset / <= 0 preserves the FIFO wait until an
+# explicit logical/wall deadline or cancellation. Queue time never shrinks
+# generation, and admission expiry never spends provider retries.
 _LLM_GATE_WAIT_ENV = "LLM_GATE_WAIT_S"
 _llm_gate_state: tuple[Any, asyncio.Semaphore] | None = None
 
@@ -283,10 +283,10 @@ async def call_llm(
     deadline through ``wall_deadline_remaining``; AgentCore never imports a
     product's context-local storage.
 
-    Admission queueing is bounded separately (``LLM_GATE_WAIT_S``, default the
-    attempt ``timeout``) and never shrinks the generation budget; a gate
-    timeout re-queues without backoff. The per-attempt ``timeout`` starts once
-    a slot is held and also covers any same-attempt tool-argument replay. A
+    Admission queueing is bounded separately (``LLM_GATE_WAIT_S``, disabled by
+    default) and never shrinks the generation budget; admission expiry ends
+    the call with reason ``gate_wait`` without retrying. The per-attempt
+    ``timeout`` starts once a slot is held and also covers any same-attempt tool-argument replay. A
     slot is released only after an abandoned provider request settles.
     Cleanup and passive observation have separate bounded grace periods so
     cancellation cannot wait indefinitely for I/O finalizers.
@@ -572,9 +572,10 @@ async def call_llm(
             try:
                 if gate is not None:
                     deadline_remaining, _deadline_reason = _nearest_deadline()
-                    gate_wait_timeout = _env_float(_LLM_GATE_WAIT_ENV, 0.0)
-                    if gate_wait_timeout <= 0:
-                        gate_wait_timeout = effective_timeout
+                    configured_gate_wait = _env_float(_LLM_GATE_WAIT_ENV, 0.0)
+                    gate_wait_timeout: float | None = (
+                        configured_gate_wait if configured_gate_wait > 0 else None
+                    )
                     gate_wait_reason = ""
                     if deadline_remaining is not None:
                         deadline_wait_timeout = (
@@ -584,7 +585,7 @@ async def call_llm(
                             _effective_timeout_or_deadline_exhausted(
                                 attempt=attempt, reason="gate_wait",
                             )
-                        if deadline_wait_timeout < gate_wait_timeout:
+                        if gate_wait_timeout is None or deadline_wait_timeout <= gate_wait_timeout:
                             gate_wait_timeout = deadline_wait_timeout
                             gate_wait_reason = _deadline_reason
                     try:
@@ -602,9 +603,12 @@ async def call_llm(
                                 gate_wait_reason,
                                 prior_exc=last_exc,
                             ) from exc
-                        raise _GateWaitTimeout(
+                        admission_exc = _GateWaitTimeout(
                             f"concurrency gate stayed saturated for "
                             f"{gate_wait_timeout:.0f}s",
+                        )
+                        raise LLMCallExhausted(
+                            admission_exc, "gate_wait", prior_exc=last_exc,
                         ) from exc
                     slot_lease.enter_context(hold_until_settled(gate.release))
                     effective_timeout, attempt_deadline_reason = (
@@ -1044,21 +1048,11 @@ async def call_llm(
                 raise LLMCallExhausted(
                     deadline_exc, deadline_reason, prior_exc=prior_exc,
                 ) from exc
-            if isinstance(exc, _GateWaitTimeout):
-                # Local congestion, not a provider fault: re-queue at once.
-                # Backing off would only push this call further back.
-                retry_reason = "gate_wait"
-                logger.warning(
-                    "LLM admission timed out: %s (turn=%d, attempt=%d/%d)",
-                    exc, turn, attempt + 1, max_retries,
-                )
-                backoff = 0.0
-            else:
-                logger.warning(
-                    "LLM call timed out (turn=%d, attempt=%d/%d)",
-                    turn, attempt + 1, max_retries,
-                )
-                backoff = _transient_backoff(attempt)
+            logger.warning(
+                "LLM call timed out (turn=%d, attempt=%d/%d)",
+                turn, attempt + 1, max_retries,
+            )
+            backoff = _transient_backoff(attempt)
         except Exception as exc:
             last_exc = exc
             retry_error = exc

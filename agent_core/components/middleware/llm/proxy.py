@@ -17,7 +17,7 @@ from agent_core.execution_context import (
 )
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
-from agent_core.runtime.async_utils import await_bounded
+from agent_core.runtime.async_utils import await_bounded, closing_stream
 
 logger = logging.getLogger(__name__)
 __all__ = ["LLMProxy"]
@@ -196,44 +196,45 @@ class LLMProxy:
                 stream_error = None
                 any_chunk_yielded = False
                 try:
-                    async for delta in self.inner.stream(
+                    async with closing_stream(self.inner.stream(
                         messages,
                         tools=tools,
                         temperature=temperature,
                         max_tokens=max_tokens,
                         extra_headers=extra_headers,
                         timeout=timeout,
-                    ):
-                        if delta.transport_activity:
-                            # Keep the caller's stall watchdog alive without
-                            # committing this attempt or invoking output hooks.
+                    )) as inner_stream:
+                        async for delta in inner_stream:
+                            if delta.transport_activity:
+                                # Keep the caller's stall watchdog alive without
+                                # committing this attempt or invoking output hooks.
+                                yield delta
+                                continue
+                            full_content += delta.content or ""
+                            full_reasoning += delta.reasoning_content or ""
+                            any_chunk_yielded = True
+                            # Per-chunk middleware hook. A middleware returning
+                            # True (e.g. StreamRepetitionDetector noticing a
+                            # degenerate loop) tells us to stop consuming the
+                            # inner stream and exit cleanly — the partial
+                            # response still flows through ``after_llm`` in the
+                            # finally block so observers see the truncated
+                            # content rather than nothing. The delta that
+                            # triggered the abort IS still yielded so the
+                            # consumer's accumulator stays consistent with the
+                            # LLMResponse we'll synthesise.
                             yield delta
-                            continue
-                        full_content += delta.content or ""
-                        full_reasoning += delta.reasoning_content or ""
-                        any_chunk_yielded = True
-                        # Per-chunk middleware hook. A middleware returning
-                        # True (e.g. StreamRepetitionDetector noticing a
-                        # degenerate loop) tells us to stop consuming the
-                        # inner stream and exit cleanly — the partial
-                        # response still flows through ``after_llm`` in the
-                        # finally block so observers see the truncated
-                        # content rather than nothing. The delta that
-                        # triggered the abort IS still yielded so the
-                        # consumer's accumulator stays consistent with the
-                        # LLMResponse we'll synthesise.
-                        yield delta
-                        if await self.chain.run_on_chunk(
-                            ctx,
-                            delta,
-                            full_content,
-                        ):
-                            ctx.metadata["stream_aborted_by_middleware"] = True
-                            logger.info(
-                                "LLMProxy: stream aborted by middleware after %d chars",
-                                len(full_content),
-                            )
-                            break
+                            if await self.chain.run_on_chunk(
+                                ctx,
+                                delta,
+                                full_content,
+                            ):
+                                ctx.metadata["stream_aborted_by_middleware"] = True
+                                logger.info(
+                                    "LLMProxy: stream aborted by middleware after %d chars",
+                                    len(full_content),
+                                )
+                                break
                     break
                 except Exception as e:
                     stream_error = e

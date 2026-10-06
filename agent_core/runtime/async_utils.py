@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator
 from contextvars import ContextVar
 from typing import Any
 
 _pending_cancellations: set[asyncio.Future[Any]] = set()
+_STREAM_CLOSE_TIMEOUT_S = 5.0
 # Set by :func:`hold_until_settled`. Abandoned operations started with
 # ``hold=True`` keep the enclosing lease (e.g. a concurrency slot) open.
 _ABANDON_HOOK: ContextVar[Callable[[asyncio.Future[Any]], None] | None] = ContextVar(
@@ -55,6 +56,23 @@ async def await_bounded[T](
             hook = _ABANDON_HOOK.get() if hold else None
             if hook is not None:
                 hook(task)
+
+
+@contextlib.asynccontextmanager
+async def closing_stream[T](stream: AsyncIterator[T]) -> AsyncGenerator[AsyncIterator[T]]:
+    """Close a delegated stream before its wrapper exits the provider lease.
+
+    An async-for break does not close its iterator. Explicit bounded cleanup
+    registers abandoned provider I/O while the enclosing lease is still held.
+    Structural iterators without ``aclose`` need no extra finalization.
+    """
+    try:
+        yield stream
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await await_bounded(close(), _STREAM_CLOSE_TIMEOUT_S, hold=True)
 
 
 class _Lease:

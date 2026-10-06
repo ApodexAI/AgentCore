@@ -102,33 +102,44 @@ async def test_builtin_tracing_cannot_hold_llm_completion_or_cancellation(monkey
             await task
 
 
-async def test_gate_wait_without_optional_deadlines_is_bounded_and_reusable(monkeypatch):
+@pytest.mark.parametrize("gate_wait", [None, "0", "-1"])
+async def test_default_gate_wait_preserves_fifo_beyond_generation_budget(monkeypatch, gate_wait):
     gate = asyncio.Semaphore(0)
     monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    if gate_wait is None:
+        monkeypatch.delenv("AGENT_CORE_LLM_GATE_WAIT_S", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CORE_LLM_GATE_WAIT_S", gate_wait)
     calls = []
 
     async def chat(messages, **kwargs):
-        calls.append(kwargs["timeout"])
+        calls.append(messages[0]["content"])
+        assert kwargs["timeout"] == 0.03
         return LLMResponse(content="ok")
 
     llm = SimpleNamespace(model="test", chat=chat)
-    task = asyncio.create_task(call_module.call_llm(llm, [user_msg("hi")], 0.03, 1, 1))
+    tasks = []
     try:
-        done, _ = await asyncio.wait({task}, timeout=0.2)
-        assert task in done
-        with pytest.raises(LLMCallExhausted) as exc:
-            await task
-        assert isinstance(exc.value.last_exc, TimeoutError)
-        assert calls == []
-        assert not gate._waiters  # Timed-out admission must not steal a later slot.
+        for label in ["first", "second", "third"]:
+            tasks.append(asyncio.create_task(call_module.call_llm(
+                llm, [user_msg(label)], 0.03, 1, 1,
+            )))
+            # Wait for each caller to join the queue before adding the next.
+            while len(gate._waiters or ()) < len(tasks):
+                await asyncio.sleep(0)
+        first_waiter = gate._waiters[0]
+        await asyncio.sleep(0.12)  # Exceeds even the old three-retry budget.
+        assert not any(task.done() for task in tasks)
+        assert gate._waiters[0] is first_waiter
         gate.release()
-        response = await call_module.call_llm(llm, [user_msg("hi")], 1, 1, 1)
-        assert response.content == "ok" and len(calls) == 1
+        responses = await asyncio.wait_for(asyncio.gather(*tasks), 0.5)
+        assert [r.content for r in responses] == ["ok"] * 3
+        assert calls == ["first", "second", "third"]
         assert gate._value == 1
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, LLMCallExhausted):
-            await task
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def test_gate_wait_does_not_shrink_generation_budget(monkeypatch):
@@ -156,33 +167,76 @@ async def test_gate_wait_does_not_shrink_generation_budget(monkeypatch):
     assert gate._value == 1
 
 
-async def test_gate_wait_timeout_requeues_without_backoff(monkeypatch):
+async def test_explicit_gate_wait_expiry_does_not_retry_or_call_provider(monkeypatch):
     gate = asyncio.Semaphore(0)
     monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
     monkeypatch.setenv("AGENT_CORE_LLM_GATE_WAIT_S", "0.03")
-    monkeypatch.setattr(call_module, "_default_backoff", lambda attempt: 60.0)
-    events = []
+    events, calls = [], []
+
+    def unexpected_backoff(attempt):
+        pytest.fail("admission expiry must not enter provider backoff")
+
+    monkeypatch.setattr(call_module, "_default_backoff", unexpected_backoff)
 
     async def on_attempt(event):
         events.append(event)
 
     async def chat(messages, **kwargs):
+        calls.append(kwargs["timeout"])
         return LLMResponse(content="ok")
 
-    async def release_slot():
-        await asyncio.sleep(0.05)
-        gate.release()
-
-    release = asyncio.create_task(release_slot())
-    start = time.monotonic()
-    response = await call_module.call_llm(SimpleNamespace(model="test", chat=chat),
-                                          [user_msg("hi")], 5, 3, 1,
-                                          on_attempt=on_attempt)
-    await release
-    assert response.content == "ok"
-    assert time.monotonic() - start < 1, "admission timeout must not back off"
+    llm = SimpleNamespace(model="test", chat=chat)
+    with pytest.raises(LLMCallExhausted) as exc:
+        await asyncio.wait_for(call_module.call_llm(
+            llm, [user_msg("hi")], 5, 10, 1, on_attempt=on_attempt,
+        ), 0.5)
+    assert exc.value.reason == "gate_wait"
+    assert isinstance(exc.value.last_exc, TimeoutError)
+    assert calls == [] and not gate._waiters
     finished = [e for e in events if e["phase"] == "finished"]
-    assert finished[0]["reason"] == "gate_wait"
+    assert len(finished) == 1 and finished[0]["reason"] == "gate_wait"
+    gate.release()
+    assert (await call_module.call_llm(llm, [user_msg("hi")], 5, 1, 1)).content == "ok"
+    assert gate._value == 1
+
+
+@pytest.mark.parametrize("deadline_kind", ["logical", "wall"])
+async def test_gate_wait_reserves_deadline_floor_without_provider_call(monkeypatch, deadline_kind):
+    gate = asyncio.Semaphore(0)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    monkeypatch.setattr(call_module, "_WALL_DEADLINE_FLOOR_S", 0.02)
+    monkeypatch.delenv("AGENT_CORE_LLM_GATE_WAIT_S", raising=False)
+    deadline = time.monotonic() + 0.07
+    calls = []
+
+    async def chat(messages, **kwargs):
+        calls.append(True)
+        return LLMResponse(content="ok")
+
+    kwargs = ({"logical_call_timeout_s": 0.07} if deadline_kind == "logical" else
+              {"wall_deadline_remaining": lambda: deadline - time.monotonic()})
+    with pytest.raises(LLMCallExhausted) as exc:
+        await asyncio.wait_for(call_module.call_llm(
+            SimpleNamespace(model="test", chat=chat), [user_msg("hi")], 1, 3, 1, **kwargs,
+        ), 0.5)
+    assert exc.value.reason == ("logical_call_deadline" if deadline_kind == "logical" else "wall_deadline")
+    assert calls == [] and not gate._waiters
+
+
+async def test_cancelled_unbounded_gate_wait_does_not_steal_slot(monkeypatch):
+    gate = asyncio.Semaphore(0)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    monkeypatch.delenv("AGENT_CORE_LLM_GATE_WAIT_S", raising=False)
+    task = asyncio.create_task(call_module.call_llm(
+        SimpleNamespace(model="test"), [user_msg("hi")], 0.03, 1, 1,
+    ))
+    while not gate._waiters:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 0.5)
+    assert not gate._waiters
+    gate.release()
     assert gate._value == 1
 
 
@@ -507,3 +561,22 @@ async def test_lease_releases_once_after_block_and_held_tasks():
     with hold_until_settled(lambda: released.append(True)):
         pass
     assert released == [True, True]
+
+
+async def test_gate_acquired_with_insufficient_deadline_never_calls_provider(monkeypatch):
+    gate = asyncio.Semaphore(1)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    remaining = iter([60.0, 60.0, 0.01])  # pre-gate, admission, post-gate
+    calls = []
+
+    async def chat(messages, **kwargs):
+        calls.append(True)
+        return LLMResponse(content="ok")
+
+    with pytest.raises(LLMCallExhausted) as exc:
+        await call_module.call_llm(
+            SimpleNamespace(model="test", chat=chat), [user_msg("hi")], 180, 3, 1,
+            wall_deadline_remaining=lambda: next(remaining),
+        )
+    assert exc.value.reason == "wall_deadline"
+    assert calls == [] and gate._value == 1
