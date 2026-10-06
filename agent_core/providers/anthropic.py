@@ -31,7 +31,7 @@ from typing import Any
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
-from agent_core.providers._stream_activity import stream_events_with_activity
+from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
 from agent_core.providers.finish_reason import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
@@ -254,7 +254,8 @@ class AnthropicClient(LLMClient):
         # ``thinking_format="content_block"`` could not replay.
         blocks: dict[int, dict[str, Any]] = {}
         stream, reset = await self._create_message(kwargs)
-        async with contextlib.aclosing(stream_events_with_activity(stream)) as events:
+        activity = StreamActivity()
+        async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
                     # Transport activity resets the loop's stall timer without
@@ -288,6 +289,7 @@ class AnthropicClient(LLMClient):
                             "name": getattr(cb, "name", "") or "",
                             "input": getattr(cb, "input", {}) or {},
                         }
+                        activity.mark_output()
                         yield StreamDelta(tool_call_deltas=[{
                             "index": idx,
                             "id": getattr(cb, "id", "") or "",
@@ -320,12 +322,14 @@ class AnthropicClient(LLMClient):
                         blk = blocks.get(idx)
                         if blk is not None and blk.get("type") == "text":
                             blk["text"] += chunk
+                        activity.mark_output()
                         yield StreamDelta(content=chunk)
                     elif dtype == "thinking_delta":
                         chunk = getattr(d, "thinking", "") or ""
                         blk = blocks.get(idx)
                         if blk is not None and blk.get("type") == "thinking":
                             blk["thinking"] += chunk
+                        activity.mark_output()
                         yield StreamDelta(reasoning_content=chunk)
                     elif dtype == "signature_delta":
                         # The signature is a single opaque token, not an
@@ -342,6 +346,7 @@ class AnthropicClient(LLMClient):
                                 blk.get("_partial_json", "")
                                 + (getattr(d, "partial_json", "") or "")
                             )
+                        activity.mark_output()
                         yield StreamDelta(tool_call_deltas=[{
                             "index": idx,
                             "id": None,
@@ -385,6 +390,7 @@ class AnthropicClient(LLMClient):
                     # The tool-call channel retains truncated arguments for
                     # the runtime's repair/replay logic.
                     block["input"] = {}
+        activity.mark_output()
         yield StreamDelta(
             usage=_anthropic_usage_dict(
                 input_tokens,

@@ -297,3 +297,50 @@ async def test_loop_smoke_omitted_thinking_tool_then_final_answer():
     assert assistant["content"][0] == {"type": "thinking", "thinking": "", "signature": "signed"}
     assert assistant["content"][1]["id"] == "call_1"
     assert requests[1]["messages"][-1]["content"][0]["tool_use_id"] == "call_1"
+
+
+@pytest.mark.parametrize("visible_reasoning,first_chunk_s", [
+    (True, 0.1), (False, 0.0), (False, 0.05),
+])
+async def test_signature_only_byte_progress_preserves_stall_and_first_chunk_bounds(
+    monkeypatch, visible_reasoning, first_chunk_s,
+):
+    class SignatureBody(_Body):
+        async def __aiter__(self):
+            self.reading = True
+            try:
+                yield _sse(_opening())
+                yield _sse({"type": "content_block_start", "index": 0,
+                            "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+                if visible_reasoning:
+                    yield _sse({"type": "content_block_delta", "index": 0,
+                                "delta": {"type": "thinking_delta", "thinking": "thinking"}})
+                for _ in range(10):
+                    await asyncio.sleep(0.03)
+                    yield _sse({"type": "content_block_delta", "index": 0,
+                                "delta": {"type": "signature_delta", "signature": "sig"}})
+                for event in _ending()[1:]:
+                    yield _sse(event)
+            finally:
+                self.reading = False
+
+    monkeypatch.setattr(f"{__name__}._Body", SignatureBody)
+    observed = []
+
+    async def on_delta(text, accumulated, index, thinking, **kwargs):
+        observed.append((text, thinking))
+
+    async with _client() as (client, body, _):
+        if not visible_reasoning and first_chunk_s:
+            with pytest.raises(LLMStreamStalled) as exc:
+                await _stream_llm_response(client, [user_msg("hi")], 2, on_delta,
+                                           first_chunk_s=first_chunk_s)
+            assert exc.value.chunks_seen == 0
+            assert observed == []
+        else:
+            response = await _stream_llm_response(client, [user_msg("hi")], 2, on_delta,
+                                                  first_chunk_s=first_chunk_s)
+            assert response.content[0]["signature"] == "sig" * 10
+            assert response.content[-1] == {"type": "text", "text": "done"}
+            assert observed == ([("", "thinking")] if visible_reasoning else []) + [("done", "")]
+        assert body.closed and not body.reading

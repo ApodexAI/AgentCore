@@ -102,7 +102,20 @@ class _Body(sdk_httpx.AsyncByteStream):
                 await asyncio.sleep(0.01)
                 self.pings += 1
                 # Comments are valid SSE heartbeats, filtered by the SDK.
-                yield b": keep-alive\n\n"
+                if self.mode == "filtered":
+                    protocol, _model = self.profile
+                    if protocol == "chat":
+                        metadata = _chat_chunk("", {})
+                        metadata["choices"] = []
+                        yield _sse(metadata)
+                    else:
+                        yield _sse({"type": "response.in_progress", "sequence_number": self.pings,
+                                    "response": {"id": "resp_1", "object": "response",
+                                                 "created_at": 1, "model": self.profile[1],
+                                                 "status": "in_progress", "output": []}},
+                                   "response.in_progress")
+                else:
+                    yield b": keep-alive\n\n"
             if self.mode == "error":
                 yield _sse({"error": {"message": "upstream unavailable", "type": "server_error"}})
             else:
@@ -379,3 +392,25 @@ def test_httpx2_wrapper_class_is_built_once():
     second = _wrap_byte_stream(Body(), lambda: None)
     assert isinstance(first, httpx2.AsyncByteStream)
     assert type(first) is type(second)
+
+
+@pytest.mark.parametrize("first_chunk_s", [0.0, 0.1])
+async def test_filtered_sdk_events_keep_stall_alive_without_satisfying_first_chunk(profile, first_chunk_s):
+    observed = []
+
+    async def on_delta(text, accumulated, index, thinking, **kwargs):
+        observed.append(text)
+
+    async with _client(profile, ("filtered",)) as (client, bodies, _):
+        if first_chunk_s:
+            with pytest.raises(LLMStreamStalled) as exc:
+                await _stream_llm_response(client, [user_msg("hi")], 2, on_delta,
+                                           first_chunk_s=first_chunk_s)
+            assert exc.value.chunks_seen == 0
+            assert observed == []
+        else:
+            response = await _stream_llm_response(client, [user_msg("hi")], 2, on_delta,
+                                                  first_chunk_s=first_chunk_s)
+            assert response.content == "done" and observed == ["done"]
+            assert bodies[0].pings == 30
+        assert bodies[0].closed and not bodies[0].reading

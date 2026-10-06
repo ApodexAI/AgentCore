@@ -11,6 +11,16 @@ from typing import Any
 import httpx
 
 
+class StreamActivity:
+    """Let the adapter acknowledge SDK events it forwards as model deltas."""
+
+    def __init__(self) -> None:
+        self.output_reported = False
+
+    def mark_output(self) -> None:
+        self.output_reported = True
+
+
 class _ActivityByteStream(httpx.AsyncByteStream):
     def __init__(self, inner: Any, on_bytes: Callable[[], None]) -> None:
         self._inner = inner
@@ -51,7 +61,9 @@ def _wrap_byte_stream(inner: Any, on_bytes: Callable[[], None]) -> Any | None:
     return None
 
 
-async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
+async def stream_events_with_activity(
+    stream: Any, activity: StreamActivity | None = None,
+) -> AsyncGenerator[Any, None]:
     """Yield SDK events and ``None`` for real HTTP progress, including pings.
 
     SDKs drop SSE comments or pings before yielding typed events. Observe the
@@ -63,6 +75,8 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
     queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
     end = object()
     bytes_pending = False
+    bytes_epoch = 0
+    activity = activity if activity is not None else StreamActivity()
 
     def flush_activity() -> None:
         nonlocal bytes_pending
@@ -72,10 +86,10 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
                 queue.put_nowait(None)
 
     def on_bytes() -> None:
-        # Deferred until the reader yields: bytes the SDK turns into an event
-        # in the same step are already proven by that event, so token-dense
-        # streams do not carry a heartbeat for every chunk.
-        nonlocal bytes_pending
+        # Defer event-less progress; parsed events carry their byte progress
+        # to the adapter acknowledgement below instead.
+        nonlocal bytes_pending, bytes_epoch
+        bytes_epoch += 1
         if not bytes_pending:
             bytes_pending = True
             asyncio.get_running_loop().call_soon(flush_activity)
@@ -91,10 +105,13 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
 
     async def read_events() -> None:
         nonlocal bytes_pending
+        event_epoch = 0
         try:
             async for event in stream:
+                had_bytes = bytes_epoch != event_epoch
+                event_epoch = bytes_epoch
                 bytes_pending = False
-                await queue.put(event)
+                await queue.put((event, had_bytes))
         except asyncio.CancelledError:
             raise
         except BaseException:
@@ -112,7 +129,16 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
             if event is end:
                 await reader  # Propagate SDK/network errors without swallowing them.
                 break
-            yield event
+            if event is None:
+                yield None
+                continue
+            sdk_event, had_bytes = event
+            activity.output_reported = False
+            yield sdk_event
+            # A signature/status event can be consumed without an adapter
+            # delta. Its bytes must still keep the stall watchdog alive.
+            if had_bytes and not activity.output_reported:
+                yield None
     finally:
         reader.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
