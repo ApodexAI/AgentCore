@@ -67,6 +67,7 @@ from agent_core.messages import Message
 # import these from here. The definitions live in a leaf module so neither
 # side has to import the other's package for them — see that module.
 from agent_core.retry_policy import LEGACY_RETRYABLE_KEYWORDS, legacy_retryable
+from agent_core.runtime.async_utils import closing_stream
 
 logger = logging.getLogger(__name__)
 
@@ -491,8 +492,9 @@ class CooldownFallbackLLM:
                 "request", leg="fallback", mode="cooldown", streaming=True,
             )
             try:
-                async for delta in self.fallback.stream(messages, **kwargs):
-                    yield delta
+                async with closing_stream(self.fallback.stream(messages, **kwargs)) as inner_stream:
+                    async for delta in inner_stream:
+                        yield delta
             except Exception as fallback_error:
                 await self._emit(
                     "error",
@@ -513,10 +515,11 @@ class CooldownFallbackLLM:
                     attempt=attempt + 1,
                     streaming=True,
                 )
-                async for delta in self.primary.stream(messages, **kwargs):
-                    if not delta.transport_activity:
-                        yielded = True
-                    yield delta
+                async with closing_stream(self.primary.stream(messages, **kwargs)) as inner_stream:
+                    async for delta in inner_stream:
+                        if not delta.transport_activity:
+                            yielded = True
+                        yield delta
                 return
             except Exception as error:
                 last_error = error
@@ -570,8 +573,9 @@ class CooldownFallbackLLM:
             "request", leg="fallback", mode="degraded", streaming=True,
         )
         try:
-            async for delta in self.fallback.stream(messages, **kwargs):
-                yield delta
+            async with closing_stream(self.fallback.stream(messages, **kwargs)) as inner_stream:
+                async for delta in inner_stream:
+                    yield delta
         except Exception as fallback_error:
             await self._emit(
                 "error",
@@ -697,30 +701,31 @@ class LLMFallbackChain:
         for idx, entry in enumerate(self.entries):
             yielded_any = False
             try:
-                async for delta in entry.model.stream(
+                async with closing_stream(entry.model.stream(
                     messages,
                     tools=tools,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     extra_headers=extra_headers,
                     timeout=timeout,
-                ):
-                    # ``StreamDelta`` has no ``response_metadata`` channel, but
-                    # it does carry a ``provider`` slot: stamp the serving leg's
-                    # vendor so the stream assembler can fold it into
-                    # ``LLMResponse.response_metadata["provider_actually_used"]``
-                    # (matching the non-streaming ``chat`` path's
-                    # ``_stamp_metadata``). Constant for the whole stream —
-                    # transport activity alone does not commit an entry; output
-                    # and metadata below come from a single committed entry.
-                    # ``fallback_used`` / ``model_actually_used`` still have no
-                    # streaming landing spot; only the billing-critical provider
-                    # is carried here.
-                    if entry.provider and not delta.transport_activity:
-                        delta.provider = entry.provider
-                    if not delta.transport_activity:
-                        yielded_any = True
-                    yield delta
+                )) as inner_stream:
+                    async for delta in inner_stream:
+                        # ``StreamDelta`` has no ``response_metadata`` channel, but
+                        # it does carry a ``provider`` slot: stamp the serving leg's
+                        # vendor so the stream assembler can fold it into
+                        # ``LLMResponse.response_metadata["provider_actually_used"]``
+                        # (matching the non-streaming ``chat`` path's
+                        # ``_stamp_metadata``). Constant for the whole stream —
+                        # transport activity alone does not commit an entry; output
+                        # and metadata below come from a single committed entry.
+                        # ``fallback_used`` / ``model_actually_used`` still have no
+                        # streaming landing spot; only the billing-critical provider
+                        # is carried here.
+                        if entry.provider and not delta.transport_activity:
+                            delta.provider = entry.provider
+                        if not delta.transport_activity:
+                            yielded_any = True
+                        yield delta
                 return
             except Exception as exc:
                 last_exc = exc

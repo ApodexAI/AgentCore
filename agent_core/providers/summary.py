@@ -11,6 +11,8 @@ from typing import Any, NotRequired, TypedDict
 
 import httpx
 
+from agent_core.runtime.async_utils import await_bounded
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +132,14 @@ def truncate_summary_fallback(content: str, limit: int = 20_000) -> str:
     return content
 
 
+class SummaryRequestTimeout(httpx.TimeoutException, TimeoutError):
+    """A summary request exceeded its total deadline.
+
+    An ``httpx`` timeout (and a builtin ``TimeoutError``) so retry predicates
+    written for either keep classifying it as a transient timeout.
+    """
+
+
 class SummaryLLMEngine:
     """Retry ordered raw-HTTP summary candidates and degrade to truncation."""
 
@@ -139,6 +149,7 @@ class SummaryLLMEngine:
         max_retries: int = 4,
         truncate_step: int = 40_960,
         request_timeout: float = 300,
+        total_timeout: float | None = None,
         fallback_limit: int = 20_000,
         usage_recorder: UsageRecorder | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
@@ -147,6 +158,10 @@ class SummaryLLMEngine:
         self.max_retries = max_retries
         self.truncate_step = truncate_step
         self.request_timeout = request_timeout
+        # ``request_timeout`` bounds each httpx phase (connect/read/...);
+        # ``total_timeout`` the whole request, so a slow-drip body cannot
+        # keep resetting the read timer. Defaults to the same value.
+        self.total_timeout = request_timeout if total_timeout is None else total_timeout
         self.fallback_limit = fallback_limit
         self.usage_recorder = usage_recorder
         self.sleep = sleep
@@ -195,14 +210,22 @@ class SummaryLLMEngine:
         headers.update(candidate.get("extra_headers") or {})
 
         current_content = content
+
+        async def post_request() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                return await client.post(endpoint, headers=headers, json=payload)
+
         for attempt in range(self.max_retries):
             try:
-                async with httpx.AsyncClient(timeout=self.request_timeout) as client:
-                    response = await client.post(
-                        endpoint,
-                        headers=headers,
-                        json=payload,
-                    )
+                try:
+                    response = await await_bounded(post_request(), self.total_timeout)
+                except TimeoutError as exc:
+                    if isinstance(exc, httpx.TimeoutException):
+                        raise
+                    raise SummaryRequestTimeout(
+                        f"summary request exceeded its {self.total_timeout:.0f}s "
+                        "total deadline",
+                    ) from exc
                 body = response.text
                 if response.status_code >= 400 and (
                     "maximum context length" in body
@@ -280,6 +303,7 @@ __all__ = [
     "PERMANENT_STATUS_CODES",
     "SummaryCandidate",
     "SummaryLLMEngine",
+    "SummaryRequestTimeout",
     "build_summary_payload",
     "default_summary_retryable",
     "describe_summary_candidates",

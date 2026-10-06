@@ -179,6 +179,58 @@ async def test_heartbeat_does_not_commit_fallback_leg_before_sdk_error():
     assert response.finish_reason == "end_turn"
 
 
+async def test_proxy_smoke_retries_sdk_error_after_heartbeats_before_output():
+    from agent_core.components.middleware.llm.base import LLMMiddleware, LLMMiddlewareChain
+    from agent_core.components.middleware.llm.proxy import LLMProxy
+
+    bodies, requests, chunks, after_calls, errors = [], [], [], [], []
+
+    class RetryRecorder(LLMMiddleware):
+        name = "retry_recorder"
+
+        async def on_llm_error(self, ctx, error, attempt):
+            errors.append((error, attempt))
+            return attempt == 0
+
+        async def on_chunk(self, ctx, delta, accumulated):
+            chunks.append(delta)
+            return False
+
+        async def after_llm(self, ctx, response):
+            after_calls.append((response, dict(ctx.metadata)))
+            return response
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        body = _Body("error" if len(requests) == 1 else "healthy")
+        bodies.append(body)
+        return sdk_httpx.Response(200, stream=body, headers={"content-type": "text/event-stream"})
+
+    client = AnthropicClient("claude-x", api_key="k",
+                             thinking={"type": "adaptive", "display": "omitted"})
+    await client._client.close()
+    async with AsyncAnthropic(api_key="k", max_retries=0, http_client=sdk_httpx.AsyncClient(
+        transport=sdk_httpx.MockTransport(respond),
+    )) as sdk:
+        client._client = sdk
+        chain = LLMMiddlewareChain()
+        chain.add(RetryRecorder())
+        proxy = LLMProxy(client, chain)
+        response = await _stream_llm_response(proxy, [user_msg("hi")], 2, _ignore)
+
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    assert len(errors) == 1 and errors[0][1] == 0
+    assert all(body.pings == 30 and body.closed and not body.reading for body in bodies)
+    assert all(not delta.transport_activity for delta in chunks)
+    assert len(after_calls) == 1
+    assert after_calls[0][0].content == "done"
+    assert "error" not in after_calls[0][1]
+    assert response.usage["completion_tokens"] == 20
+    assert response.finish_reason == "end_turn"
+    assert response.content[-1] == {"type": "text", "text": "done"}
+
+
 async def test_loop_smoke_omitted_thinking_tool_then_final_answer():
     from agent_core.loop_types import LoopConfig, LoopPolicy
     from agent_core.runtime.loop.agent_loop import run_agent_loop
@@ -245,3 +297,127 @@ async def test_loop_smoke_omitted_thinking_tool_then_final_answer():
     assert assistant["content"][0] == {"type": "thinking", "thinking": "", "signature": "signed"}
     assert assistant["content"][1]["id"] == "call_1"
     assert requests[1]["messages"][-1]["content"][0]["tool_use_id"] == "call_1"
+
+
+@pytest.mark.parametrize("visible_reasoning,first_chunk_s", [
+    (True, 0.1), (False, 0.0), (False, 0.05),
+])
+async def test_signature_only_byte_progress_preserves_stall_and_first_chunk_bounds(
+    monkeypatch, visible_reasoning, first_chunk_s,
+):
+    class SignatureBody(_Body):
+        async def __aiter__(self):
+            self.reading = True
+            try:
+                yield _sse(_opening())
+                yield _sse({"type": "content_block_start", "index": 0,
+                            "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
+                if visible_reasoning:
+                    yield _sse({"type": "content_block_delta", "index": 0,
+                                "delta": {"type": "thinking_delta", "thinking": "thinking"}})
+                for _ in range(10):
+                    await asyncio.sleep(0.03)
+                    yield _sse({"type": "content_block_delta", "index": 0,
+                                "delta": {"type": "signature_delta", "signature": "sig"}})
+                for event in _ending()[1:]:
+                    yield _sse(event)
+            finally:
+                self.reading = False
+
+    monkeypatch.setattr(f"{__name__}._Body", SignatureBody)
+    observed = []
+
+    async def on_delta(text, accumulated, index, thinking, **kwargs):
+        observed.append((text, thinking))
+
+    async with _client() as (client, body, _):
+        if not visible_reasoning and first_chunk_s:
+            with pytest.raises(LLMStreamStalled) as exc:
+                await _stream_llm_response(client, [user_msg("hi")], 2, on_delta,
+                                           first_chunk_s=first_chunk_s)
+            assert exc.value.chunks_seen == 0
+            assert observed == []
+        else:
+            response = await _stream_llm_response(client, [user_msg("hi")], 2, on_delta,
+                                                  first_chunk_s=first_chunk_s)
+            assert response.content[0]["signature"] == "sig" * 10
+            assert response.content[-1] == {"type": "text", "text": "done"}
+            assert observed == ([("", "thinking")] if visible_reasoning else []) + [("done", "")]
+        assert body.closed and not body.reading
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "chain", "cooldown_primary", "cooldown_fallback", "cooldown_degraded"])
+async def test_middleware_abort_keeps_gate_until_sdk_body_closes(monkeypatch, wrapper):
+    import contextlib
+
+    from agent_core.components.middleware.llm.base import LLMMiddleware, LLMMiddlewareChain
+    from agent_core.components.middleware.llm.proxy import LLMProxy
+    from agent_core.providers import _stream_activity as activity_module
+    from agent_core.providers.fallback import CooldownFallbackLLM
+    from agent_core.runtime import async_utils
+    from agent_core.runtime.loop import _call as call_module
+
+    entered, release, closed = (asyncio.Event() for _ in range(3))
+
+    class Body(_Body):
+        async def __aiter__(self):
+            yield _sse(_opening())
+            yield _sse({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""}})
+            yield _sse({"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": "hello"}})
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            entered.set()
+            while not release.is_set():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await release.wait()
+            await super().aclose()
+            closed.set()
+
+    class Abort(LLMMiddleware):
+        name = "abort"
+
+        async def on_chunk(self, *args):
+            return True
+
+    class Unavailable:
+        model = "unavailable"
+
+        async def stream(self, *args, **kwargs):
+            raise RuntimeError("unavailable")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(f"{__name__}._Body", Body)
+    monkeypatch.setattr(activity_module, "_CLEANUP_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(async_utils, "_STREAM_CLOSE_TIMEOUT_S", 0.03)
+    gate = asyncio.Semaphore(1)
+    monkeypatch.setattr(call_module, "_llm_gate", lambda: gate)
+    async with _client() as (client, body, _):
+        inner = client
+        if wrapper == "chain":
+            inner = LLMFallbackChain([FallbackEntry(model=client)])
+        elif wrapper.startswith("cooldown"):
+            inner = CooldownFallbackLLM(
+                Unavailable() if wrapper == "cooldown_degraded" else client,
+                client, max_retries=1,
+            )
+            if wrapper == "cooldown_fallback":
+                inner._cooldown_until = float("inf")
+        chain = LLMMiddlewareChain()
+        chain.add(Abort())
+        try:
+            response = await asyncio.wait_for(call_module.call_llm(
+                LLMProxy(inner, chain), [user_msg("hi")], 1, 1, 1, on_delta=_ignore,
+            ), 0.5)
+            assert response.content == "hello"
+            assert entered.is_set()
+            assert not closed.is_set() and not body.closed
+            assert gate._value == 0  # Cleanup is still live after the caller returns.
+        finally:
+            release.set()
+            await asyncio.wait_for(closed.wait(), 0.5)
+            for _ in range(10):
+                await asyncio.sleep(0)
+        assert gate._value == 1  # Released exactly once when all held I/O settles.

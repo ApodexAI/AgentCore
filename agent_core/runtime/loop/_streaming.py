@@ -15,10 +15,12 @@ from agent_core.errors import (
 )
 from agent_core.llm import LLMResponse
 from agent_core.messages import Message, ToolCall
+from agent_core.runtime.async_utils import await_bounded
 
 from ._runaway import _env_float, _env_int
 
 logger = logging.getLogger(__name__)
+_CLEANUP_TIMEOUT_S = 5.0
 # ── Stream-stall watchdog ─────────────────────────────────────────────
 # A streaming request can be black-holed without a chunk, error, or connection
 # close. Inter-chunk deadlines distinguish that state from slow decoding.
@@ -219,11 +221,13 @@ async def _stream_llm_response(
     without FIN — raises :class:`LLMStreamStalled` after ``stall_s``
     instead of pinning the attempt for the full call ``timeout``. Any
     chunk (text / reasoning / tool args) resets the timer, so
-    slow-but-alive generations are never flagged. The FIRST chunk gets
+    slow-but-alive generations are never flagged; so does transport
+    activity (SSE heartbeats the SDK filters out). The FIRST chunk gets
     an optionally tighter bound (:data:`_FIRST_CHUNK_ENV`) because a
     healthy gateway delivers TTFT in seconds — zero chunks after tens
-    of seconds means black-holed, not thinking. The bound is one
-    long-lived ``asyncio.timeout`` rescheduled per chunk — a single
+    of seconds means black-holed, not thinking. Transport activity does
+    not satisfy that bound, and ``chunks_seen`` counts only real chunks.
+    The bound is one long-lived ``asyncio.timeout`` rescheduled per chunk — a single
     timer-handle mutation — rather than a per-chunk ``wait_for`` (which
     would allocate a future + timer on a loop that runs ~100k times for
     a long generation).
@@ -374,7 +378,9 @@ async def _stream_llm_response(
 
     async def _close_chunk_stream() -> None:
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(chunk_stream.aclose(), timeout=5.0)
+            await await_bounded(
+                chunk_stream.aclose(), _CLEANUP_TIMEOUT_S, hold=True,
+            )
 
     try:
         async with asyncio.timeout(timeout):
@@ -382,7 +388,16 @@ async def _stream_llm_response(
                 initial_s if initial_s > 0 else None,
             ) as stall_scope:
                 async for delta in chunk_stream:
-                    chunks_seen += 1
+                    if getattr(delta, "transport_activity", False):
+                        # Heartbeats prove a live socket, not first-token
+                        # progress: an armed first-chunk bound still waits
+                        # for real output (a gateway can keep-alive a
+                        # black-holed queue). Afterwards, and when no such
+                        # bound is armed, they extend the stall window below.
+                        if chunks_seen == 0 and first_s > 0:
+                            continue
+                    else:
+                        chunks_seen += 1
                     raw_visible = delta.content or ""
                     typed_thinking = delta.reasoning_content or ""
                     tc_chunks = delta.tool_call_deltas or []
@@ -557,6 +572,8 @@ async def _stream_llm_response(
                 time.monotonic() - stream_started,
             ) from exc
         raise
+    finally:
+        await _close_chunk_stream()
 
     # Drain any bytes the splitter held back at a partial-tag boundary.
     visible_flush, thinking_flush = think_splitter.flush()

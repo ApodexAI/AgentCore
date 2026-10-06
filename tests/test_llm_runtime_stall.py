@@ -285,6 +285,51 @@ async def test_first_chunk_per_call_param_wins_over_env(monkeypatch) -> None:
     assert exc_info.value.last_exc.stall_s == pytest.approx(0.2)
 
 
+class _HeartbeatLLM:
+    """Transport heartbeats only, optionally after one real chunk."""
+
+    def __init__(self, preamble: int = 0, beats: int = 20) -> None:
+        self.preamble, self.beats = preamble, beats
+
+    async def stream(self, messages, **_kw):
+        for i in range(self.preamble):
+            yield StreamDelta(content=f"chunk{i} ")
+        for _ in range(self.beats):
+            await asyncio.sleep(0.02)
+            yield StreamDelta(transport_activity=True)
+        yield StreamDelta(content="done")
+
+
+@pytest.mark.asyncio
+async def test_heartbeats_do_not_satisfy_first_chunk_bound(monkeypatch) -> None:
+    """A gateway can keep-alive a black-holed queue: heartbeats before any
+    real chunk must not defeat the TTFT bound, nor count as chunks."""
+    monkeypatch.setenv("MIROHARNESS_LLM_STREAM_STALL_S", "30")
+    with pytest.raises(LLMCallExhausted) as exc_info:
+        await call_llm(
+            _HeartbeatLLM(), MSGS, timeout=600, max_retries=1, turn=1,
+            on_delta=_sink_delta, retry_wait_fixed=0, first_chunk_s=0.1,
+        )
+    assert isinstance(exc_info.value.last_exc, LLMStreamStalled)
+    assert exc_info.value.last_exc.chunks_seen == 0
+    assert exc_info.value.last_exc.stall_s == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_heartbeats_extend_stall_after_first_chunk(monkeypatch) -> None:
+    """After real output, and with no TTFT bound armed, heartbeats keep a
+    silent-but-alive stream past the stall window."""
+    monkeypatch.setenv("MIROHARNESS_LLM_STREAM_STALL_S", "0.1")
+    for preamble, first_chunk_s in ((1, 0.1), (0, 0)):
+        response = await call_llm(
+            _HeartbeatLLM(preamble=preamble), MSGS, timeout=30, max_retries=1,
+            turn=1, on_delta=_sink_delta, retry_wait_fixed=0,
+            first_chunk_s=first_chunk_s,
+        )
+        assert response is not None
+        assert response.content.endswith("done")
+
+
 @pytest.mark.asyncio
 async def test_first_chunk_default_off_and_invalid_env(monkeypatch) -> None:
     """No env → disabled (first chunk rides the stall bound); junk env

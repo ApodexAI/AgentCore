@@ -29,6 +29,7 @@ payloads. See ``temp/2026-07-09_reasoning-protocol-live-verification.md`` and
 from __future__ import annotations
 
 # pyright: basic, reportPrivateImportUsage=false
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -39,6 +40,7 @@ from agent_core.errors import LLMError
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.providers._api_key import resolve_openai_api_key
+from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
 from agent_core.providers.finish_reason import (
     normalize_finish_reason,
     responses_finish_reason,
@@ -187,30 +189,38 @@ class OpenAIResponsesClient(LLMClient):
         )
         kwargs["stream"] = True
         stream = await self._client.responses.create(**kwargs)
-        async for event in stream:
-            etype = getattr(event, "type", "")
-            if etype == "response.output_text.delta":
-                yield StreamDelta(content=getattr(event, "delta", "") or "")
-            elif etype in (
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_text.delta",
-            ):
-                yield StreamDelta(reasoning_content=getattr(event, "delta", "") or "")
-            elif etype == "response.failed":
-                raise _response_failure(
-                    getattr(event, "response", None), fallback="Responses request failed",
-                )
-            elif etype in ("response.completed", "response.incomplete"):
-                resp = getattr(event, "response", None)
-                usage = _responses_usage_dict(getattr(resp, "usage", None))
-                reason = normalize_finish_reason(
-                    _get(_get(resp, "incomplete_details", None) or {}, "reason", ""),
-                )
-                yield StreamDelta(
-                    usage=usage,
-                    model=getattr(resp, "model", "") or "",
-                    finish_reason=reason or "stop",
-                )
+        activity = StreamActivity()
+        async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
+            async for event in events:
+                if event is None:
+                    yield StreamDelta(transport_activity=True)
+                    continue
+                etype = getattr(event, "type", "")
+                if etype == "response.output_text.delta":
+                    activity.mark_output()
+                    yield StreamDelta(content=getattr(event, "delta", "") or "")
+                elif etype in (
+                    "response.reasoning_summary_text.delta",
+                    "response.reasoning_text.delta",
+                ):
+                    activity.mark_output()
+                    yield StreamDelta(reasoning_content=getattr(event, "delta", "") or "")
+                elif etype == "response.failed":
+                    raise _response_failure(
+                        getattr(event, "response", None), fallback="Responses request failed",
+                    )
+                elif etype in ("response.completed", "response.incomplete"):
+                    resp = getattr(event, "response", None)
+                    usage = _responses_usage_dict(getattr(resp, "usage", None))
+                    reason = normalize_finish_reason(
+                        _get(_get(resp, "incomplete_details", None) or {}, "reason", ""),
+                    )
+                    activity.mark_output()
+                    yield StreamDelta(
+                        usage=usage,
+                        model=getattr(resp, "model", "") or "",
+                        finish_reason=reason or "stop",
+                    )
 
 
 # ── Conversion helpers (pure — unit-tested) ────────────────────────────────

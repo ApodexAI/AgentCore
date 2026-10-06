@@ -110,6 +110,79 @@ async def test_after_llm_fires_once_across_a_retry():
 
 
 @pytest.mark.asyncio
+async def test_transport_activity_keeps_retry_eligible_and_skips_output_hooks():
+    class HeartbeatInner(_Inner):
+        async def stream(self, messages, **kwargs):
+            self.stream_calls += 1
+            yield StreamDelta(transport_activity=True)
+            if self.stream_calls == 1:
+                raise RuntimeError("upstream reset")
+            yield StreamDelta(content="hello")
+
+    chunks = []
+
+    class Recorder(_Recorder):
+        async def on_chunk(self, ctx, delta, accumulated):
+            chunks.append((delta, accumulated))
+            return False
+
+    rec = Recorder(retries=1)
+    inner = HeartbeatInner()
+    proxy = LLMProxy(inner=inner, chain=_chain(rec), role_id="r")
+    deltas = [d async for d in proxy.stream([user_msg("q")])]
+
+    assert sum(d.transport_activity for d in deltas) == 2
+    assert inner.stream_calls == 2
+    assert rec.error_calls == 1
+    assert rec.after_calls == ["hello"]
+    assert chunks == [(deltas[-1], "hello")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", [
+    StreamDelta(content="partial"),
+    StreamDelta(reasoning_content="thinking"),
+    StreamDelta(tool_call_deltas=[{"index": 0, "name": "search"}]),
+])
+async def test_transport_activity_does_not_reenable_retry_after_output(output):
+    class PartialInner(_Inner):
+        async def stream(self, messages, **kwargs):
+            self.stream_calls += 1
+            yield output
+            yield StreamDelta(transport_activity=True)
+            raise RuntimeError("upstream reset")
+
+    rec = _Recorder(retries=1)
+    inner = PartialInner()
+    proxy = LLMProxy(inner=inner, chain=_chain(rec), role_id="r")
+    with pytest.raises(RuntimeError, match="upstream reset"):
+        await _drain(proxy)
+
+    assert inner.stream_calls == 1
+    assert rec.error_calls == 0
+    assert len(rec.after_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_only_failures_stop_at_middleware_retry_limit():
+    class FailingInner(_Inner):
+        async def stream(self, messages, **kwargs):
+            self.stream_calls += 1
+            yield StreamDelta(transport_activity=True)
+            raise RuntimeError("upstream reset")
+
+    rec = _Recorder(retries=1)
+    inner = FailingInner()
+    proxy = LLMProxy(inner=inner, chain=_chain(rec), role_id="r")
+    with pytest.raises(RuntimeError, match="upstream reset"):
+        await _drain(proxy)
+
+    assert inner.stream_calls == 2
+    assert rec.error_calls == 2
+    assert rec.after_calls == [""]
+
+
+@pytest.mark.asyncio
 async def test_after_llm_still_fires_once_when_every_attempt_fails():
     rec = _Recorder(retries=1)
     inner = _Inner(fail_times=99)
