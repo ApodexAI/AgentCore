@@ -4,21 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
-from anthropic import DefaultAsyncHttpxClient
-
-# Anthropic SDK v1 uses httpx2; older supported SDKs use httpx. The response
-# requires its own transport's AsyncByteStream, not merely a duck-typed one.
-if TYPE_CHECKING or issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
-    from httpx import AsyncByteStream
-else:
-    from httpx2 import AsyncByteStream
 
 
-class _ActivityByteStream(AsyncByteStream):
+class StreamActivity:
+    """Let the adapter acknowledge SDK events it forwards as model deltas."""
+
+    def __init__(self) -> None:
+        self.output_reported = False
+
+    def mark_output(self) -> None:
+        self.output_reported = True
+
+
+class _ActivityByteStream(httpx.AsyncByteStream):
     def __init__(self, inner: Any, on_bytes: Callable[[], None]) -> None:
         self._inner = inner
         self._on_bytes = on_bytes
@@ -33,35 +36,82 @@ class _ActivityByteStream(AsyncByteStream):
         await self._inner.aclose()
 
 
-async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
+@functools.cache
+def _httpx2_stream_types() -> tuple[type, type] | None:
+    try:
+        from httpx2 import AsyncByteStream
+    except ImportError:
+        return None
+
+    class _Httpx2ActivityByteStream(_ActivityByteStream, AsyncByteStream):
+        pass
+
+    return AsyncByteStream, _Httpx2ActivityByteStream
+
+
+def _wrap_byte_stream(inner: Any, on_bytes: Callable[[], None]) -> Any | None:
+    # SDKs can use different transports in the same process. Match the actual
+    # response stream, rather than selecting a base from one SDK's version.
+    # ``None`` means an unknown stream: leave it untouched rather than break it.
+    if isinstance(inner, httpx.AsyncByteStream):
+        return _ActivityByteStream(inner, on_bytes)
+    httpx2_types = _httpx2_stream_types()
+    if httpx2_types is not None and isinstance(inner, httpx2_types[0]):
+        return httpx2_types[1](inner, on_bytes)
+    return None
+
+
+async def stream_events_with_activity(
+    stream: Any, activity: StreamActivity | None = None,
+) -> AsyncGenerator[Any, None]:
     """Yield SDK events and ``None`` for real HTTP progress, including pings.
 
-    Anthropic's SDK drops SSE pings before yielding typed events. Observe the
-    public response byte stream before that filtering, and let the SDK continue
+    SDKs drop SSE comments or pings before yielding typed events. Observe the
+    public response byte stream before that filtering, and let each SDK continue
     to own parsing, errors, signatures and Bedrock event decoding. A bounded
     queue preserves event order without accumulating tokens or heartbeats.
     No timer invents activity: a silent socket still trips the caller's guard.
     """
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+    end = object()
+    bytes_pending = False
+    bytes_epoch = 0
+    activity = activity if activity is not None else StreamActivity()
+
+    def flush_activity() -> None:
+        nonlocal bytes_pending
+        if bytes_pending:
+            bytes_pending = False
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(None)
+
+    def on_bytes() -> None:
+        # Defer event-less progress; parsed events carry their byte progress
+        # to the adapter acknowledgement below instead.
+        nonlocal bytes_pending, bytes_epoch
+        bytes_epoch += 1
+        if not bytes_pending:
+            bytes_pending = True
+            asyncio.get_running_loop().call_soon(flush_activity)
+
     response = getattr(stream, "response", None)
-    if response is None:
-        # Also support custom/test SDK iterators without an HTTP response.
+    wrapped = _wrap_byte_stream(getattr(response, "stream", None), on_bytes)
+    if response is None or wrapped is None:
+        # Custom/test SDK iterators, or a transport we cannot observe safely.
         async for event in stream:
             yield event
         return
-
-    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
-    end = object()
-
-    def on_bytes() -> None:
-        with contextlib.suppress(asyncio.QueueFull):
-            queue.put_nowait(None)
-
-    response.stream = _ActivityByteStream(response.stream, on_bytes)
+    response.stream = wrapped
 
     async def read_events() -> None:
+        nonlocal bytes_pending
+        event_epoch = 0
         try:
             async for event in stream:
-                await queue.put(event)
+                had_bytes = bytes_epoch != event_epoch
+                event_epoch = bytes_epoch
+                bytes_pending = False
+                await queue.put((event, had_bytes))
         except asyncio.CancelledError:
             raise
         except BaseException:
@@ -72,14 +122,23 @@ async def stream_events_with_activity(stream: Any) -> AsyncGenerator[Any, None]:
 
     reader = asyncio.create_task(read_events())
     try:
-        # Receiving HTTP headers is progress too; it ends the first-byte wait.
+        # Receiving HTTP headers is socket progress too (not first output).
         yield None
         while True:
             event = await queue.get()
             if event is end:
                 await reader  # Propagate SDK/network errors without swallowing them.
                 break
-            yield event
+            if event is None:
+                yield None
+                continue
+            sdk_event, had_bytes = event
+            activity.output_reported = False
+            yield sdk_event
+            # A signature/status event can be consumed without an adapter
+            # delta. Its bytes must still keep the stall watchdog alive.
+            if had_bytes and not activity.output_reported:
+                yield None
     finally:
         reader.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
