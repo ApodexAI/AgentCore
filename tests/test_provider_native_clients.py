@@ -1139,6 +1139,7 @@ async def test_anthropic_stream_omits_blocks_for_a_plain_text_turn():
         yield SimpleNamespace(type="message_delta",
                               delta=SimpleNamespace(stop_reason="end_turn"),
                               usage=SimpleNamespace(output_tokens=2))
+        yield SimpleNamespace(type="message_stop")
 
     c = ac.AnthropicClient("claude-x", api_key="x")
     c._client = SimpleNamespace(
@@ -1480,6 +1481,7 @@ async def test_anthropic_streamed_refusal_reports_the_same_detail():
             ),
             usage=SimpleNamespace(output_tokens=0),
         ),
+        SimpleNamespace(type="message_stop"),
     ]
 
     class _Stream:

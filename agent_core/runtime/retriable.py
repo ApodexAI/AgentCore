@@ -149,6 +149,9 @@ _TRANSIENT_NETWORK_PATTERNS = (
     # extractor sees them.
     re.compile(r"gateway[\s_]*time[\s_]*out", re.IGNORECASE),
     re.compile(r"upstream[\s_]*(?:timeout|error)", re.IGNORECASE),
+    # ``LLMTruncatedStream``: the connection carrying the stream was dropped
+    # before the protocol terminator. Same-key resample, like a reset.
+    re.compile(r"truncated[\s_]*stream", re.IGNORECASE),
 )
 
 # Runtime stream watchdog. Matched by type name / message text instead of

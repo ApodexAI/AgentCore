@@ -108,6 +108,53 @@ class LLMEmptyCompletion(LLMError):
         )
 
 
+class LLMTruncatedStream(LLMError):
+    """An Anthropic stream ended without its protocol terminator.
+
+    The Messages streaming protocol always closes with ``message_delta``
+    (stop_reason + output usage) followed by ``message_stop``. A stream that
+    ends before ``message_stop`` was cut off, whatever it carried so far, and
+    the client cannot tell that from a deliberate stop: the SDK raises only on
+    an SSE ``error`` event or a broken chunked body, and a gateway that loses
+    its upstream mid-generation can do neither and simply finish the response
+    body. What comes back is well-formed and short — thinking, no text, no tool
+    call — and the loop reads it as "the model chose to stop" and ends the run.
+
+    Measured on ApodexHarness's 2026-10-07 GDPval batch over llm-hub: 10 of 15
+    finished trials ended this way, in three bursts where several unrelated
+    in-flight streams were cut in the same second (02:42:20, 03:00:35 and
+    03:07:46 UTC). Every one still carried ``message_start`` usage, so the
+    empty-completion guard (which requires *no* usage) let it through.
+
+    The wording matches ``_TRANSIENT_NETWORK_PATTERNS``: a dropped connection
+    is retried on the same key with backoff, which is what clears it. The
+    carried fields are the stream's end record, so the cause is visible in the
+    retry log and attempt telemetry instead of only in a missing deliverable.
+    """
+
+    def __init__(
+        self,
+        *,
+        last_event: str,
+        events_seen: int,
+        saw_message_delta: bool,
+        block_types: list[str],
+        elapsed_s: float,
+    ) -> None:
+        self.last_event = last_event
+        self.events_seen = int(events_seen)
+        self.saw_message_delta = bool(saw_message_delta)
+        self.block_types = list(block_types)
+        self.elapsed_s = float(elapsed_s)
+        super().__init__(
+            "truncated stream: ended without message_stop "
+            f"(last_event={last_event or 'none'}, events_seen={self.events_seen}, "
+            f"message_delta={'yes' if self.saw_message_delta else 'no'}, "
+            f"blocks=[{','.join(self.block_types)}], "
+            f"elapsed={self.elapsed_s:.1f}s)",
+        )
+
+
 class LLMStreamStalled(LLMError, TimeoutError):
     """A streaming LLM call went silent mid-flight.
 
@@ -193,6 +240,7 @@ __all__ = [
     "LLMError",
     "LLMReasoningRunaway",
     "LLMStreamStalled",
+    "LLMTruncatedStream",
     "PermissionDenied",
     "ServiceNotRegistered",
     "TaskNotFoundError",
