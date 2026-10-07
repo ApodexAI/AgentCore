@@ -13,6 +13,45 @@ from agent_core.messages import Message, assistant_msg, for_wire, system_msg, to
 from agent_core.providers.anthropic import AnthropicClient
 from agent_core.runtime.loop import _call
 from agent_core.runtime.loop._bind import bind_max_tokens
+from agent_core.runtime.loop._runaway import _expanded_retry_max_tokens
+
+
+@pytest.mark.parametrize(("active_cap", "expected"), [
+    (100_000, 128_000),
+    (128_000, None),
+])
+def test_expansion_respects_model_output_limit(active_cap: int, expected: int | None) -> None:
+    assert _expanded_retry_max_tokens(
+        active_cap, [user_msg("question")], 1_048_576, 128_000,
+    ) == expected
+
+
+@pytest.mark.asyncio
+async def test_runaway_at_model_output_limit_skips_invalid_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_call, "_RUNAWAY_BACKOFF_S", 0.0)
+    client = AnthropicClient("claude-opus-5-5", api_key="test-key", max_tokens=128_000)
+    wire_caps: list[int] = []
+
+    async def create(**kwargs: Any) -> Any:
+        wire_caps.append(kwargs["max_tokens"])
+        done = len(wire_caps) == 2
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="done")] if done else [],
+            stop_reason="end_turn" if done else "max_tokens",
+            model="claude-opus-5-5", id=f"response-{len(wire_caps)}",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=2 if done else 128_000),
+        )
+
+    client._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=create)))
+    response = await _call.call_llm(
+        client, [user_msg("question")], timeout=30, max_retries=3, turn=1,
+        max_completion_tokens_hint=128_000, context_token_limit_hint=1_048_576,
+    )
+
+    assert response is not None and response.content == "done"
+    assert wire_caps == [128_000, 8_192]
 
 
 @pytest.mark.parametrize("retry_path", [
