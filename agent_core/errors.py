@@ -155,6 +155,25 @@ class LLMTruncatedStream(LLMError):
         )
 
 
+class LLMOpenAITruncatedStream(LLMError):
+    """An OpenAI-compatible stream closed before a completion signal."""
+
+    def __init__(
+        self, *, protocol: str, last_event: str, events_seen: int,
+        expected: str, elapsed_s: float,
+    ) -> None:
+        self.protocol = protocol
+        self.last_event = last_event
+        self.events_seen = int(events_seen)
+        self.expected = expected
+        self.elapsed_s = float(elapsed_s)
+        super().__init__(
+            f"truncated stream: {protocol} ended without {expected} "
+            f"(last_event={last_event or 'none'}, events_seen={self.events_seen}, "
+            f"elapsed={self.elapsed_s:.1f}s)",
+        )
+
+
 class LLMStreamStalled(LLMError, TimeoutError):
     """A streaming LLM call went silent mid-flight.
 
@@ -238,6 +257,7 @@ __all__ = [
     "LLMDeadlineExceeded",
     "LLMEmptyCompletion",
     "LLMError",
+    "LLMOpenAITruncatedStream",
     "LLMReasoningRunaway",
     "LLMStreamStalled",
     "LLMTruncatedStream",

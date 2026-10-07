@@ -31,12 +31,13 @@ from __future__ import annotations
 # pyright: basic, reportPrivateImportUsage=false
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 from openai import AsyncOpenAI
 
-from agent_core.errors import LLMError
+from agent_core.errors import LLMError, LLMOpenAITruncatedStream
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.providers._api_key import resolve_openai_api_key
@@ -190,12 +191,18 @@ class OpenAIResponsesClient(LLMClient):
         kwargs["stream"] = True
         stream = await self._client.responses.create(**kwargs)
         activity = StreamActivity()
+        started = time.monotonic()
+        events_seen = 0
+        last_event = ""
+        saw_terminal = False
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
                     yield StreamDelta(transport_activity=True)
                     continue
                 etype = getattr(event, "type", "")
+                events_seen += 1
+                last_event = etype
                 if etype == "response.output_text.delta":
                     activity.mark_output()
                     yield StreamDelta(content=getattr(event, "delta", "") or "")
@@ -210,6 +217,7 @@ class OpenAIResponsesClient(LLMClient):
                         getattr(event, "response", None), fallback="Responses request failed",
                     )
                 elif etype in ("response.completed", "response.incomplete"):
+                    saw_terminal = True
                     resp = getattr(event, "response", None)
                     usage = _responses_usage_dict(getattr(resp, "usage", None))
                     reason = normalize_finish_reason(
@@ -221,6 +229,13 @@ class OpenAIResponsesClient(LLMClient):
                         model=getattr(resp, "model", "") or "",
                         finish_reason=reason or "stop",
                     )
+        if not saw_terminal:
+            raise LLMOpenAITruncatedStream(
+                protocol="responses", last_event=last_event,
+                events_seen=events_seen,
+                expected="response.completed or response.incomplete",
+                elapsed_s=time.monotonic() - started,
+            )
 
 
 # ── Conversion helpers (pure — unit-tested) ────────────────────────────────

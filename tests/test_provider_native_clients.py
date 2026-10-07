@@ -414,7 +414,7 @@ async def test_openai_stream_mirrors_session_into_extra_query():
     async def fake_stream():
         yield SimpleNamespace(choices=[SimpleNamespace(
             delta=SimpleNamespace(content="ok", reasoning_content=None,
-                                  tool_calls=None))])
+                                  tool_calls=None), finish_reason="stop")])
 
     create = AsyncMock(return_value=fake_stream())
     c._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
@@ -461,7 +461,8 @@ async def test_openai_stream_yields_deltas_and_skips_choiceless_chunks():
                 content="llo", reasoning_content="r",
                 tool_calls=[SimpleNamespace(
                     index=0, id="c1",
-                    function=SimpleNamespace(name="f", arguments='{}'))]))])
+                    function=SimpleNamespace(name="f", arguments='{}'))]),
+            finish_reason="tool_calls")])
 
     c._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
         create=AsyncMock(return_value=fake_stream()),

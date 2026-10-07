@@ -20,20 +20,49 @@ class StreamActivity:
 
     def __init__(self) -> None:
         self.output_reported = False
+        # The OpenAI SDK consumes the Chat Completions [DONE] sentinel without
+        # yielding it. Keep this wire-level signal for the adapter's end check.
+        self.saw_done = False
+        self._line = b""
+        self._line_long = False
 
     def mark_output(self) -> None:
         self.output_reported = True
 
+    def observe_bytes(self, chunk: bytes) -> None:
+        if self.saw_done:
+            return
+        parts = chunk.split(b"\n")
+        for part in parts[:-1]:
+            self._append_line(part)
+            if not self._line_long:
+                line = self._line.strip()
+                if line.startswith(b"data:") and line[5:].strip() == b"[DONE]":
+                    self.saw_done = True
+            self._line = b""
+            self._line_long = False
+        self._append_line(parts[-1])
+
+    def _append_line(self, part: bytes) -> None:
+        # Only the short sentinel line matters; never retain an unbounded SSE
+        # JSON line containing model output.
+        if not self._line_long:
+            if len(self._line) + len(part) <= 32:
+                self._line += part
+            else:
+                self._line = b""
+                self._line_long = True
+
 
 class _ActivityByteStream(httpx.AsyncByteStream):
-    def __init__(self, inner: Any, on_bytes: Callable[[], None]) -> None:
+    def __init__(self, inner: Any, on_bytes: Callable[[bytes], None]) -> None:
         self._inner = inner
         self._on_bytes = on_bytes
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         async for chunk in self._inner:
             if chunk:
-                self._on_bytes()
+                self._on_bytes(chunk)
             yield chunk
 
     async def aclose(self) -> None:
@@ -53,7 +82,7 @@ def _httpx2_stream_types() -> tuple[type, type] | None:
     return AsyncByteStream, _Httpx2ActivityByteStream
 
 
-def _wrap_byte_stream(inner: Any, on_bytes: Callable[[], None]) -> Any | None:
+def _wrap_byte_stream(inner: Any, on_bytes: Callable[[bytes], None]) -> Any | None:
     # SDKs can use different transports in the same process. Match the actual
     # response stream, rather than selecting a base from one SDK's version.
     # ``None`` means an unknown stream: leave it untouched rather than break it.
@@ -89,10 +118,11 @@ async def stream_events_with_activity(
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(None)
 
-    def on_bytes() -> None:
+    def on_bytes(chunk: bytes) -> None:
         # Defer event-less progress; parsed events carry their byte progress
         # to the adapter acknowledgement below instead.
         nonlocal bytes_pending, bytes_epoch
+        activity.observe_bytes(chunk)
         bytes_epoch += 1
         if not bytes_pending:
             bytes_pending = True

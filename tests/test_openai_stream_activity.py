@@ -11,12 +11,13 @@ from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from agent_core.components.middleware.llm.base import LLMMiddleware, LLMMiddlewareChain
 from agent_core.components.middleware.llm.proxy import LLMProxy
-from agent_core.errors import LLMReasoningRunaway, LLMStreamStalled
+from agent_core.errors import LLMOpenAITruncatedStream, LLMReasoningRunaway, LLMStreamStalled
 from agent_core.messages import user_msg
 from agent_core.providers.fallback import FallbackEntry, LLMFallbackChain
 from agent_core.providers.openai_chat import OpenAIClient
 from agent_core.providers.openai_responses import OpenAIResponsesClient
 from agent_core.runtime.loop._streaming import _stream_llm_response
+from agent_core.runtime.retriable import classify_error, is_retriable_with_fallback
 
 if issubclass(DefaultAsyncHttpxClient, httpx.AsyncClient):
     sdk_httpx = httpx
@@ -97,7 +98,8 @@ class _Body(sdk_httpx.AsyncByteStream):
                     yield _sse({"type": "response.reasoning_summary_text.delta", "item_id": "r1",
                                 "output_index": 0, "summary_index": 0, "delta": "thinking",
                                 "sequence_number": 0}, "response.reasoning_summary_text.delta")
-            beats = {"dense": 0, "long": 100}.get(self.mode, 30)
+            beats = {"dense": 0, "long": 100, "truncated": 0,
+                     "done_only": 0, "finish_only": 0}.get(self.mode, 30)
             for _ in range(beats):
                 await asyncio.sleep(0.01)
                 self.pings += 1
@@ -116,7 +118,25 @@ class _Body(sdk_httpx.AsyncByteStream):
                                    "response.in_progress")
                 else:
                     yield b": keep-alive\n\n"
-            if self.mode == "error":
+            if self.mode == "truncated":
+                protocol, model = self.profile
+                if protocol == "chat":
+                    yield _sse(_chat_chunk(model, {"reasoning_content": "partial thought"}))
+                else:
+                    yield _sse({"type": "response.reasoning_summary_text.delta",
+                                "delta": "partial thought", "sequence_number": 1},
+                               "response.reasoning_summary_text.delta")
+            elif self.mode == "done_only":
+                protocol, model = self.profile
+                assert protocol == "chat"
+                yield _sse(_chat_chunk(model, {"content": "done"}))
+                yield b"data: [DO"
+                yield b"NE]\n\n"
+            elif self.mode == "finish_only":
+                protocol, model = self.profile
+                assert protocol == "chat"
+                yield _sse(_chat_chunk(model, {"content": "done"}, "stop"))
+            elif self.mode == "error":
                 yield _sse({"error": {"message": "upstream unavailable", "type": "server_error"}})
             else:
                 for chunk in _ending(*self.profile, tool=self.tool):
@@ -181,6 +201,44 @@ async def test_heartbeats_outlive_stall_window_without_output_noise(profile):
     assert response.usage["completion_tokens"] == 20
     assert response.finish_reason == "stop"
     assert requests[0]["stream"] is True and requests[0]["model"] == profile[1]
+
+
+async def test_cleanly_closed_short_stream_is_rejected(profile):
+    async with _client(profile, ("truncated",)) as (client, bodies, _):
+        with pytest.raises(LLMOpenAITruncatedStream) as info:
+            await _stream_llm_response(client, [user_msg("hi")], 2, _ignore)
+    assert bodies[0].closed
+    assert info.value.events_seen == 1
+    assert info.value.protocol == ("chat_completions" if profile[0] == "chat" else "responses")
+    assert classify_error(info.value) == "transient_network"
+    assert not is_retriable_with_fallback(info.value)
+
+
+@pytest.mark.parametrize("mode", ["done_only", "finish_only"])
+async def test_compatible_chat_completion_accepts_either_end_signal(mode):
+    async with _client(("chat", "apodex-1.1-mini"), (mode,)) as (client, _, _):
+        response = await _stream_llm_response(client, [user_msg("hi")], 2, _ignore)
+    assert response.content == "done"
+
+
+async def test_truncated_chat_turn_is_retried_before_no_tool_stop():
+    from agent_core.loop_types import LoopConfig, LoopPolicy
+    from agent_core.runtime.loop.agent_loop import run_agent_loop
+
+    async with _client(("chat", "apodex-1.1-mini"), ("truncated", "healthy")) as (
+        client, bodies, requests,
+    ):
+        result = await run_agent_loop(
+            system_prompt="s", user_message="hi", llm=client, tools=[],
+            config=LoopConfig(max_turns=2, max_llm_retries=2,
+                              retry_wait_fixed=0, llm_timeout=2,
+                              stream_llm_tokens=True,
+                              loop_policy=LoopPolicy(no_tool_behavior="stop")),
+        )
+    assert len(requests) == 2
+    assert all(body.closed for body in bodies)
+    assert result.stopped_by == "no_tool"
+    assert result.final_content == "done"
 
 
 async def test_silent_socket_still_stalls_and_closes(profile):
