@@ -4,9 +4,11 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from agent_core.errors import LLMOpenAITruncatedStream
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message, user_msg
 from agent_core.providers.fallback import CooldownFallbackLLM, legacy_retryable
+from agent_core.runtime.loop.llm_client import call_llm
 
 
 class ScriptedLLM:
@@ -164,6 +166,49 @@ class OkStream:
         **_kwargs: object,
     ) -> AsyncIterator[StreamDelta]:
         yield StreamDelta(content="FALLBACK")
+
+
+class TruncatingStream:
+    model = "primary"
+
+    def __init__(self) -> None:
+        self.starts = 0
+
+    async def stream(self, _messages: list[Message], **_kwargs: object) -> AsyncIterator[StreamDelta]:
+        self.starts += 1
+        if self.starts == 1:
+            yield StreamDelta(content="partial ")
+            raise LLMOpenAITruncatedStream(
+                protocol="chat_completions", last_event="chunk", events_seen=1,
+                expected="[DONE] or finish_reason", elapsed_s=1.0,
+            )
+        yield StreamDelta(content="complete", finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_truncated_partial_stream_does_not_append_fallback_turn() -> None:
+    primary = TruncatingStream()
+    llm = CooldownFallbackLLM(primary, OkStream(), max_retries=1, clock=lambda: 0.0)
+
+    with pytest.raises(LLMOpenAITruncatedStream):
+        _ = [delta async for delta in llm.stream([user_msg("x")])]
+
+    assert primary.starts == 1
+    assert llm._cooldown_until == 0.0
+
+    async def ignore(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    retry_primary = TruncatingStream()
+    retry_llm = CooldownFallbackLLM(
+        retry_primary, OkStream(), max_retries=1, clock=lambda: 0.0,
+    )
+    response = await call_llm(
+        retry_llm, [user_msg("x")], timeout=5, max_retries=2, turn=1,
+        on_delta=ignore, retry_wait_fixed=0,
+    )
+    assert response.content == "complete"
+    assert retry_primary.starts == 2
 
 
 @pytest.mark.asyncio

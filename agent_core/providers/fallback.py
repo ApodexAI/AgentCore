@@ -68,6 +68,7 @@ from agent_core.messages import Message
 # side has to import the other's package for them — see that module.
 from agent_core.retry_policy import LEGACY_RETRYABLE_KEYWORDS, legacy_retryable
 from agent_core.runtime.async_utils import closing_stream
+from agent_core.runtime.retriable import is_truncated_stream
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,8 @@ class CooldownFallbackLLM:
     consumer, because a retry would emit those deltas twice. Set
     ``replay_partial_stream=True`` to restore the historical duplicating
     behavior; prefer :class:`LLMFallbackChain` for rewind-safe semantics.
+    A truncated stream that already yielded deltas propagates its error so
+    the caller can start a fresh attempt instead of combining model outputs.
 
     Event hook contract
     -------------------
@@ -532,6 +535,11 @@ class CooldownFallbackLLM:
                 )
                 if not self._retryable(error):
                     break
+                if yielded and is_truncated_stream(error):
+                    # The consumer already has part of this turn. Appending a
+                    # fallback turn would turn two responses into one apparent
+                    # success; let the caller discard and restart the attempt.
+                    raise
                 if yielded and not self._replay_partial_stream:
                     # Deltas already reached the consumer; retrying the primary
                     # would duplicate them. Degrade to the fallback leg instead.
