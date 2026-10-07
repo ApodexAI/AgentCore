@@ -184,3 +184,36 @@ forwarder alone is not opt-in, because invoking the inner preparation method
 could silently bypass the wrapper. Wrappers without these hooks still receive
 empty classification and same-key recovery; products using an external chain
 can inject `chain_fallback_active` to receive the terminal error for routing.
+
+
+### Streamed middleware consumers
+
+`LLMProxy.stream` supplies `after_llm` with terminal usage/provenance, model,
+provider and rejection metadata, plus assembled **named native tool calls**.
+The proxy and loop use the same indexed tool accumulator: names/arguments are
+concatenated in provider order, nameless slots are dropped, and each retry
+starts with fresh state. Heartbeats are never model output. The middleware
+response remains a passive view; signed-block replay stays owned by the loop.
+
+Token accounting charges only reported usage. `usage_source="estimated"` and
+`estimated: true` maps remain visible in tracing/attempt diagnostics, but never
+enter `CostSink`, task budget charges, billing events or `UsageAggregator`.
+Unmarked legacy usage retains its reported interpretation. Reported cache reads
+and writes use `cache_read_tokens` / `cache_write_tokens` first, including real
+zeros, with legacy read/creation aliases as fallbacks. Cache-only reported calls
+still reach cache-aware usage aggregation; the existing four-argument `CostSink`
+contract and prompt/completion budget units remain unchanged.
+
+Rate correction uses reported totals (or reported prompt/completion counts),
+including zero. Missing, invalid or estimated usage leaves the admission
+reservation in place. Corrections use the **capped reservation actually taken**,
+not the original prompt estimate, and records are isolated by limiter instance
+so multiple quota layers cannot overwrite one another's state. Request quota is
+reserved independently of whether token usage is later available.
+
+`LoopDetectionMiddleware` now receives native streamed tool calls, so completed
+repeated calls can trigger the existing strategy-switch hint. Failed or
+consumer-closed stream proposals do not enter loop history; authentic usage
+from those requests is still eligible for accounting. Streaming cost/token
+reports therefore increase from the previously omitted values. Consumers should
+recheck budgets and alerts calibrated against the old undercount.

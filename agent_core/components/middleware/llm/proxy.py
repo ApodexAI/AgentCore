@@ -20,6 +20,7 @@ from agent_core.execution_context import (
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
 from agent_core.runtime.async_utils import await_bounded, closing_stream
+from agent_core.stream_tools import StreamToolCalls
 
 logger = logging.getLogger(__name__)
 __all__ = ["LLMProxy"]
@@ -40,6 +41,7 @@ class _StreamTerminal:
         self.refusal = ""
         self.stop_details: dict[str, Any] = {}
         self.stop_reason = ""
+        self.tool_calls = StreamToolCalls()
 
     def feed(self, delta: StreamDelta) -> None:
         # Last non-empty wins, except refusal text, which streams in pieces.
@@ -57,6 +59,8 @@ class _StreamTerminal:
             self.stop_details = delta.stop_details
         if delta.stop_reason:
             self.stop_reason = delta.stop_reason
+        # Keep known usage/provenance even if a malformed tool fragment fails.
+        self.tool_calls.feed(delta.tool_call_deltas)
 
     def response(self, content: str, reasoning: str) -> LLMResponse:
         metadata: dict[str, Any] = {}
@@ -70,6 +74,7 @@ class _StreamTerminal:
             metadata["stop_reason"] = self.stop_reason
         return LLMResponse(
             content=content,
+            tool_calls=self.tool_calls.complete(),
             reasoning_content=reasoning,
             finish_reason=self.finish_reason,
             model=self.model,
@@ -257,6 +262,7 @@ class LLMProxy:
         full_content = ""
         full_reasoning = ""
         terminal = _StreamTerminal()
+        stream_completed = False
         stream_error: Exception | None = None
         try:
             while True:
@@ -307,6 +313,7 @@ class LLMProxy:
                                     len(full_content),
                                 )
                                 break
+                    stream_completed = True
                     break
                 except Exception as e:
                     stream_error = e
@@ -336,6 +343,9 @@ class LLMProxy:
                 (time.time() - start_time) * 1000,
             )
             ctx.metadata["duration_ms"] = duration_ms
+            # Accounting may use reported usage from failed requests, but loop
+            # detection must not treat an abandoned proposal as a delivered turn.
+            ctx.metadata["_llm_stream_incomplete"] = not stream_completed
             if stream_error:
                 ctx.metadata["error"] = str(stream_error)
             # Stream after hooks are passive (their result is discarded), so

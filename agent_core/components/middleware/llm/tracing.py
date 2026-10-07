@@ -65,6 +65,11 @@ class LLMTracingMiddleware(LLMMiddleware):
                     "duration_ms": duration_ms,
                     "usage": usage,
                 }
+                source = getattr(response, "usage_source", "") or rm.get("usage_source", "")
+                if source == "estimated" or (isinstance(usage, dict) and cast("dict[str, Any]", usage).get("estimated")):
+                    metadata["usage_source"] = "estimated"
+                elif source:
+                    metadata["usage_source"] = source
                 # A fallback chain stamps these on the response when the
                 # call fell through to a secondary model. Surface them in
                 # the trace metadata so observability can flag failover

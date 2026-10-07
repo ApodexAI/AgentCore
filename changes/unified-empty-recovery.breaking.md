@@ -4,3 +4,6 @@ Empty completion recovery now runs inside one logical `call_llm` invocation in b
 
 
 Empty OpenAI refusal placeholders beside text, tool calls or reasoning are ignored. Streams infer an otherwise empty refusal only at normal EOF, including clean closes without a finish-reason chunk; exceptions and cancellation preserve their original failure semantics.
+
+
+Streamed middleware now receives terminal usage/provenance, provider/model and rejection metadata plus named native tool calls. This restores streamed token/cost accounting and loop detection. Estimates stay diagnostic and do not charge real cost, task budgets or billing aggregates; canonical cache read/write fields preserve zeros and cache-only reported calls. Rate correction handles zero estimates and real zero usage against each limiter's actual capped reservation, while unknown/estimated usage keeps the reservation. Failed or consumer-closed tool proposals are excluded from repeat detection even when their authentic reported usage is accounted. Reported streaming usage/cost and budget consumption will increase from the old undercount; downstream budgets/alerts should be recalibrated. The legacy CostSink signature remains unchanged; cache-aware aggregators receive the separate read/write fields.

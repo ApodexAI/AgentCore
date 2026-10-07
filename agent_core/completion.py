@@ -46,6 +46,40 @@ def response_rejection_reason(response: Any) -> str:
     return ""
 
 
+def reported_usage(response: Any) -> dict[str, Any] | None:
+    """Usage eligible for real accounting; missing/estimated data stays diagnostic.
+
+    Unmarked legacy mappings retain their historical reported interpretation.
+    This does not rewrite the original response or its estimate provenance.
+    """
+    metadata = _mapping(getattr(response, "response_metadata", None))
+    source = getattr(response, "usage_source", "") or metadata.get("usage_source", "")
+    if source == "estimated":
+        return None
+    candidates = [getattr(response, "usage", None), getattr(response, "usage_metadata", None)]
+    candidates.extend((metadata.get("token_usage"), metadata.get("usage")))
+    for candidate in candidates:
+        usage = _mapping(candidate)
+        if usage and not usage.get("estimated"):
+            return usage
+    return None
+
+
+def usage_count(usage: dict[str, Any], *keys: str) -> int | None:
+    """First reported count, including zero; None means absent/unparseable."""
+    for key in keys:
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            count = int(value)
+            if count >= 0:
+                return count
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
 def _has_reported_usage(response: Any) -> bool:
     metadata = _mapping(getattr(response, "response_metadata", None))
     source = getattr(response, "usage_source", "") or (
