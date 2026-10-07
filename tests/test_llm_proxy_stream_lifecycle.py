@@ -267,3 +267,47 @@ async def test_interleaved_streams_keep_their_own_step_id():
         assert sorted(steps) == ["research:llm:1", "research:llm:2"]
     finally:
         reset_current_execution_scope(token)
+
+
+async def test_stream_after_llm_sees_terminal_metadata() -> None:
+    """Usage/cost and refusal-aware middleware need the streamed terminal
+    metadata, not just the concatenated text."""
+
+    seen: list[LLMResponse] = []
+
+    class _Capture(LLMMiddleware):
+        name = "capture"
+
+        async def after_llm(
+            self, ctx: LLMCallContext, response: LLMResponse,
+        ) -> LLMResponse:
+            seen.append(response)
+            return response
+
+    class _Refusing:
+        model = "test-model"
+
+        async def stream(self, messages, **kwargs):
+            yield StreamDelta(transport_activity=True, usage={"total_tokens": 99})
+            yield StreamDelta(content="I can", refusal="I can", model="m-1")
+            yield StreamDelta(content="not", refusal="not", stop_details={"type": "refusal"},
+                finish_reason="stop", provider="vendor", stop_reason="refusal")
+            yield StreamDelta(usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                usage_source="provider")
+
+    proxy = LLMProxy(inner=_Refusing(), chain=_chain(_Capture()), role_id="r")
+    async for _ in proxy.stream([user_msg("hi")]):
+        pass
+
+    [response] = seen
+    assert response.content == "I cannot"
+    assert response.finish_reason == "stop"
+    assert response.model == "m-1"
+    assert response.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    assert response.usage_source == "provider"
+    assert response.response_metadata == {
+        "provider_actually_used": "vendor",
+        "refusal": "I cannot",
+        "stop_details": {"type": "refusal"},
+        "stop_reason": "refusal",
+    }

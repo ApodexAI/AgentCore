@@ -26,6 +26,59 @@ __all__ = ["LLMProxy"]
 _HOOK_TIMEOUT_S = 5.0
 
 
+class _StreamTerminal:
+    """Terminal metadata of one streamed attempt, folded like the loop's
+    stream assembler (``_streaming._assembled_response``) so ``after_llm``
+    sees usage, finish_reason and refusal signals, not just text."""
+
+    def __init__(self) -> None:
+        self.usage: dict[str, int] = {}
+        self.usage_source = ""
+        self.finish_reason = ""
+        self.model = ""
+        self.provider = ""
+        self.refusal = ""
+        self.stop_details: dict[str, Any] = {}
+        self.stop_reason = ""
+
+    def feed(self, delta: StreamDelta) -> None:
+        # Last non-empty wins, except refusal text, which streams in pieces.
+        if delta.usage:
+            self.usage = delta.usage
+            self.usage_source = delta.usage_source
+        if delta.finish_reason:
+            self.finish_reason = delta.finish_reason
+        if delta.model:
+            self.model = delta.model
+        if delta.provider:
+            self.provider = delta.provider
+        self.refusal += delta.refusal
+        if delta.stop_details:
+            self.stop_details = delta.stop_details
+        if delta.stop_reason:
+            self.stop_reason = delta.stop_reason
+
+    def response(self, content: str, reasoning: str) -> LLMResponse:
+        metadata: dict[str, Any] = {}
+        if self.provider:
+            metadata["provider_actually_used"] = self.provider
+        if self.refusal:
+            metadata["refusal"] = self.refusal
+        if self.stop_details:
+            metadata["stop_details"] = self.stop_details
+        if self.stop_reason:
+            metadata["stop_reason"] = self.stop_reason
+        return LLMResponse(
+            content=content,
+            reasoning_content=reasoning,
+            finish_reason=self.finish_reason,
+            model=self.model,
+            usage=self.usage,
+            usage_source=self.usage_source,
+            response_metadata=metadata,
+        )
+
+
 async def _log_llm_exception(
     ctx: LLMCallContext,
     error: Exception,
@@ -203,12 +256,14 @@ class LLMProxy:
         start_time = time.time()
         full_content = ""
         full_reasoning = ""
+        terminal = _StreamTerminal()
         stream_error: Exception | None = None
         try:
             while True:
                 start_time = time.time()
                 full_content = ""
                 full_reasoning = ""
+                terminal = _StreamTerminal()
                 stream_error = None
                 any_chunk_yielded = False
                 try:
@@ -228,6 +283,7 @@ class LLMProxy:
                                 continue
                             full_content += delta.content or ""
                             full_reasoning += delta.reasoning_content or ""
+                            terminal.feed(delta)
                             any_chunk_yielded = True
                             # Per-chunk middleware hook. A middleware returning
                             # True (e.g. StreamRepetitionDetector noticing a
@@ -289,10 +345,7 @@ class LLMProxy:
             # response (e.g. output repair) and stay unbounded.
             await self.chain.run_after(
                 ctx,
-                LLMResponse(
-                    content=full_content,
-                    reasoning_content=full_reasoning,
-                ),
+                terminal.response(full_content, full_reasoning),
                 timeout_s=_HOOK_TIMEOUT_S,
             )
 
