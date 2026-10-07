@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.16.1] - 2026-10-07
+
+### Fixed
+
+- Runaway retry no longer expands the output cap past the model's limit when the client is driven through an `LLMFallbackChain`. The chain binds one `max_tokens` for whichever leg serves the request, so expansion is now clamped to the smallest declared output limit among its legs instead of reading a `capabilities` attribute the chain does not expose; a chain whose legs declare no limit keeps the previous context-bounded behaviour.
+
 ## [0.16.0] - 2026-10-07
 
 ### Changed
