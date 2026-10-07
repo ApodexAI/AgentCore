@@ -7,6 +7,16 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.16.0] - 2026-10-07
+
+### Changed
+
+- The opportunistic recovery for an invalid streamed tool call now retries with streaming instead of a non-streaming `chat` replay, so the retry's attempt events carry `recovery_action="retry_streaming"` instead of `replay_non_streaming`. Calls that match the previous empty-required-arguments condition keep the `stream_empty_tool_arguments` / `stream_empty_args_replay` reasons and the `stream_empty_args_*` response metadata; newly detected cases (invalid JSON or a non-object for tools without required fields) use `stream_invalid_tool_call`. When a native call is still invalid after the retry, the attempt finishes as `accepted_degraded` with reason `invalid_tool_call` and the call returns an error tool result (`error_kind="invalid_arguments"`) instead of running the tool. Consumers asserting the old replay transport, its event names, or `accepted` for such attempts should update those assertions; set `LoopConfig(tool_argument_validation="off")` to keep only the legacy retry condition. AgentCore now depends on `jsonschema>=4.20,<5`.
+
+### Added
+
+- Streaming can now be selected independently of token observers (`LoopConfig.stream_transport`, `call_llm(stream=...)`). Native tool calls are checked before execution according to the new `LoopConfig.tool_argument_validation` (`"structural"` by default, `"strict"` for full JSON Schema, `"off"`). Invalid streamed calls are retried once using streaming, and invalid native calls that remain return an explicit tool error instead of running. Blank arguments count as `{}`, text-mode calls and tool-side type coercion are unaffected, malformed tool schemas never fail a call, and native calls missing an id get a generated one instead of breaking history replay.
+
 ## [0.15.0] - 2026-10-07
 
 ### Changed
