@@ -393,26 +393,25 @@ async def test_gate_time_is_not_subtracted_twice_from_tool_argument_replay(monke
             pass
 
     monkeypatch.setattr(call_module, "_llm_gate", Gate)
-    monkeypatch.setattr(call_module, "stream_tool_calls_missing_required_arguments",
-                        lambda response, llm: ["search"])
+    checks = iter([[{"reason": "arguments are empty"}], []])
+    monkeypatch.setattr(call_module, "invalid_native_tool_calls",
+                        lambda response, llm, *_: next(checks, []))
 
     async def stream_response(llm, messages, timeout, on_delta, **kwargs):
         read_timeouts.append(timeout)
-        clock[0] += 30
-        return LLMResponse(content="partial")
-
-    async def chat(messages, **kwargs):
-        read_timeouts.append(kwargs["timeout"])
+        if len(read_timeouts) == 1:
+            clock[0] += 30
+            return LLMResponse(content="partial")
         return LLMResponse(content="repaired")
 
     monkeypatch.setattr(call_module, "_stream_llm_response", stream_response)
     response = await call_module.call_llm(
-        SimpleNamespace(model="test", chat=chat), [user_msg("hi")], 100, 1, 1,
+        SimpleNamespace(model="test"), [user_msg("hi")], 100, 1, 1,
         on_delta=_ignore,
     )
     assert read_timeouts == [100, 70]
     assert response.content == "repaired"
-    assert response.response_metadata["stream_empty_args_fallback"] is True
+    assert response.response_metadata["invalid_tool_call_retry"] is True
 
 
 async def test_external_cancellation_during_normal_eof_cleanup_propagates(monkeypatch):

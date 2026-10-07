@@ -93,6 +93,46 @@ Code" channel, 2026-10-05: an identical `claude-opus-5-5` request at
 taking 242s. Concurrency was ruled out (five light requests in flight all
 succeeded; five heavy ones failed at the same 76s mark).
 
+`LoopConfig.stream_transport` is the explicit transport selector for new
+callers. It takes precedence over the older `stream_llm_tokens` field, and a
+streamed call can be drained into a final `LLMResponse` even when no delta
+observer is registered. At the lower-level call boundary,
+`call_llm(..., stream=True)` selects the same transport independently of
+`on_delta`. Leaving it unset retains the existing automatic choice and older
+call sites continue to work. The new `LoopConfig` field is keyword-only so
+existing positional construction retains its argument order.
+
+After a stream ends, native tool arguments are checked according to
+`LoopConfig.tool_argument_validation`:
+
+- `"structural"` (default): the arguments must decode to a JSON object that
+  carries every top-level `required` property. A blank argument string counts
+  as `{}`, which is how Anthropic streaming and several OpenAI-compatible
+  servers encode a zero-argument call. Property types are left to the tool,
+  so tools that coerce `"5"` to `5` behave as before.
+- `"strict"`: the structural checks plus full JSON Schema validation.
+- `"off"`: no new checks; only the legacy empty-required-arguments retry.
+
+A tool schema that is not itself valid JSON Schema never fails a call:
+validation is skipped for that tool with a warning.
+
+An invalid streamed call triggers at most one streaming retry within the
+original attempt's time budget. The discarded request keeps its own usage and
+attempt record. Calls that matched the previous empty-required-arguments
+condition keep the `stream_empty_tool_arguments` attempt reason (and
+`stream_empty_args_replay` for a failed retry) and the `stream_empty_args_*`
+response metadata keys; other invalid calls use `stream_invalid_tool_call`.
+The retry's `recovery_action` is `retry_streaming`.
+
+A retry that remains invalid is returned with `invalid_tool_calls` diagnostics
+(raw arguments included) and the attempt is `accepted_degraded`. At execution
+time, only provider-native calls are checked: an invalid one produces an
+error tool result (`error_kind="invalid_arguments"`) without invoking the
+tool, unless an observer rewrote its arguments. Text-mode calls are never
+blocked by this check. A named native call without an id is given a generated
+id before the assistant turn reaches history, so the tool reply always
+matches. The stream assembler continues to discard nameless slots.
+
 In automatic mode the choice is also gated by protocol:
 `UNVERIFIED_STREAM_PROTOCOLS` (`responses`, `bedrock`) stays non-streaming
 because no test here proves their streamed turn replays like its non-streaming
