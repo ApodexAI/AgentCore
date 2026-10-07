@@ -25,13 +25,20 @@ import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+from agent_core.errors import LLMTruncatedStream
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
-from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
+from agent_core.providers._stream_activity import (
+    STREAM_TERMINATOR_ENV,
+    StreamActivity,
+    stream_events_with_activity,
+    stream_terminator_required,
+)
 from agent_core.providers.finish_reason import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
@@ -253,6 +260,13 @@ class AnthropicClient(LLMClient):
         # string, so a streamed thinking turn used to yield reasoning that
         # ``thinking_format="content_block"`` could not replay.
         blocks: dict[int, dict[str, Any]] = {}
+        # End record: the protocol always closes with ``message_delta`` then
+        # ``message_stop``; a stream that ends before the latter was cut off.
+        events_seen = 0
+        last_event = ""
+        saw_message_delta = False
+        saw_message_stop = False
+        started = time.monotonic()
         stream, reset = await self._create_message(kwargs)
         activity = StreamActivity()
         usage_estimated = False
@@ -264,7 +278,11 @@ class AnthropicClient(LLMClient):
                     yield StreamDelta(transport_activity=True)
                     continue
                 etype = getattr(event, "type", "")
-                if etype == "message_start":
+                events_seen += 1
+                last_event = etype
+                if etype == "message_stop":
+                    saw_message_stop = True
+                elif etype == "message_start":
                     msg = getattr(event, "message", None)
                     model = getattr(msg, "model", "") or model
                     u = getattr(msg, "usage", None)
@@ -356,6 +374,7 @@ class AnthropicClient(LLMClient):
                             "arguments": getattr(d, "partial_json", "") or "",
                         }])
                 elif etype == "message_delta":
+                    saw_message_delta = True
                     d = getattr(event, "delta", None)
                     stop_reason = getattr(d, "stop_reason", "") or stop_reason
                     # A classifier refusal ends the stream here, with the detail on
@@ -378,6 +397,24 @@ class AnthropicClient(LLMClient):
                         rt = _anthropic_reasoning_tokens(u)
                         if rt is not None:
                             reasoning_tokens = rt
+        if not saw_message_stop:
+            # Raised, not returned: whatever arrived (often a complete thinking
+            # block) is shaped like a deliberate stop, and ``no_tool`` would
+            # end the run on it. Nothing has executed yet, so a resample is
+            # safe; the error text carries the end record for the retry log.
+            error = LLMTruncatedStream(
+                last_event=last_event,
+                events_seen=events_seen,
+                saw_message_delta=saw_message_delta,
+                block_types=[
+                    str(b.get("type", "")) for b in _ordered_blocks(blocks)
+                ],
+                elapsed_s=time.monotonic() - started,
+            )
+            if stream_terminator_required():
+                raise error
+            logger.warning("Accepting stream without terminator (%s=0): %s",
+                           STREAM_TERMINATOR_ENV, error)
         # Terminal delta: fold the accumulated usage/finish/model onto the
         # assembled ``LLMResponse`` (mirrors OpenAI's empty-choices chunk).
         # ``reasoning_blocks`` is sent ONLY for a thinking turn — for a plain

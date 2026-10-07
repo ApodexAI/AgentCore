@@ -283,3 +283,30 @@ async def test_incomplete_stream_does_not_infer_refusal_on_error_or_consumer_clo
         await client._client.close()
     assert len(seen) == 1
     assert all(not delta.stop_details for delta in seen)
+
+
+@pytest.mark.parametrize("protocol", ["chat_completions", "responses"])
+async def test_truncated_refusal_stream_is_never_accepted_as_a_completed_decline(protocol, monkeypatch):
+    from agent_core.errors import LLMOpenAITruncatedStream
+
+    monkeypatch.setenv("AGENT_CORE_STREAM_REQUIRE_TERMINATOR", "1")
+    def respond(request):
+        event = {"id": "id", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "refusal": ""}, "finish_reason": None}]}
+        if protocol == "responses":
+            event = {"type": "response.refusal.delta", "delta": "declined", "output_index": 0,
+                "content_index": 0, "item_id": "msg", "sequence_number": 1}
+        # Neither [DONE]/finish_reason nor a Responses terminal event arrives.
+        return sdk_httpx.Response(200, text=f"data: {json.dumps(event)}\n\n", headers={"content-type": "text/event-stream"})
+    cls = OpenAIClient if protocol == "chat_completions" else OpenAIResponsesClient
+    client = cls("m", api_key="test", base_url="https://openai.invalid")
+    await client._client.close()
+    seen = []
+    async with AsyncOpenAI(api_key="test", base_url="https://openai.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond))) as sdk:
+        client._client = sdk
+        with pytest.raises(LLMOpenAITruncatedStream):
+            async for delta in client.stream([]):
+                seen.append(delta)
+    if protocol == "chat_completions":
+        assert all(not delta.stop_details for delta in seen)

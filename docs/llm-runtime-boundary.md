@@ -132,7 +132,9 @@ OpenAI-compatible gateways may send `refusal=""` as a placeholder beside text,
 tool calls or reasoning (`reasoning_content` / `reasoning`). That placeholder is
 not a decline when the turn carries output. Streaming inference waits for normal
 EOF, including streams without `finish_reason`; errors and consumer cancellation
-never turn a pending marker into a refusal. Non-empty refusal text and explicit
+never turn a pending marker into a refusal. Protocol terminator validation runs
+before this inference, so a truncated transport cannot become a completed decline.
+Non-empty refusal text and explicit
 provider rejection reasons retain their usual semantics.
 
 ### One recovery owner in both transports
