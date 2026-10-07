@@ -57,7 +57,7 @@ from ._streaming import (
     _stream_stall_max_before_advance,
 )
 from .tool_call_recovery import stream_tool_calls_missing_required_arguments
-from .tool_call_validation import invalid_native_tool_calls
+from .tool_call_validation import ensure_tool_call_ids, invalid_native_tool_calls
 
 logger = logging.getLogger(__name__)
 _OBSERVATION_TIMEOUT_S = 5.0
@@ -219,6 +219,7 @@ async def call_llm(
     chain_fallback_active: Callable[[], bool] | None = None,
     empty_completion_max_retries: int = 2,
     stream: bool | None = None,
+    tool_argument_validation: str = "structural",
 ) -> LLMResponse | None:
     """Call ``llm.chat`` or ``llm.stream`` (independent of delta delivery) with
     exponential backoff on transient errors.
@@ -699,9 +700,12 @@ async def call_llm(
                 else:
                     response = await _stream_active(effective_timeout)
                     invalid_calls = invalid_native_tool_calls(
+                        response, llm_active, tool_argument_validation,
+                    )
+                    legacy_empty_args_tools = stream_tool_calls_missing_required_arguments(
                         response, llm_active,
                     )
-                    if invalid_calls:
+                    if invalid_calls or legacy_empty_args_tools:
                         # The stream has only been observed/assembled here: no
                         # assistant history or tool execution has happened yet,
                         # so replacing it with one streaming retry cannot
@@ -709,13 +713,17 @@ async def call_llm(
                         streamed_response = response
                         stream_ended_at = time.monotonic()
                         stream_first_delta = attempt_first_delta
-                        legacy_empty_args_tools = stream_tool_calls_missing_required_arguments(
-                            streamed_response, llm_active,
+                        # Keep the pre-validation event reason for the calls
+                        # the old empty-arguments replay covered, so consumers
+                        # keyed on it keep matching.
+                        tool_retry_reason = (
+                            "stream_empty_tool_arguments"
+                            if legacy_empty_args_tools else "stream_invalid_tool_call"
                         )
                         logger.warning(
                             "Streamed tool call(s) failed validation: %s "
                             "(turn=%d, attempt=%d/%d); retrying with streaming",
-                            [issue["reason"] for issue in invalid_calls],
+                            [issue["reason"] for issue in invalid_calls] or legacy_empty_args_tools,
                             turn, attempt + 1, max_retries,
                         )
                         recovered: LLMResponse | None = None
@@ -732,7 +740,7 @@ async def call_llm(
                             recovery_timeout = min(
                                 _effective_timeout_or_deadline_exhausted(
                                     attempt=attempt,
-                                    reason="stream_invalid_tool_call",
+                                    reason=tool_retry_reason,
                                 )[0],
                                 max(
                                     attempt_deadline - stream_ended_at,
@@ -760,7 +768,7 @@ async def call_llm(
                             # re-clamp before the actual replay request starts.
                             recovery_timeout = min(
                                 _effective_timeout_or_deadline_exhausted(
-                                    attempt=attempt, reason="stream_invalid_tool_call",
+                                    attempt=attempt, reason=tool_retry_reason,
                                 )[0],
                                 max(attempt_deadline - time.monotonic(), 0.0),
                             )
@@ -783,7 +791,10 @@ async def call_llm(
                                 replay_event: dict[str, Any] = {
                                     "phase": "finished", "attempt_index": replay_index,
                                     "outcome": ATTEMPT_FAILED,
-                                    "reason": "empty_completion" if isinstance(recovery_error, LLMEmptyCompletion) else "stream_invalid_tool_call_retry",
+                                    "reason": "empty_completion" if isinstance(recovery_error, LLMEmptyCompletion) else (
+                                        "stream_empty_args_replay" if legacy_empty_args_tools
+                                        else "stream_invalid_tool_call_retry"
+                                    ),
                                     "recovery_action": "keep_streamed_response",
                                     "duration_ms": int((time.monotonic() - replay_started) * 1000),
                                     "ttft_ms": None, "max_tokens": active_cap,
@@ -831,7 +842,7 @@ async def call_llm(
                             attempt_first_delta = stream_first_delta
                             await _finish_attempt(
                                 outcome=ATTEMPT_DISCARDED,
-                                reason="stream_invalid_tool_call",
+                                reason=tool_retry_reason,
                                 recovery_action="retry_streaming",
                                 response=streamed_response,
                                 ended_at=stream_ended_at,
@@ -843,7 +854,9 @@ async def call_llm(
                             response.response_metadata = {
                                 **(response.response_metadata or {}),
                                 "invalid_tool_call_retry": True,
-                                "invalid_tool_calls": invalid_native_tool_calls(recovered, llm_active),
+                                "invalid_tool_calls": invalid_native_tool_calls(
+                                    recovered, llm_active, tool_argument_validation,
+                                ),
                                 "stream_finish_reason": (
                                     streamed_response.finish_reason or ""
                                 ),
@@ -854,15 +867,10 @@ async def call_llm(
                             }
             finally:
                 slot_lease.close()
-            incomplete_identity = [
-                issue for issue in invalid_native_tool_calls(response, llm_active)
-                if issue["reason"] in {"missing tool name", "missing tool call id"}
-            ]
-            if incomplete_identity:
-                raise LLMCallExhausted(
-                    ValueError(f"incomplete tool-call identity: {incomplete_identity}"),
-                    "invalid_tool_call",
-                )
+            # A named native call without an id cannot be replayed: the tool
+            # reply would echo an id the assistant turn never carried. Repair
+            # it before the turn reaches history instead of failing the call.
+            ensure_tool_call_ids(response)
             if _is_runaway_response(response):
                 last_runaway_reason = "reasoning_runaway"
                 if runaway_state is not None:
@@ -979,7 +987,9 @@ async def call_llm(
                     runaway_state["last_call_reason"] = (
                         last_runaway_reason or "reasoning_runaway"
                     )
-            remaining_invalid = invalid_native_tool_calls(response, llm_active)
+            remaining_invalid = invalid_native_tool_calls(
+                response, llm_active, tool_argument_validation,
+            )
             await _finish_attempt(
                 outcome=(ATTEMPT_ACCEPTED_DEGRADED if remaining_invalid else ATTEMPT_ACCEPTED),
                 reason="invalid_tool_call" if remaining_invalid else "",

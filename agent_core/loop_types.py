@@ -205,6 +205,15 @@ class LoopConfig:
     # Keyword-only to preserve every existing positional LoopConfig argument.
     # When unset, retain the legacy stream_llm_tokens/watchdog selection.
     stream_transport: bool | None = field(default=None, kw_only=True)
+    # How strictly native tool-call arguments are checked before execution.
+    # "structural" (default): decodable JSON object with every top-level
+    # required property; blank arguments count as {} and property types are
+    # left to the tool. "strict": full JSON Schema. "off": no checks beyond
+    # the legacy empty-required-arguments retry. Text-mode calls are never
+    # blocked.
+    tool_argument_validation: Literal["structural", "strict", "off"] = field(
+        default="structural", kw_only=True,
+    )
 
 
 @dataclass

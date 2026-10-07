@@ -77,6 +77,10 @@ from agent_core.runtime.loop.tool_call_parser import (
     MultiFormatToolCallParser,
     ToolCallParser,
 )
+from agent_core.runtime.loop.tool_call_validation import (
+    IDENTITY_REASONS,
+    native_tool_call_issues,
+)
 from agent_core.runtime.loop.tool_exec import (
     DefaultToolResultPostProcessor,
     ToolExecutionHooks,
@@ -641,6 +645,7 @@ async def _run_loop_inner(
                 result_max_chars=tool_result_cap,
                 profile=profile,
                 max_images_in_history=policy.max_images_in_history,
+                native_tool_calls=getattr(response, "tool_calls", None),
             )
             total_tool_calls += tool_calls_executed
             if stop_reason:
@@ -911,6 +916,7 @@ async def _call_llm_with_callbacks(
             wall_deadline_remaining=runtime_hooks.wall_deadline_remaining,
             chain_fallback_active=runtime_hooks.chain_fallback_active,
             empty_completion_max_retries=cfg.empty_completion_max_retries,
+            tool_argument_validation=getattr(cfg, "tool_argument_validation", "structural"),
         )
     except LLMCallExhausted as exhausted:
         if exhausted.reason == "empty_completion":
@@ -1436,6 +1442,37 @@ def _effective_tool_result_cap(
     return cap if cap and cap > 0 else None
 
 
+def _invalid_native_calls_by_id(
+    native_tool_calls: list[dict] | None, tool_map: dict[str, ToolLike], mode: str,
+) -> dict[str, dict[str, Any]]:
+    """Argument diagnostics for native calls, keyed by tool-call id."""
+    if not native_tool_calls or mode == "off":
+        return {}
+    schemas: dict[str, dict[str, Any] | None] = {}
+
+    def schema_for(name: str) -> dict[str, Any] | None:
+        if name not in schemas:
+            schemas[name] = None
+            to_schema = getattr(tool_map.get(name), "to_openai_schema", None)
+            if callable(to_schema):
+                try:
+                    schema = to_schema()
+                except Exception:
+                    logger.debug("to_openai_schema failed for tool %s", name, exc_info=True)
+                    schema = None
+                function = schema.get("function") if isinstance(schema, dict) else None
+                parameters = function.get("parameters") if isinstance(function, dict) else None
+                if isinstance(parameters, dict):
+                    schemas[name] = parameters
+        return schemas[name]
+
+    return {
+        str(issue["id"]): issue
+        for issue in native_tool_call_issues(native_tool_calls, schema_for, mode)
+        if issue["id"] and issue["reason"] not in IDENTITY_REASONS
+    }
+
+
 async def _execute_tool_calls(
     cfg: LoopConfig, obs: list, tool_map: dict[str, ToolLike], messages: list[Message], metadata: dict[str, Any],
     turn: int, total_tool_calls: int, ctx: TurnContext, parsed_calls: list[dict],
@@ -1451,9 +1488,15 @@ async def _execute_tool_calls(
     # -1 disables eviction. Not 0: a defaulted caller must not silently mean
     # "throw every image away", which is what a 0 default would spell.
     max_images_in_history: int = -1,
+    # The raw ``response.tool_calls``. Only these provider-native calls are
+    # checked before dispatch; text-mode calls keep their lenient handling.
+    native_tool_calls: list[dict] | None = None,
 ) -> tuple[str, int]:
     executable: list[tuple[int, dict]] = []
     synthetic: list[tuple[int, ToolResult]] = []
+    invalid_native = _invalid_native_calls_by_id(
+        native_tool_calls, tool_map, getattr(cfg, "tool_argument_validation", "structural"),
+    )
     for idx, tc in enumerate(parsed_calls):
         # Text-mode calls arrive without a provider id. Assign it here, once,
         # off the ``parsed_calls`` index -- before the batch is split into
@@ -1468,23 +1511,14 @@ async def _execute_tool_calls(
             metadata.update(tcv.metadata_updates)
         if tcv.rewrite_args is not None:
             tc = {**tc, "args": tcv.rewrite_args}
-        invalid_reason = None if tcv.rewrite_args is not None else tc.get("_invalid_reason")
-        if invalid_reason is None:
-            tool = tool_map.get(str(tc.get("name", "") or ""))
-            if tool is not None and hasattr(tool, "to_openai_schema"):
-                from .tool_call_validation import validate_arguments
-
-                schema = cast("Any", tool).to_openai_schema()
-                function = schema.get("function", {}) if isinstance(schema, dict) else {}
-                parameters = function.get("parameters") if isinstance(function, dict) else None
-                if isinstance(parameters, dict):
-                    invalid_reason = validate_arguments(tc.get("args"), parameters)
+        issue = None if tcv.rewrite_args is not None else invalid_native.get(str(tc.get("id") or ""))
+        invalid_reason = issue["reason"] if issue is not None else None
         if invalid_reason:
             recorded = metadata.setdefault("invalid_tool_calls", [])
             if isinstance(recorded, list):
                 recorded.append({
                     "id": tc["id"], "name": tc.get("name"),
-                    "raw_arguments": tc.get("_raw_arguments"),
+                    "raw_arguments": issue.get("raw_arguments") if issue else None,
                     "reason": invalid_reason,
                 })
             invalid_args = tc.get("args")

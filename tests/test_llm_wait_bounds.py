@@ -395,7 +395,7 @@ async def test_gate_time_is_not_subtracted_twice_from_tool_argument_replay(monke
     monkeypatch.setattr(call_module, "_llm_gate", Gate)
     checks = iter([[{"reason": "arguments are empty"}], []])
     monkeypatch.setattr(call_module, "invalid_native_tool_calls",
-                        lambda response, llm: next(checks, []))
+                        lambda response, llm, *_: next(checks, []))
 
     async def stream_response(llm, messages, timeout, on_delta, **kwargs):
         read_timeouts.append(timeout)
