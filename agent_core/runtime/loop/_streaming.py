@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from agent_core.errors import (
+    LLMEmptyCompletion,
     LLMReasoningRunaway,
     LLMStreamStalled,
 )
@@ -17,6 +18,7 @@ from agent_core.llm import LLMResponse
 from agent_core.messages import Message, ToolCall
 from agent_core.runtime.async_utils import await_bounded
 
+from ._response import is_wholly_empty_response
 from ._runaway import _env_float, _env_int
 
 logger = logging.getLogger(__name__)
@@ -597,7 +599,27 @@ async def _stream_llm_response(
     # visible text (``\n\nAnswer…`` → lstrip the remnant). Either way they
     # carry no user-visible meaning; keeping the leading remnant doubles the
     # separator when ``thinking_in_history`` reconstructs the turn.
-    return _assembled_response()
+    assembled = _assembled_response()
+    # A stream that closed cleanly and produced NOTHING is an upstream failure,
+    # not an answer. It is shaped exactly like "the model chose to stop
+    # talking" — no tool call, no text — so handing it back as a valid response
+    # ends the run at ``no_tool_behavior="stop"`` and discards every turn of
+    # work already done. ``is_empty_completion`` has always named the empty
+    # stream; raising is what lets it resample on the same key and then advance
+    # the chain, which is the documented recovery.
+    #
+    # The test is deliberately "nothing whatsoever": no visible text, no tool
+    # call, no reasoning AND no usage. A real 0-token reply still reports usage
+    # (prompt tokens at minimum), so that case keeps flowing to the runaway and
+    # no-tool handling that already reason about it; only the wholly blank
+    # response — the shape measured 10 times in 19 streamed GDPval trials on
+    # 2026-10-06, usage absent and backfilled as ``estimated`` zeros — raises.
+    if is_wholly_empty_response(assembled):
+        raise LLMEmptyCompletion(
+            chunks_seen=chunks_seen,
+            elapsed_s=time.monotonic() - stream_started,
+        )
+    return assembled
 
 
 # Public alias — callers outside this package should depend on this name
