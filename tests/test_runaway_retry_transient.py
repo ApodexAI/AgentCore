@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -11,8 +12,80 @@ import pytest
 
 from agent_core.messages import Message, assistant_msg, for_wire, system_msg, tool_msg, user_msg
 from agent_core.providers.anthropic import AnthropicClient
+from agent_core.providers.fallback import FallbackEntry, LLMFallbackChain
 from agent_core.runtime.loop import _call
 from agent_core.runtime.loop._bind import bind_max_tokens
+from agent_core.runtime.loop._runaway import (
+    _bind_expanded_max_tokens,
+    _expanded_retry_max_tokens,
+    _model_output_limit,
+)
+
+
+@pytest.mark.parametrize(("active_cap", "expected"), [
+    (100_000, 128_000),
+    (128_000, None),
+])
+def test_expansion_respects_model_output_limit(active_cap: int, expected: int | None) -> None:
+    assert _expanded_retry_max_tokens(
+        active_cap, [user_msg("question")], 1_048_576, 128_000,
+    ) == expected
+
+
+def _opus(max_tokens: int = 128_000) -> AnthropicClient:
+    return AnthropicClient("claude-opus-5-5", api_key="test-key", max_tokens=max_tokens)
+
+
+def test_expansion_through_fallback_chain_respects_smallest_leg_limit() -> None:
+    small = _opus(64_000)
+    small.capabilities = replace(small.capabilities, max_output_tokens=64_000)
+    chain = LLMFallbackChain(entries=[FallbackEntry(model=_opus(48_000)), FallbackEntry(model=small)])
+    bound = _bind_expanded_max_tokens(
+        chain, active_cap=48_000, messages=[user_msg("question")],
+        context_token_limit_hint=1_048_576,
+    )
+    assert bound is not None and bound.max_tokens == 64_000
+
+
+def test_fallback_chain_at_its_output_limit_skips_expansion() -> None:
+    chain = LLMFallbackChain(entries=[FallbackEntry(model=_opus()), FallbackEntry(model=_opus())])
+    assert _bind_expanded_max_tokens(
+        chain, active_cap=128_000, messages=[user_msg("question")],
+        context_token_limit_hint=1_048_576,
+    ) is None
+
+
+def test_unknown_leg_limits_leave_expansion_to_context() -> None:
+    chain = LLMFallbackChain(entries=[FallbackEntry(model=SimpleNamespace(model="custom"))])
+    assert _model_output_limit(chain) is None
+
+
+@pytest.mark.asyncio
+async def test_runaway_at_model_output_limit_skips_invalid_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_call, "_RUNAWAY_BACKOFF_S", 0.0)
+    client = AnthropicClient("claude-opus-5-5", api_key="test-key", max_tokens=128_000)
+    wire_caps: list[int] = []
+
+    async def create(**kwargs: Any) -> Any:
+        wire_caps.append(kwargs["max_tokens"])
+        done = len(wire_caps) == 2
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="done")] if done else [],
+            stop_reason="end_turn" if done else "max_tokens",
+            model="claude-opus-5-5", id=f"response-{len(wire_caps)}",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=2 if done else 128_000),
+        )
+
+    client._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=create)))
+    response = await _call.call_llm(
+        client, [user_msg("question")], timeout=30, max_retries=3, turn=1,
+        max_completion_tokens_hint=128_000, context_token_limit_hint=1_048_576,
+    )
+
+    assert response is not None and response.content == "done"
+    assert wire_caps == [128_000, 8_192]
 
 
 @pytest.mark.parametrize("retry_path", [

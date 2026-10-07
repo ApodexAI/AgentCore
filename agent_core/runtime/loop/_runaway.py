@@ -7,6 +7,7 @@ from typing import Any
 
 from agent_core.llm import LLMResponse
 from agent_core.messages import Message
+from agent_core.model_capabilities import ModelCapabilities
 from agent_core.runtime.env import first_configured
 from agent_core.runtime.llm_request_overrides import ThinkingRetryOverride
 from agent_core.tokens import estimate_message_tokens
@@ -258,8 +259,9 @@ def _expanded_retry_max_tokens(
     active_cap: Any,
     messages: list[Message],
     context_token_limit_hint: int | None,
+    max_output_tokens_limit: int | None = None,
 ) -> int | None:
-    """Return a safe 1.5× cap, or ``None`` when context cannot hold it."""
+    """Return a safe 1.5× cap within context and model output limits."""
     try:
         cap = int(active_cap)
     except (TypeError, ValueError):
@@ -267,6 +269,8 @@ def _expanded_retry_max_tokens(
     if cap <= 0:
         return None
     expanded = int(cap * _RUNAWAY_EXPAND_FACTOR)
+    if max_output_tokens_limit is not None:
+        expanded = min(expanded, max_output_tokens_limit)
     if context_token_limit_hint:
         available = max(
             int(context_token_limit_hint)
@@ -278,6 +282,30 @@ def _expanded_retry_max_tokens(
     return expanded if expanded > cap else None
 
 
+def _model_output_limit(client: Any, _depth: int = 0) -> int | None:
+    """Return the largest ``max_tokens`` every model behind ``client`` accepts.
+
+    A plain client (or a middleware proxy forwarding to one) reports its own
+    ``capabilities``. A fallback chain binds one ``max_tokens`` for whichever
+    leg serves the request, so it is limited by its *smallest* known leg;
+    legs with no declared limit do not constrain it.
+    """
+    if client is None or _depth > 8:
+        return None
+    capabilities = getattr(client, "capabilities", None)
+    if isinstance(capabilities, ModelCapabilities):
+        return capabilities.max_output_tokens
+    entries = getattr(client, "entries", None)
+    if not isinstance(entries, list):
+        return None
+    limits = [
+        limit
+        for entry in entries
+        if (limit := _model_output_limit(getattr(entry, "model", None), _depth + 1)) is not None
+    ]
+    return min(limits) if limits else None
+
+
 def _bind_expanded_max_tokens(
     llm: Any,
     *,
@@ -285,12 +313,14 @@ def _bind_expanded_max_tokens(
     messages: list[Message],
     context_token_limit_hint: int | None,
 ) -> Any | None:
+    bound = _ensure_bound(llm)
     expanded = _expanded_retry_max_tokens(
         active_cap, messages, context_token_limit_hint,
+        _model_output_limit(bound.client),
     )
     if expanded is None:
         return None
-    return replace(_ensure_bound(llm), max_tokens=expanded)
+    return replace(bound, max_tokens=expanded)
 
 
 def _phase_reasoning_guard(
