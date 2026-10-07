@@ -1,6 +1,7 @@
 """Real SDK serialization/parsing over local HTTP mocks; no API calls."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -161,3 +162,124 @@ async def test_gateway_estimated_usage_marker_survives_real_sdk_normalization(pr
                 thinking_format="content_block" if protocol == "responses" else "none"))
     assert len(requests) == 2
     assert result.final_content == "answer"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("reasoning_field", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize("finish", ["stop", None])
+async def test_empty_refusal_beside_reasoning_continues_to_the_answer(streaming, reasoning_field, finish):
+    requests = []
+    def respond(request):
+        requests.append(json.loads(request.content))
+        first = len(requests) == 1
+        message = {"role": "assistant", "content": None, "refusal": "", reasoning_field: "real thinking"} if first else {"role": "assistant", "content": "answer"}
+        payload = {"id": "id", "created": 1, "model": "m",
+            "object": "chat.completion.chunk" if streaming else "chat.completion",
+            "choices": [{"index": 0, "delta" if streaming else "message": message,
+                "finish_reason": finish if first else "stop"}]}
+        return sdk_httpx.Response(200, text=sse([payload]), headers={"content-type": "text/event-stream"}) if streaming else sdk_httpx.Response(200, json=payload)
+    client = OpenAIClient("m", api_key="test", base_url="https://openai.invalid")
+    await client._client.close()
+    async with AsyncOpenAI(api_key="test", base_url="https://openai.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond))) as sdk:
+        client._client = sdk
+        result = await run_agent_loop(system_prompt="s", user_message="u", llm=client, tools=[],
+            config=LoopConfig(max_turns=2, max_llm_retries=1, stream_llm_tokens=streaming,
+                retry_wait_fixed=0, loop_policy=LoopPolicy(no_tool_behavior="nudge")),
+            model_profile=ModelProfile(model_id="m", provider="openai", thinking_format="reasoning_content"))
+    assert len(requests) == 2
+    assert result.final_content == "answer"
+    assert result.stopped_by == "no_tool"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("finish", ["stop", None])
+@pytest.mark.parametrize("with_usage", [False, True])
+async def test_empty_refusal_at_clean_eof_is_preserved_with_or_without_finish_reason(streaming, finish, with_usage):
+    requests = []
+    def respond(request):
+        requests.append(json.loads(request.content))
+        payload = {"id": "id", "created": 1, "model": "m",
+            "object": "chat.completion.chunk" if streaming else "chat.completion",
+            "choices": [{"index": 0, "delta" if streaming else "message": {
+                "role": "assistant", "content": None, "refusal": ""}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10} if with_usage else None}
+        return sdk_httpx.Response(200, text=sse([payload]), headers={"content-type": "text/event-stream"}) if streaming else sdk_httpx.Response(200, json=payload)
+    client = OpenAIClient("m", api_key="test", base_url="https://openai.invalid")
+    await client._client.close()
+    async with AsyncOpenAI(api_key="test", base_url="https://openai.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond))) as sdk:
+        client._client = sdk
+        result = await run(client, streaming, "chat_completions")
+    assert len(requests) == 1
+    assert result.stopped_by == "refusal"
+    assert result.final_content == ""
+
+
+@pytest.mark.parametrize("output", ["text", "reasoning", "tool"])
+async def test_empty_refusal_waits_for_the_entire_stream_before_inference(output):
+    from agent_core.completion import response_rejection_reason
+    from agent_core.runtime.loop._streaming import _stream_llm_response
+
+    actual = {"content": "answer"} if output == "text" else {"reasoning_content": "thinking"} if output == "reasoning" else {"tool_calls": [{"index": 0, "id": "call", "type": "function", "function": {"name": "echo", "arguments": "{}"}}]}
+    def respond(request):
+        chunks = [{"refusal": "", "content": None}, actual]
+        events = [{"id": "id", "created": 1, "model": "m", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": "stop" if index == 0 else None}]}
+            for index, delta in enumerate(chunks)]
+        return sdk_httpx.Response(200, text=sse(events), headers={"content-type": "text/event-stream"})
+    client = OpenAIClient("m", api_key="test", base_url="https://openai.invalid")
+    await client._client.close()
+    async def noop(*_args, **_kwargs):
+        pass
+    async with AsyncOpenAI(api_key="test", base_url="https://openai.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond))) as sdk:
+        client._client = sdk
+        response = await _stream_llm_response(client, [], 10, noop)
+    assert response_rejection_reason(response) == ""
+    if output == "text":
+        assert response.content == "answer"
+    elif output == "reasoning":
+        assert response.reasoning_content == "thinking"
+    else:
+        assert response.tool_calls[0]["function"]["name"] == "echo"
+
+
+@pytest.mark.parametrize("abort", ["error", "close", "cancel"])
+async def test_incomplete_stream_does_not_infer_refusal_on_error_or_consumer_close(abort):
+    from types import SimpleNamespace
+
+    async def events():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(refusal="", content=None), finish_reason=None)], usage=None, model="m")
+        if abort == "cancel":
+            await asyncio.Event().wait()
+        raise RuntimeError("transport broke")
+    client = OpenAIClient("m", api_key="test")
+    async def open_stream(_kwargs):
+        return events()
+    client._open_stream = open_stream
+    seen = []
+    try:
+        stream = client.stream([])
+        if abort == "error":
+            with pytest.raises(RuntimeError, match="transport broke"):
+                async for delta in stream:
+                    seen.append(delta)
+        elif abort == "close":
+            seen.append(await anext(stream))
+            await stream.aclose()
+        else:
+            ready = asyncio.Event()
+            async def consume():
+                async for delta in stream:
+                    seen.append(delta)
+                    ready.set()
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(ready.wait(), 1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        await client._client.close()
+    assert len(seen) == 1
+    assert all(not delta.stop_details for delta in seen)

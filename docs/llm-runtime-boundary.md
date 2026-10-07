@@ -128,6 +128,13 @@ conservatively as reported; there is no reliable way to reconstruct provenance
 once a wrapper discards it. The classifier also reads legacy `usage_metadata`
 and raw `response_metadata.token_usage` / `usage` channels.
 
+OpenAI-compatible gateways may send `refusal=""` as a placeholder beside text,
+tool calls or reasoning (`reasoning_content` / `reasoning`). That placeholder is
+not a decline when the turn carries output. Streaming inference waits for normal
+EOF, including streams without `finish_reason`; errors and consumer cancellation
+never turn a pending marker into a refusal. Non-empty refusal text and explicit
+provider rejection reasons retain their usual semantics.
+
 ### One recovery owner in both transports
 
 `empty_completion_max_retries` defaults to two same-leg resamples. This allowance
