@@ -15,15 +15,23 @@ from __future__ import annotations
 # pyright: basic, reportPrivateImportUsage=false
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from openai import AsyncOpenAI, BadRequestError
 
+from agent_core.errors import LLMOpenAITruncatedStream
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, for_wire
 from agent_core.providers._api_key import resolve_openai_api_key
-from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
+from agent_core.providers._stream_activity import (
+    STREAM_TERMINATOR_ENV,
+    StreamActivity,
+    stream_events_with_activity,
+    stream_terminator_required,
+    watch_done_sentinel,
+)
 from agent_core.runtime.llm_request_overrides import (
     current_thinking_retry_override,
 )
@@ -392,11 +400,16 @@ class OpenAIClient(LLMClient):
 
         stream = await self._open_stream(kwargs)
         activity = StreamActivity()
+        watch_done_sentinel(stream, activity)
+        started = time.monotonic()
+        chunks_seen = 0
+        last_finish_reason = ""
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for chunk in events:
                 if chunk is None:
                     yield StreamDelta(transport_activity=True)
                     continue
+                chunks_seen += 1
                 chunk_usage = _usage_dict(getattr(chunk, "usage", None))
                 chunk_model = getattr(chunk, "model", "") or ""
                 if not chunk.choices:
@@ -409,15 +422,32 @@ class OpenAIClient(LLMClient):
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
+                finish_reason = getattr(choice, "finish_reason", None) or ""
+                if finish_reason:
+                    last_finish_reason = finish_reason
                 activity.mark_output()
                 yield StreamDelta(
                     content=getattr(delta, "content", None) or "",
                     reasoning_content=_reasoning_text(delta),
                     tool_call_deltas=_tool_call_deltas(getattr(delta, "tool_calls", None)),
-                    finish_reason=getattr(choice, "finish_reason", None) or "",
+                    finish_reason=finish_reason,
                     model=chunk_model,
                     usage=chunk_usage,
                 )
+        # Some compatible gateways omit finish_reason, while the SDK consumes
+        # [DONE] without yielding it. Either signal proves a completed turn.
+        # When [DONE] cannot be observed (no SDK decoder to watch), a missing
+        # finish_reason proves nothing and the turn is accepted as before.
+        if activity.done_observable and not (activity.saw_done or last_finish_reason):
+            error = LLMOpenAITruncatedStream(
+                protocol="chat_completions", last_event="chunk" if chunks_seen else "",
+                events_seen=chunks_seen, expected="[DONE] or finish_reason",
+                elapsed_s=time.monotonic() - started,
+            )
+            if stream_terminator_required():
+                raise error
+            logger.warning("Accepting stream without terminator (%s=0): %s",
+                           STREAM_TERMINATOR_ENV, error)
 
     async def _open_stream(self, kwargs: dict[str, Any]) -> Any:
         """Open the stream, retrying once past a rejected ``reasoning_effort``."""

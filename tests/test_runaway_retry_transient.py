@@ -90,6 +90,7 @@ async def test_all_runaway_retries_fold_without_caching_or_persisting_reminders(
                 delta=SimpleNamespace(stop_reason="end_turn" if done else "max_tokens"),
                 usage=SimpleNamespace(output_tokens=2 if done else 2048),
             )
+            yield SimpleNamespace(type="message_stop")
 
         return events()
 
