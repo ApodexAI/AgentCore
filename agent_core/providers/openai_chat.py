@@ -392,6 +392,11 @@ class OpenAIClient(LLMClient):
 
         stream = await self._open_stream(kwargs)
         activity = StreamActivity()
+        # ``refusal: ""`` is a refusal only when the turn carries nothing else;
+        # some gateways send it next to ordinary output. Hold that marker until
+        # the finishing chunk, when the whole turn is known.
+        empty_refusal_seen = False
+        output_seen = False
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for chunk in events:
                 if chunk is None:
@@ -410,13 +415,19 @@ class OpenAIClient(LLMClient):
                 choice = chunk.choices[0]
                 delta = choice.delta
                 activity.mark_output()
+                refusal = getattr(delta, "refusal", None)
+                tool_call_deltas = _tool_call_deltas(getattr(delta, "tool_calls", None))
+                finish_reason = getattr(choice, "finish_reason", None) or ""
+                empty_refusal_seen = empty_refusal_seen or refusal == ""
+                output_seen = output_seen or bool(getattr(delta, "content", None) or refusal or tool_call_deltas)
+                is_refusal = bool(refusal) or bool(finish_reason and empty_refusal_seen and not output_seen)
                 yield StreamDelta(
-                    content=getattr(delta, "content", None) or getattr(delta, "refusal", None) or "",
-                    refusal=getattr(delta, "refusal", None) or "",
-                    stop_details={"type": "refusal"} if getattr(delta, "refusal", None) is not None else {},
+                    content=getattr(delta, "content", None) or refusal or "",
+                    refusal=refusal or "",
+                    stop_details={"type": "refusal"} if is_refusal else {},
                     reasoning_content=_reasoning_text(delta),
-                    tool_call_deltas=_tool_call_deltas(getattr(delta, "tool_calls", None)),
-                    finish_reason=getattr(choice, "finish_reason", None) or "",
+                    tool_call_deltas=tool_call_deltas,
+                    finish_reason=finish_reason,
                     model=chunk_model,
                     usage=chunk_usage,
                     usage_source="estimated" if chunk_usage.get("estimated") else "provider" if chunk_usage else "",
@@ -536,8 +547,10 @@ def _to_llm_response(raw: Any) -> LLMResponse:
             },
         })
     usage_dict = _usage_dict(getattr(raw, "usage", None))
-    has_refusal = getattr(msg, "refusal", None) is not None
-    refusal = getattr(msg, "refusal", "") or ""
+    refusal = getattr(msg, "refusal", None)
+    # ``refusal: ""`` alongside real output is gateway noise, not a decline.
+    has_refusal = bool(refusal) or (refusal == "" and not getattr(msg, "content", None) and not tool_calls)
+    refusal = refusal or ""
     content = getattr(msg, "content", "") or refusal
     # Mirror the streaming path (llm_client._stream_llm_response): a Qwen
     # ``</think>\n\n`` separator remnant is either the whole of ``content``

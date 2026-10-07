@@ -64,6 +64,32 @@ async def test_chat_refusal_and_filter_without_usage_survive_sdk_boundary(stream
 
 
 @pytest.mark.parametrize("streaming", [False, True])
+async def test_chat_empty_refusal_beside_content_is_not_a_refusal(streaming):
+    def respond(request):
+        if streaming:
+            events = [{
+                "id": "id", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "refusal": ""}, "finish_reason": None}],
+            }, {
+                "id": "id", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                "choices": [{"index": 0, "delta": {"content": "hello", "refusal": ""}, "finish_reason": "stop"}],
+            }]
+            return sdk_httpx.Response(200, text=sse(events), headers={"content-type": "text/event-stream"})
+        return sdk_httpx.Response(200, json={
+            "id": "id", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello", "refusal": ""}, "finish_reason": "stop"}],
+        })
+    client = OpenAIClient("m", api_key="test", base_url="https://openai.invalid")
+    await client._client.close()
+    async with AsyncOpenAI(api_key="test", base_url="https://openai.invalid", max_retries=0,
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(respond))) as sdk:
+        client._client = sdk
+        result = await run(client, streaming, "chat_completions")
+    assert result.stopped_by != "refusal"
+    assert result.final_content == "hello"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("delta_events", [False, True])
 @pytest.mark.parametrize("refusal", ["request declined", ""])
 async def test_responses_refusal_parts_and_events_without_usage_survive_sdk_boundary(streaming, delta_events, refusal):
