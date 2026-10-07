@@ -126,8 +126,8 @@ class LLMTruncatedStream(LLMError):
     03:07:46 UTC). Every one still carried ``message_start`` usage, so the
     empty-completion guard (which requires *no* usage) let it through.
 
-    The wording matches ``_TRANSIENT_NETWORK_PATTERNS``: a dropped connection
-    is retried on the same key with backoff, which is what clears it. The
+    The wording matches ``_TRUNCATED_STREAM_PATTERNS``: the turn is resampled
+    on the same key, and an active fallback chain advances instead. The
     carried fields are the stream's end record, so the cause is visible in the
     retry log and attempt telemetry instead of only in a missing deliverable.
     """
@@ -156,7 +156,12 @@ class LLMTruncatedStream(LLMError):
 
 
 class LLMOpenAITruncatedStream(LLMError):
-    """An OpenAI-compatible stream closed before a completion signal."""
+    """An OpenAI-compatible stream closed before a completion signal.
+
+    Chat Completions completes with ``[DONE]`` or a ``finish_reason``;
+    Responses with ``response.completed`` / ``response.incomplete``. Routed
+    like :class:`LLMTruncatedStream`.
+    """
 
     def __init__(
         self, *, protocol: str, last_event: str, events_seen: int,

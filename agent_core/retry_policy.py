@@ -17,7 +17,7 @@ LEGACY_RETRYABLE_KEYWORDS = frozenset({
     "timeout", "timed out", "429", "500", "502", "503", "504", "529",
     "overloaded", "rate limit", "rate_limit", "server error",
     "connection reset", "connection error", "econnreset", "gateway timeout",
-    "model_dump", "model_not_found",
+    "model_dump", "model_not_found", "truncated stream",
 })
 
 

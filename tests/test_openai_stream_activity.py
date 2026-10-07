@@ -210,8 +210,8 @@ async def test_cleanly_closed_short_stream_is_rejected(profile):
     assert bodies[0].closed
     assert info.value.events_seen == 1
     assert info.value.protocol == ("chat_completions" if profile[0] == "chat" else "responses")
-    assert classify_error(info.value) == "transient_network"
-    assert not is_retriable_with_fallback(info.value)
+    assert classify_error(info.value) == "truncated_stream"
+    assert is_retriable_with_fallback(info.value)
 
 
 @pytest.mark.parametrize("mode", ["done_only", "finish_only"])

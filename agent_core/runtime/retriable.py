@@ -149,8 +149,14 @@ _TRANSIENT_NETWORK_PATTERNS = (
     # extractor sees them.
     re.compile(r"gateway[\s_]*time[\s_]*out", re.IGNORECASE),
     re.compile(r"upstream[\s_]*(?:timeout|error)", re.IGNORECASE),
-    # ``LLMTruncatedStream``: the connection carrying the stream was dropped
-    # before the protocol terminator. Same-key resample, like a reset.
+)
+
+# ``LLMTruncatedStream`` / ``LLMOpenAITruncatedStream``: the stream closed
+# cleanly before its protocol terminator. Routed like an empty completion: a
+# same-key resample usually clears it, and when it does not (or a chain is
+# active) a different provider is the guaranteed recovery.
+_TRUNCATED_STREAM_PATTERNS = (
+    re.compile(r"\bLLM(?:OpenAI)?TruncatedStream\b"),
     re.compile(r"truncated[\s_]*stream", re.IGNORECASE),
 )
 
@@ -354,6 +360,8 @@ def is_transient_network(err: BaseException) -> bool:
         return False
     if is_stream_stall(err):
         return False
+    if is_truncated_stream(err):
+        return False
     if is_overloaded_error(err):
         return False
     # model_unavailable is also a 5xx (typically 503 from distributor
@@ -464,6 +472,17 @@ def is_empty_completion(err: BaseException) -> bool:
     return any(p.search(blob) for p in _EMPTY_COMPLETION_PATTERNS)
 
 
+def is_truncated_stream(err: BaseException) -> bool:
+    """True if a stream closed cleanly without its protocol terminator.
+
+    What arrived is well-formed but partial, so it must never be read as a
+    deliberate stop. Routed like :func:`is_empty_completion`: same-key
+    resample first, chain advance when that is the better recovery.
+    """
+    blob = _stringify(err)
+    return any(p.search(blob) for p in _TRUNCATED_STREAM_PATTERNS)
+
+
 def is_retriable_with_fallback(err: BaseException) -> bool:
     """The chain-escalation trigger.
 
@@ -474,8 +493,8 @@ def is_retriable_with_fallback(err: BaseException) -> bool:
     is deterministic on (current provider, current input) — only
     switching providers / keys can change the outcome.
 
-    ``empty_completion`` also routes here: it isn't deterministic on the
-    input (a temp>0 resample may recover), but the caller's same-key
+    ``empty_completion`` and ``truncated_stream`` also route here: they
+    aren't deterministic on the input (a temp>0 resample may recover), but the caller's same-key
     retry budget runs first, and advancing the chain afterwards is the
     guaranteed recovery — so it belongs to the same predicate.
     """
@@ -486,6 +505,7 @@ def is_retriable_with_fallback(err: BaseException) -> bool:
         or is_model_unavailable(err)
         or is_auth_failure(err)
         or is_empty_completion(err)
+        or is_truncated_stream(err)
         or is_stream_stall(err)
     )
 
@@ -496,7 +516,8 @@ def classify_error(err: BaseException) -> str:
     Precedence (top wins):
       runtime deadline → ``context_length`` → ``safety_filter`` →
       ``model_unavailable`` →
-      ``auth_failure`` → ``empty_completion`` → ``overloaded`` →
+      ``auth_failure`` → ``empty_completion`` → ``truncated_stream`` →
+      ``overloaded`` →
       ``credit_exhausted`` → ``stream_stall`` → ``rate_limited`` →
       ``transient_network`` → ``other``.
 
@@ -526,6 +547,8 @@ def classify_error(err: BaseException) -> str:
         return "auth_failure"
     if is_empty_completion(err):
         return "empty_completion"
+    if is_truncated_stream(err):
+        return "truncated_stream"
     if is_overloaded_error(err):
         return "overloaded"
     if is_credit_exhausted(err):
@@ -553,4 +576,5 @@ __all__ = [
     "is_safety_filter",
     "is_stream_stall",
     "is_transient_network",
+    "is_truncated_stream",
 ]

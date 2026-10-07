@@ -41,7 +41,12 @@ from agent_core.errors import LLMError, LLMOpenAITruncatedStream
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.providers._api_key import resolve_openai_api_key
-from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
+from agent_core.providers._stream_activity import (
+    STREAM_TERMINATOR_ENV,
+    StreamActivity,
+    stream_events_with_activity,
+    stream_terminator_required,
+)
 from agent_core.providers.finish_reason import (
     normalize_finish_reason,
     responses_finish_reason,
@@ -212,6 +217,14 @@ class OpenAIResponsesClient(LLMClient):
                 ):
                     activity.mark_output()
                     yield StreamDelta(reasoning_content=getattr(event, "delta", "") or "")
+                elif etype == "error":
+                    # A stream-level failure carries code/message at the top
+                    # level, not under ``response.error``. Surface it as-is so
+                    # the retry classifier sees the real cause.
+                    raise _ResponsesError(
+                        str(getattr(event, "code", "") or ""),
+                        getattr(event, "message", "") or "Responses stream error",
+                    )
                 elif etype == "response.failed":
                     raise _response_failure(
                         getattr(event, "response", None), fallback="Responses request failed",
@@ -230,12 +243,16 @@ class OpenAIResponsesClient(LLMClient):
                         finish_reason=reason or "stop",
                     )
         if not saw_terminal:
-            raise LLMOpenAITruncatedStream(
+            error = LLMOpenAITruncatedStream(
                 protocol="responses", last_event=last_event,
                 events_seen=events_seen,
                 expected="response.completed or response.incomplete",
                 elapsed_s=time.monotonic() - started,
             )
+            if stream_terminator_required():
+                raise error
+            logger.warning("Accepting stream without terminator (%s=0): %s",
+                           STREAM_TERMINATOR_ENV, error)
 
 
 # ── Conversion helpers (pure — unit-tested) ────────────────────────────────

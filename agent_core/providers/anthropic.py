@@ -33,7 +33,12 @@ from agent_core.errors import LLMTruncatedStream
 from agent_core.llm import LLMClient, LLMResponse, StreamDelta
 from agent_core.messages import Message, ToolCall, text_of
 from agent_core.model_capabilities import ModelCapabilities, resolve_model_capabilities
-from agent_core.providers._stream_activity import StreamActivity, stream_events_with_activity
+from agent_core.providers._stream_activity import (
+    STREAM_TERMINATOR_ENV,
+    StreamActivity,
+    stream_events_with_activity,
+    stream_terminator_required,
+)
 from agent_core.providers.finish_reason import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
@@ -394,7 +399,7 @@ class AnthropicClient(LLMClient):
             # block) is shaped like a deliberate stop, and ``no_tool`` would
             # end the run on it. Nothing has executed yet, so a resample is
             # safe; the error text carries the end record for the retry log.
-            raise LLMTruncatedStream(
+            error = LLMTruncatedStream(
                 last_event=last_event,
                 events_seen=events_seen,
                 saw_message_delta=saw_message_delta,
@@ -403,6 +408,10 @@ class AnthropicClient(LLMClient):
                 ],
                 elapsed_s=time.monotonic() - started,
             )
+            if stream_terminator_required():
+                raise error
+            logger.warning("Accepting stream without terminator (%s=0): %s",
+                           STREAM_TERMINATOR_ENV, error)
         # Terminal delta: fold the accumulated usage/finish/model onto the
         # assembled ``LLMResponse`` (mirrors OpenAI's empty-choices chunk).
         # ``reasoning_blocks`` is sent ONLY for a thinking turn — for a plain

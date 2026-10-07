@@ -20,6 +20,8 @@ from agent_core.errors import LLMTruncatedStream
 from agent_core.loop_types import LoopConfig, LoopPolicy
 from agent_core.messages import user_msg
 from agent_core.providers import anthropic as ac
+from agent_core.providers._stream_activity import STREAM_TERMINATOR_ENV
+from agent_core.retry_policy import legacy_retryable
 from agent_core.runtime.loop.agent_loop import run_agent_loop
 from agent_core.runtime.loop.model_profile import ModelProfile
 from agent_core.runtime.retriable import (
@@ -27,6 +29,7 @@ from agent_core.runtime.retriable import (
     is_empty_completion,
     is_retriable_with_fallback,
     is_transient_network,
+    is_truncated_stream,
 )
 
 
@@ -134,15 +137,26 @@ async def test_complete_stream_is_untouched() -> None:
     assert deltas[-1].stop_reason == "tool_use"
 
 
-def test_classified_as_a_same_key_transient() -> None:
-    """A dropped connection: back off and resample, don't burn a fallback leg."""
+def test_classified_as_truncated_stream() -> None:
+    """Resample on the same key; an active chain advances, like empty completion."""
     err = LLMTruncatedStream(last_event="content_block_stop", events_seen=5,
                              saw_message_delta=False, block_types=["thinking"],
                              elapsed_s=776.0)
-    assert is_transient_network(err)
-    assert classify_error(err) == "transient_network"
-    assert not is_retriable_with_fallback(err)
+    assert is_truncated_stream(err)
+    assert classify_error(err) == "truncated_stream"
+    assert is_retriable_with_fallback(err)
+    assert not is_transient_network(err)
     assert not is_empty_completion(err)
+    assert legacy_retryable(err)
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_accepts_the_partial_turn(monkeypatch, caplog) -> None:
+    monkeypatch.setenv(STREAM_TERMINATOR_ENV, "0")
+    with caplog.at_level("WARNING"):
+        deltas = [d async for d in _client(_truncated()).stream([user_msg("go")])]
+    assert deltas[-1].usage
+    assert "ended without message_stop" in caplog.text
 
 
 @pytest.mark.asyncio

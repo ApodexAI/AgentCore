@@ -298,6 +298,7 @@ async def call_llm(
         is_empty_completion,
         is_overloaded_error,
         is_retriable_with_fallback,
+        is_truncated_stream,
     )
 
     def _transient_backoff(attempt: int) -> float:
@@ -1095,8 +1096,8 @@ async def call_llm(
             # Skip the rest of the retry budget and surface so an outer
             # chain wrapper can advance the leg right now.
             if is_retriable_with_fallback(exc):
-                # Overload (503) and empty completions frequently clear on a
-                # same-key resample (temperature>0 re-rolls the sampler). When
+                # Overload (503), empty completions and truncated streams
+                # frequently clear on a same-key resample (temperature>0 re-rolls the sampler). When
                 # NO outer chain is active to advance a leg
                 # (``chain_fallback_active()`` is False),
                 # short-circuiting these would trade a recoverable blip for a
@@ -1107,6 +1108,7 @@ async def call_llm(
                 # credit / safety) where retrying the same key cannot help.
                 resample_may_recover = (
                     is_overloaded_error(exc) or is_empty_completion(exc)
+                    or is_truncated_stream(exc)
                 )
                 if _chain_fallback_active() or not resample_may_recover:
                     logger.error(

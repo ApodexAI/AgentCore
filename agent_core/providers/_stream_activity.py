@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import os
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import Any
 
@@ -13,6 +15,8 @@ import httpx
 from agent_core.runtime.async_utils import await_bounded
 
 _CLEANUP_TIMEOUT_S = 5.0
+_SSE_LINE_BREAK = re.compile(rb"[\r\n]")
+STREAM_TERMINATOR_ENV = "AGENT_CORE_STREAM_REQUIRE_TERMINATOR"
 
 
 class StreamActivity:
@@ -21,8 +25,10 @@ class StreamActivity:
     def __init__(self) -> None:
         self.output_reported = False
         # The OpenAI SDK consumes the Chat Completions [DONE] sentinel without
-        # yielding it. Keep this wire-level signal for the adapter's end check.
+        # yielding it. Keep this wire-level signal for the adapter's end check;
+        # ``done_observable`` is False when no observer could be installed.
         self.saw_done = False
+        self.done_observable = False
         self._line = b""
         self._line_long = False
 
@@ -30,18 +36,36 @@ class StreamActivity:
         self.output_reported = True
 
     def observe_bytes(self, chunk: bytes) -> None:
+        """Scan DECODED SSE bytes for the ``data: [DONE]`` line."""
         if self.saw_done:
             return
-        parts = chunk.split(b"\n")
+        # SSE ends a line on CRLF, LF or a lone CR. Splitting on both bytes
+        # turns CRLF into an extra empty line, which is harmless here.
+        parts = _SSE_LINE_BREAK.split(chunk)
         for part in parts[:-1]:
             self._append_line(part)
-            if not self._line_long:
-                line = self._line.strip()
-                if line.startswith(b"data:") and line[5:].strip() == b"[DONE]":
-                    self.saw_done = True
+            self._check_line()
             self._line = b""
             self._line_long = False
         self._append_line(parts[-1])
+
+    def finish_bytes(self) -> None:
+        """The body ended: a final line without its line break still counts."""
+        if not self.saw_done:
+            self._check_line()
+        self._line = b""
+        self._line_long = False
+
+    def _check_line(self) -> None:
+        # Same rule as the SDK: field ``data``, one optional leading space,
+        # value starting with ``[DONE]``.
+        if self._line_long or not self._line.startswith(b"data:"):
+            return
+        value = self._line[5:]
+        if value.startswith(b" "):
+            value = value[1:]
+        if value.startswith(b"[DONE]"):
+            self.saw_done = True
 
     def _append_line(self, part: bytes) -> None:
         # Only the short sentinel line matters; never retain an unbounded SSE
@@ -54,15 +78,69 @@ class StreamActivity:
                 self._line_long = True
 
 
+class _DoneSentinelDecoder:
+    """Feed the SDK's SSE decoder through :meth:`StreamActivity.observe_bytes`.
+
+    The decoder receives ``response.aiter_bytes()`` — already decompressed —
+    whereas ``response.stream`` carries the raw body, where a gzip/deflate
+    encoded SSE stream hides the sentinel entirely.
+    """
+
+    def __init__(self, inner: Any, activity: StreamActivity) -> None:
+        self._inner = inner
+        self._activity = activity
+
+    def aiter_bytes(self, iterator: AsyncIterator[bytes]) -> AsyncIterator[Any]:
+        activity = self._activity
+
+        async def observed() -> AsyncIterator[bytes]:
+            async for chunk in iterator:
+                activity.observe_bytes(chunk)
+                yield chunk
+            activity.finish_bytes()
+
+        return self._inner.aiter_bytes(observed())
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def watch_done_sentinel(stream: Any, activity: StreamActivity) -> None:
+    """Record whether an OpenAI SDK stream delivered ``data: [DONE]``.
+
+    Must run before the stream is iterated: the SDK reads ``_decoder`` when its
+    event iterator starts. An object without one (a custom/test iterator)
+    leaves ``done_observable`` False, and the adapter must not demand it.
+    """
+    decoder = getattr(stream, "_decoder", None)
+    if decoder is None or not callable(getattr(decoder, "aiter_bytes", None)):
+        return
+    try:
+        stream._decoder = _DoneSentinelDecoder(decoder, activity)
+    except (AttributeError, TypeError):
+        return
+    activity.done_observable = True
+
+
+def stream_terminator_required() -> bool:
+    """Whether a stream that ends without its protocol terminator raises.
+
+    ``AGENT_CORE_STREAM_REQUIRE_TERMINATOR=0`` is the escape hatch for a
+    gateway that never sends one: the adapters then log the missing
+    terminator and accept the turn, which is the pre-0.14.3 behaviour.
+    """
+    return os.getenv(STREAM_TERMINATOR_ENV, "1").strip() != "0"
+
+
 class _ActivityByteStream(httpx.AsyncByteStream):
-    def __init__(self, inner: Any, on_bytes: Callable[[bytes], None]) -> None:
+    def __init__(self, inner: Any, on_bytes: Callable[[], None]) -> None:
         self._inner = inner
         self._on_bytes = on_bytes
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         async for chunk in self._inner:
             if chunk:
-                self._on_bytes(chunk)
+                self._on_bytes()
             yield chunk
 
     async def aclose(self) -> None:
@@ -82,7 +160,7 @@ def _httpx2_stream_types() -> tuple[type, type] | None:
     return AsyncByteStream, _Httpx2ActivityByteStream
 
 
-def _wrap_byte_stream(inner: Any, on_bytes: Callable[[bytes], None]) -> Any | None:
+def _wrap_byte_stream(inner: Any, on_bytes: Callable[[], None]) -> Any | None:
     # SDKs can use different transports in the same process. Match the actual
     # response stream, rather than selecting a base from one SDK's version.
     # ``None`` means an unknown stream: leave it untouched rather than break it.
@@ -118,11 +196,10 @@ async def stream_events_with_activity(
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(None)
 
-    def on_bytes(chunk: bytes) -> None:
+    def on_bytes() -> None:
         # Defer event-less progress; parsed events carry their byte progress
         # to the adapter acknowledgement below instead.
         nonlocal bytes_pending, bytes_epoch
-        activity.observe_bytes(chunk)
         bytes_epoch += 1
         if not bytes_pending:
             bytes_pending = True
