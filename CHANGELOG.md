@@ -7,6 +7,22 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.15.0] - 2026-10-07
+
+### Changed
+
+- Empty completion recovery now runs inside one logical `call_llm` invocation in both chat and streaming modes. `empty_completion_max_retries` (default 2, also available to direct callers) supplies same-leg resamples independently of the generic `max_retries` allowance; the original logical/wall deadlines bound backoff and native fallback advances. Empty attempts are emitted as discarded/failed with reason `empty_completion`, including separately identified failed tool-argument replays, and the loop stops with `empty_completion` after terminal exhaustion. Native and nested `LLMFallbackChain` routing uses independent per-call cursors, preserves bindings and middleware, respects trigger barriers, and supports an explicit `empty_completion` trigger. Direct fallback streams buffer candidate-empty deltas until a real signal commits the leg, preventing discarded tool-argument fragments from contaminating a fallback response. The cooldown wrapper detects blanks before applying its existing policy. Consumers relying on streaming retry counts, stop/error reasons or accepted-attempt metrics should adopt these unified semantics.
+  
+  `LLMResponse` and `StreamDelta` gain optional `usage_source` provenance; adapters mark provider reports, while wrappers should mark synthetic counts as `estimated` or retain `estimated: true` in usage maps. Reported zero usage remains distinct from estimates. OpenAI Chat/Responses refusal fields and events are preserved, and explicit refusals/content filters now terminate under their own stop reasons even with a nudge policy, without executing accompanying tool calls. Product wrappers opting into native delayed-assembly failover must explicitly implement `for_logical_call` and `advance_empty_completion` while preserving themselves; dynamic attribute forwarding alone is not opt-in.
+  
+  Empty OpenAI refusal placeholders beside text, tool calls or reasoning are ignored. Streams infer an otherwise empty refusal only at normal EOF, including clean closes without a finish-reason chunk; exceptions and cancellation preserve their original failure semantics.
+  
+  Streamed middleware now receives terminal usage/provenance, provider/model and rejection metadata plus named native tool calls. This restores streamed token/cost accounting and loop detection. Estimates stay diagnostic and do not charge real cost, task budgets or billing aggregates; canonical cache read/write fields preserve zeros and cache-only reported calls. Rate correction handles zero estimates and real zero usage against each limiter's actual capped reservation, while unknown/estimated usage keeps the reservation. Failed or consumer-closed tool proposals are excluded from repeat detection even when their authentic reported usage is accounted. Reported streaming usage/cost and budget consumption will increase from the old undercount; downstream budgets/alerts should be recalibrated. The legacy CostSink signature remains unchanged; cache-aware aggregators receive the separate read/write fields.
+
+### Fixed
+
+- Retry Anthropic and OpenAI-compatible streams that close before a completion signal, preventing partial responses from silently ending an agent run. Truncated streams are classified `truncated_stream`: resampled on the same key, or advanced to the next provider when a fallback chain is active. The Chat Completions `[DONE]` check reads decoded bytes, so gzip/deflate-encoded event streams are handled. Responses `error` events now surface their code and message. `AGENT_CORE_STREAM_REQUIRE_TERMINATOR=0` accepts unterminated streams with a warning, for gateways that never send a terminator.
+
 ## [0.14.2] - 2026-10-07
 
 ### Fixed
