@@ -282,6 +282,30 @@ def _expanded_retry_max_tokens(
     return expanded if expanded > cap else None
 
 
+def _model_output_limit(client: Any, _depth: int = 0) -> int | None:
+    """Return the largest ``max_tokens`` every model behind ``client`` accepts.
+
+    A plain client (or a middleware proxy forwarding to one) reports its own
+    ``capabilities``. A fallback chain binds one ``max_tokens`` for whichever
+    leg serves the request, so it is limited by its *smallest* known leg;
+    legs with no declared limit do not constrain it.
+    """
+    if client is None or _depth > 8:
+        return None
+    capabilities = getattr(client, "capabilities", None)
+    if isinstance(capabilities, ModelCapabilities):
+        return capabilities.max_output_tokens
+    entries = getattr(client, "entries", None)
+    if not isinstance(entries, list):
+        return None
+    limits = [
+        limit
+        for entry in entries
+        if (limit := _model_output_limit(getattr(entry, "model", None), _depth + 1)) is not None
+    ]
+    return min(limits) if limits else None
+
+
 def _bind_expanded_max_tokens(
     llm: Any,
     *,
@@ -290,10 +314,9 @@ def _bind_expanded_max_tokens(
     context_token_limit_hint: int | None,
 ) -> Any | None:
     bound = _ensure_bound(llm)
-    capabilities = getattr(bound.client, "capabilities", None)
     expanded = _expanded_retry_max_tokens(
         active_cap, messages, context_token_limit_hint,
-        capabilities.max_output_tokens if isinstance(capabilities, ModelCapabilities) else None,
+        _model_output_limit(bound.client),
     )
     if expanded is None:
         return None
