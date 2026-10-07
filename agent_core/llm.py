@@ -20,6 +20,9 @@ class LLMResponse:
     model: str = ""
     usage: dict[str, int] = field(default_factory=dict[str, int])
     response_metadata: dict[str, Any] = field(default_factory=dict[str, Any])
+    # "provider" for reported usage, "estimated" for host-generated counts.
+    # Empty keeps conservative compatibility with unmarked legacy clients.
+    usage_source: str = ""
 
 
 @dataclass
@@ -78,6 +81,9 @@ class StreamDelta:
     # HTTP progress without model output (e.g. Anthropic SSE pings). Keeps
     # stall guards alive without committing a provider fallback leg.
     transport_activity: bool = False
+    usage_source: str = ""
+    # Refusal text has its own SDK channel on OpenAI Chat and Responses.
+    refusal: str = ""
 
 
 @runtime_checkable

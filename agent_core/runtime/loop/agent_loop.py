@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from agent_core.completion import response_rejection_reason
 from agent_core.llm import LLMClient
 from agent_core.loop_types import (
     AgentLoopResult,
@@ -65,7 +66,6 @@ from agent_core.runtime.loop.llm_client import (
     extract_leaked_reasoning,
     extract_usage,
     is_truncated_with_text,
-    is_wholly_empty_response,
 )
 from agent_core.runtime.loop.model_profile import (
     DefaultThinkingParser,
@@ -440,7 +440,6 @@ async def _run_loop_inner(
     total_tool_calls = 0
     no_tool_retries = 0
     truncation_continuations = 0
-    empty_completions = 0
     truncated_text_parts: list[str] = []
 
     last_input_tokens = 0
@@ -537,28 +536,6 @@ async def _run_loop_inner(
         if stop_reason:
             break
 
-        # Reject transport blanks before history normalization or observers
-        # can treat them as model output. Resampling must replay the original
-        # history, not an empty/whitespace assistant prefill.
-        if is_wholly_empty_response(response):
-            empty_completions += 1
-            if empty_completions <= cfg.empty_completion_max_retries:
-                logger.warning(
-                    "turn=%d response carried no content, no tool call, no "
-                    "reasoning and no usage — resampling (%d/%d)",
-                    turn, empty_completions, cfg.empty_completion_max_retries,
-                )
-                turn -= 1
-                continue
-            stop_reason = "empty_completion"
-            logger.warning(
-                "turn=%d still empty after %d resample(s) — stopping",
-                turn, cfg.empty_completion_max_retries,
-            )
-            break
-        # Each consecutive empty episode has its own recovery budget.
-        empty_completions = 0
-
         (
             parsed_calls, ctx, stop_reason,
             continue_to_next_turn, skip_tool_execution,
@@ -576,6 +553,14 @@ async def _run_loop_inner(
         if continue_to_next_turn:
             turn -= 1
             continue
+
+        rejection = response_rejection_reason(response)
+        if rejection:
+            _answer_unexecuted_tool_calls(
+                messages, "the provider rejected this turn; this tool call was not executed.",
+            )
+            stop_reason = rejection
+            break
 
         # A reply the output cap cut off is the one case where we KNOW the model
         # was not finished, and it must never reach the ``no_tool`` branch below:
@@ -922,8 +907,16 @@ async def _call_llm_with_callbacks(
             context_token_limit_hint=cfg.context_token_limit,
             wall_deadline_remaining=runtime_hooks.wall_deadline_remaining,
             chain_fallback_active=runtime_hooks.chain_fallback_active,
+            empty_completion_max_retries=cfg.empty_completion_max_retries,
         )
     except LLMCallExhausted as exhausted:
+        if exhausted.reason == "empty_completion":
+            metadata["llm_error"] = str(exhausted.last_exc)
+            metadata["llm_error_reason"] = exhausted.reason
+            return (
+                None, "empty_completion", first_delta_at, llm_call_started,
+                time.perf_counter(), call_id, current_attempt_id, current_attempt_index,
+            )
         if exhausted.reason == "wall_deadline":
             logger.warning(
                 "agent_loop: wall deadline reached mid-turn %d; ending with wall_deadline for salvage: %s",

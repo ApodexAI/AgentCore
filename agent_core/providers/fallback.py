@@ -18,6 +18,7 @@ trigger the fall-through. Built-in triggers:
                     / "too many requests".
 - ``5xx``         — exception with a ``status_code`` attribute in
                     [500, 599], or message starting with "5".
+- ``empty_completion`` — a typed transport blank with no completion signals.
 - ``any_error``   — match anything (use this on the last entry to
                     guarantee at least one fallback).
 
@@ -57,9 +58,16 @@ import logging
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, Literal
 
+from agent_core.completion import (
+    get_recovery_hook,
+    is_wholly_empty_response,
+    stream_delta_has_completion_signal,
+)
+from agent_core.errors import LLMEmptyCompletion
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
 
@@ -94,7 +102,7 @@ async def _noop_event(_name: str, _payload: dict[str, Any]) -> None:
     return None
 
 
-FallbackTrigger = Literal["timeout", "rate_limit", "5xx", "any_error"]
+FallbackTrigger = Literal["timeout", "rate_limit", "5xx", "any_error", "empty_completion"]
 
 
 @dataclass
@@ -154,6 +162,8 @@ def _trigger_matches(trigger: FallbackTrigger, exc: BaseException) -> bool:
     """Decide whether ``exc`` matches the given trigger keyword."""
     if trigger == "any_error":
         return True
+    if trigger == "empty_completion":
+        return isinstance(exc, LLMEmptyCompletion)
 
     name = type(exc).__name__.lower()
     msg = str(exc).lower()
@@ -197,6 +207,34 @@ def _trigger_matches(trigger: FallbackTrigger, exc: BaseException) -> bool:
         )
 
     return False
+
+
+async def _nonempty_stream(
+    client: Any, messages: list[Message], **kwargs: Any,
+) -> AsyncIterator[StreamDelta]:
+    """Do not commit candidate-empty deltas that could contaminate a new leg."""
+    pending: list[StreamDelta] = []
+    committed = False
+    chunks_seen = 0
+    started = time.monotonic()
+    async with closing_stream(client.stream(messages, **kwargs)) as inner:
+        async for delta in inner:
+            if delta.transport_activity:
+                yield delta
+                continue
+            chunks_seen += 1
+            if committed:
+                yield delta
+            elif stream_delta_has_completion_signal(delta):
+                committed = True
+                for buffered in pending:
+                    yield buffered
+                pending.clear()
+                yield delta
+            else:
+                pending.append(delta)
+    if not committed:
+        raise LLMEmptyCompletion(chunks_seen=chunks_seen, elapsed_s=time.monotonic() - started)
 
 
 class CooldownFallbackLLM:
@@ -414,7 +452,10 @@ class CooldownFallbackLLM:
         for attempt in range(self.max_retries):
             try:
                 await self._emit("request", leg="primary", attempt=attempt + 1)
-                return await self.primary.chat(messages, **kwargs)
+                response = await self.primary.chat(messages, **kwargs)
+                if is_wholly_empty_response(response):
+                    raise LLMEmptyCompletion(chunks_seen=0, elapsed_s=0, partial_response=response)
+                return response
             except Exception as error:
                 last_error = error
                 await self._emit(
@@ -423,7 +464,7 @@ class CooldownFallbackLLM:
                     attempt=attempt + 1,
                     error=str(error),
                 )
-                if not self._retryable(error):
+                if not self._retryable(error) and not isinstance(error, LLMEmptyCompletion):
                     break
                 if attempt + 1 >= self.max_retries:
                     # Last attempt: sleeping here only delays the degrade and
@@ -492,7 +533,7 @@ class CooldownFallbackLLM:
                 "request", leg="fallback", mode="cooldown", streaming=True,
             )
             try:
-                async with closing_stream(self.fallback.stream(messages, **kwargs)) as inner_stream:
+                async with closing_stream(_nonempty_stream(self.fallback, messages, **kwargs)) as inner_stream:
                     async for delta in inner_stream:
                         yield delta
             except Exception as fallback_error:
@@ -515,7 +556,7 @@ class CooldownFallbackLLM:
                     attempt=attempt + 1,
                     streaming=True,
                 )
-                async with closing_stream(self.primary.stream(messages, **kwargs)) as inner_stream:
+                async with closing_stream(_nonempty_stream(self.primary, messages, **kwargs)) as inner_stream:
                     async for delta in inner_stream:
                         if not delta.transport_activity:
                             yielded = True
@@ -530,7 +571,7 @@ class CooldownFallbackLLM:
                     streaming=True,
                     error=str(error),
                 )
-                if not self._retryable(error):
+                if not self._retryable(error) and not isinstance(error, LLMEmptyCompletion):
                     break
                 if yielded and not self._replay_partial_stream:
                     # Deltas already reached the consumer; retrying the primary
@@ -573,7 +614,7 @@ class CooldownFallbackLLM:
             "request", leg="fallback", mode="degraded", streaming=True,
         )
         try:
-            async with closing_stream(self.fallback.stream(messages, **kwargs)) as inner_stream:
+            async with closing_stream(_nonempty_stream(self.fallback, messages, **kwargs)) as inner_stream:
                 async for delta in inner_stream:
                     yield delta
         except Exception as fallback_error:
@@ -618,6 +659,9 @@ class LLMFallbackChain:
     entries: list[FallbackEntry] = field(default_factory=list)
     default_triggers: tuple[FallbackTrigger, ...] = ("any_error",)
     model: str = field(init=False, default="")
+    _empty_recovery_managed: bool = field(default=False, init=False, repr=False)
+    _start_index: int = field(default=0, init=False, repr=False)
+    _serving_index: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.entries:
@@ -630,6 +674,32 @@ class LLMFallbackChain:
         for entry in self.entries:
             if entry.triggers is None:
                 entry.triggers = self.default_triggers
+
+    def for_logical_call(self) -> LLMFallbackChain:
+        """Return an independent cursor; never mutate the cached/shared chain."""
+        entries = []
+        for entry in self.entries:
+            prepare = get_recovery_hook(entry.model, "for_logical_call")
+            model = prepare() if callable(prepare) else entry.model
+            entries.append(replace(entry, model=model))
+        cursor = replace(self, entries=entries)
+        cursor._empty_recovery_managed = True
+        return cursor
+
+    def advance_empty_completion(self, error: BaseException) -> bool:
+        """Advance after the caller spent its same-leg empty retry budget."""
+        index = self._serving_index
+        nested_advance = get_recovery_hook(self.entries[index].model, "advance_empty_completion")
+        if self._empty_recovery_managed and callable(nested_advance) and nested_advance(error):
+            return True
+        if (
+            not self._empty_recovery_managed
+            or index + 1 >= len(self.entries)
+            or not self.entries[index].matches(error)
+        ):
+            return False
+        self._start_index = index + 1
+        return True
 
     @classmethod
     def from_models(
@@ -662,6 +732,11 @@ class LLMFallbackChain:
     ) -> LLMResponse:
         last_exc: BaseException | None = None
         for idx, entry in enumerate(self.entries):
+            if idx < self._start_index:
+                continue
+            self._serving_index = idx
+            if self._empty_recovery_managed:
+                self._start_index = idx
             try:
                 result = await entry.model.chat(
                     messages,
@@ -671,6 +746,8 @@ class LLMFallbackChain:
                     extra_headers=extra_headers,
                     timeout=timeout,
                 )
+                if not self._empty_recovery_managed and is_wholly_empty_response(result):
+                    raise LLMEmptyCompletion(chunks_seen=0, elapsed_s=0, partial_response=result)
                 _stamp_metadata(result, idx, entry.model, entry.provider)
                 return result
             except Exception as exc:
@@ -699,9 +776,17 @@ class LLMFallbackChain:
         # has committed to that entry.
         last_exc: BaseException | None = None
         for idx, entry in enumerate(self.entries):
+            if idx < self._start_index:
+                continue
+            self._serving_index = idx
+            if self._empty_recovery_managed:
+                self._start_index = idx
             yielded_any = False
             try:
-                async with closing_stream(entry.model.stream(
+                stream_client = entry.model.stream
+                if not self._empty_recovery_managed:
+                    stream_client = partial(_nonempty_stream, entry.model)
+                async with closing_stream(stream_client(
                     messages,
                     tools=tools,
                     temperature=temperature,

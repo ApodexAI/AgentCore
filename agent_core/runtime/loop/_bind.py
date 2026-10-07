@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from agent_core.completion import get_recovery_hook
 from agent_core.llm import LLMResponse
 from agent_core.messages import Message
 
@@ -29,6 +30,15 @@ class _BoundLLM:
     temperature: float | None = None
     extra_headers: dict[str, str] | None = None
     max_tokens: int | None = None
+
+    def for_logical_call(self) -> _BoundLLM:
+        """Allocate optional client-owned routing state for this call only."""
+        prepare = get_recovery_hook(self.client, "for_logical_call")
+        return replace(self, client=prepare()) if callable(prepare) else self
+
+    def advance_empty_completion(self, error: BaseException) -> bool:
+        advance = get_recovery_hook(self.client, "advance_empty_completion")
+        return bool(advance(error)) if callable(advance) else False
 
     @property
     def model(self) -> str:

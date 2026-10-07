@@ -107,41 +107,73 @@ When automatic mode suppresses deltas something asked for, the loop logs a
 warning. It used to be silent, which meant a profile configuring the
 reasoning-only watchdog on a gated protocol got no watchdog and no sign of it.
 
-## A blank reply is a failure, not an answer
+## Completion classification and recovery
 
-Three signals arrive in the same shape — a reply with no tool call — and need
-opposite treatment:
+The same raw-response classifier is used for chat and assembled streams, before
+history normalization or accepted-attempt events:
 
-| signal | what it means | handling |
-|---|---|---|
-| truncation (`finish_reason="length"` with text) | stopped mid-sentence | continue from the partial text (`truncation_max_continuations`) |
-| a tool-less turn with text | the model chose to stop | `no_tool_behavior` decides |
-| **nothing whatsoever** | the transport returned nothing | **resample** (`empty_completion_max_retries`), then `stopped_by="empty_completion"` |
+| Signal | Handling |
+|---|---|
+| Visible content, executable call, reasoning or opaque signed blocks | Preserve the response; existing tool/truncation/runaway policies apply. |
+| Provider-reported usage, including reported zeros | Preserve it. Usage establishes a real response, not a useful answer. |
+| `refusal`, `content_filter`, native refusal text/blocks or structured refusal details | Preserve the provider evidence and stop with `refusal` or `content_filter`, even under a nudge policy. Tools from that turn are not executed; recorded ids get synthetic replies for safe replay. |
+| No content, calls, reasoning, reported usage or explicit rejection | Raise `LLMEmptyCompletion` and recover inside `call_llm`. |
 
-"Nothing whatsoever" means no visible text, no tool call, no reasoning AND no
-usage. The usage test is what separates it from a real 0-token reply, which
-still reports prompt tokens; a reasoning-only stream likewise stays with the
-runaway guard. Only the wholly blank response is treated as a fault.
+`LLMResponse.usage_source` and `StreamDelta.usage_source` are optional provenance
+channels. Adapters stamp `provider` for reported usage. A wrapper that invents
+counts should stamp `estimated`, or retain an `estimated: true` marker on its
+usage map. Estimates are retained as estimated in attempt accounting but cannot
+turn a transport blank into a valid response. Unmarked legacy usage is treated
+conservatively as reported; there is no reliable way to reconstruct provenance
+once a wrapper discards it. The classifier also reads legacy `usage_metadata`
+and raw `response_metadata.token_usage` / `usage` channels.
 
-It is caught twice. `_stream_llm_response` raises `LLMEmptyCompletion` so a
-blank stream never becomes an `LLMResponse`; `is_empty_completion` then
-resamples on the same key and advances the chain, which is the recovery it has
-always documented for "an empty stream". `run_agent_loop` repeats the test for
-anything that reaches it by another path — a non-streamed reply, or one a
-product wrapper rebuilt. Both guards use the same predicate on the original
-response, before reasoning extraction or display normalization. Signed or
-opaque reasoning blocks, reported usage (even zero-valued), and structured
-refusal details are not transport blanks.
+### One recovery owner in both transports
 
-The loop rejects a blank before appending it to history or notifying response
-observers. A resample replays the existing conversation without an empty or
-whitespace assistant prefill; exhausting the retry budget likewise leaves
-history intact. The budget applies to consecutive blank responses and resets
-as soon as a non-empty response arrives, so separate failures in a productive
-run each get their own recovery allowance.
+`empty_completion_max_retries` defaults to two same-leg resamples. This allowance
+is independent of `max_llm_retries`, which bounds generic failures and the
+existing reasoning recovery. Resamples use the same retry backoff configuration,
+conversation and bindings. A fresh logical call gets a fresh empty allowance;
+resamples stay inside the current call and never spend additional loop turns.
+They do not restart `logical_call_timeout_s`: admission, requests, backoff and
+fallback all share the original deadline, with the run wall deadline taking
+precedence when earlier.
 
-Why it is worth two guards: without them a blank reply takes the no-tool exit,
-so the run ends with `stopped_by="no_tool"` and a trajectory that reads as a
-clean finish, while every turn of work already done is discarded. On
-ApodexHarness's 2026-10-06 GDPval batch over llm-hub that cost 10 of 19
-streamed trials, six of them inside five minutes and one on turn 1 after 37s.
+Empty requests produce exactly one finished attempt event, with reason
+`empty_completion` and outcome `discarded` when recovery continues, or `failed`
+when it stops. They never enter assistant history or response observers. The
+loop translates terminal empty exhaustion to `stopped_by="empty_completion"`;
+deadline exhaustion keeps its own error/deadline reason. The opportunistic chat
+replay used to repair streamed tool arguments also gets a separate attempt id
+before its request starts. A blank/failed replay is recorded as failed while the
+original streamed response remains deliverable; each request retains its own
+latency and accounting, rather than charging replay time to the original.
+
+### Fallback routing and wrappers
+
+`LLMFallbackChain` allocates a private cursor for each logical call. After the
+serving leg spends its empty allowance, it advances only if that leg's triggers
+match: `any_error` or the optional `empty_completion` trigger. An explicit empty
+trigger tuple is a barrier. Each subsequent leg gets the same allowance, bounded
+by the finite chain and the shared deadline. An ordinary HTTP failure that
+already selected a later leg pins empty resamples to that actual leg.
+
+Cursors survive tool, temperature, token and session bindings, nested provider
+stamping chains and middleware proxies. Cached clients are never moved to another
+leg, so concurrent calls and the next turn start independently. Direct native
+chain callers detect blanks inside the chain and apply their configured triggers.
+Candidate-empty deltas (including nameless tool argument fragments) are buffered
+until a real signal commits that leg, so discarded fragments cannot corrupt the
+next leg's tool calls. Transport heartbeats still pass through immediately.
+`CooldownFallbackLLM` similarly detects them before its existing retry/degrade
+policy and preserves its cooldown and tracing events.
+
+Transparent product wrappers opt into delayed-assembly recovery by explicitly
+implementing `for_logical_call()` and `advance_empty_completion(error)`. The
+first returns a client preserving the wrapper around fresh inner routing state;
+the second returns whether the current call advanced. `LLMProxy` implements both
+and keeps its middleware, role and shared atomic counter. A `__getattr__`
+forwarder alone is not opt-in, because invoking the inner preparation method
+could silently bypass the wrapper. Wrappers without these hooks still receive
+empty classification and same-key recovery; products using an external chain
+can inject `chain_fallback_active` to receive the terminal error for routing.

@@ -405,18 +405,21 @@ class OpenAIClient(LLMClient):
                     # streaming usage/billing read 0).
                     if chunk_usage or chunk_model:
                         activity.mark_output()
-                        yield StreamDelta(usage=chunk_usage, model=chunk_model)
+                        yield StreamDelta(usage=chunk_usage, usage_source="estimated" if chunk_usage.get("estimated") else "provider", model=chunk_model)
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
                 activity.mark_output()
                 yield StreamDelta(
-                    content=getattr(delta, "content", None) or "",
+                    content=getattr(delta, "content", None) or getattr(delta, "refusal", None) or "",
+                    refusal=getattr(delta, "refusal", None) or "",
+                    stop_details={"type": "refusal"} if getattr(delta, "refusal", None) is not None else {},
                     reasoning_content=_reasoning_text(delta),
                     tool_call_deltas=_tool_call_deltas(getattr(delta, "tool_calls", None)),
                     finish_reason=getattr(choice, "finish_reason", None) or "",
                     model=chunk_model,
                     usage=chunk_usage,
+                    usage_source="estimated" if chunk_usage.get("estimated") else "provider" if chunk_usage else "",
                 )
 
     async def _open_stream(self, kwargs: dict[str, Any]) -> Any:
@@ -506,6 +509,8 @@ def _usage_dict(usage: Any) -> dict[str, int]:
     reasoning = getattr(ctd, "reasoning_tokens", None) if ctd is not None else None
     if reasoning is not None:
         out["reasoning_tokens"] = int(reasoning)
+    if getattr(usage, "estimated", False):
+        out["estimated"] = True
     return out
 
 
@@ -531,7 +536,9 @@ def _to_llm_response(raw: Any) -> LLMResponse:
             },
         })
     usage_dict = _usage_dict(getattr(raw, "usage", None))
-    content = getattr(msg, "content", "") or ""
+    has_refusal = getattr(msg, "refusal", None) is not None
+    refusal = getattr(msg, "refusal", "") or ""
+    content = getattr(msg, "content", "") or refusal
     # Mirror the streaming path (llm_client._stream_llm_response): a Qwen
     # ``</think>\n\n`` separator remnant is either the whole of ``content``
     # (whitespace-only → drop) or leads the real answer (``\n\nAnswer…`` →
@@ -546,7 +553,11 @@ def _to_llm_response(raw: Any) -> LLMResponse:
         finish_reason=getattr(choice, "finish_reason", "") or "",
         model=getattr(raw, "model", "") or "",
         usage=usage_dict,
-        response_metadata={"id": getattr(raw, "id", "")},
+        usage_source="estimated" if usage_dict.get("estimated") else "provider" if usage_dict else "",
+        response_metadata={
+            "id": getattr(raw, "id", ""),
+            **({"refusal": refusal, "stop_details": {"type": "refusal"}} if has_refusal else {}),
+        },
     )
 
 

@@ -255,6 +255,7 @@ class AnthropicClient(LLMClient):
         blocks: dict[int, dict[str, Any]] = {}
         stream, reset = await self._create_message(kwargs)
         activity = StreamActivity()
+        usage_estimated = False
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
@@ -268,6 +269,7 @@ class AnthropicClient(LLMClient):
                     model = getattr(msg, "model", "") or model
                     u = getattr(msg, "usage", None)
                     if u is not None:
+                        usage_estimated = usage_estimated or bool(getattr(u, "estimated", False))
                         input_tokens = getattr(u, "input_tokens", input_tokens)
                         cr = getattr(u, "cache_read_input_tokens", None)
                         if cr is not None:
@@ -364,6 +366,7 @@ class AnthropicClient(LLMClient):
                         stop_details = details
                     u = getattr(event, "usage", None)
                     if u is not None:
+                        usage_estimated = usage_estimated or bool(getattr(u, "estimated", False))
                         ot = getattr(u, "output_tokens", None)
                         if ot is not None:
                             output_tokens = ot
@@ -392,6 +395,7 @@ class AnthropicClient(LLMClient):
                     block["input"] = {}
         activity.mark_output()
         yield StreamDelta(
+            usage_source="estimated" if usage_estimated else "provider",
             usage=_anthropic_usage_dict(
                 input_tokens,
                 output_tokens,
@@ -1018,6 +1022,9 @@ def _to_llm_response(raw: Any) -> LLMResponse:
         _anthropic_reasoning_tokens(usage),
     )
 
+    if getattr(usage, "estimated", False):
+        usage_dict["estimated"] = True
+
     # ``stop_reason`` is normalised for ``finish_reason`` (``max_tokens`` →
     # ``length``), which is what the loop's truncation checks need. The RAW
     # value is kept alongside it: ``refusal`` survives normalisation today,
@@ -1038,6 +1045,7 @@ def _to_llm_response(raw: Any) -> LLMResponse:
         finish_reason=normalize_finish_reason(getattr(raw, "stop_reason", "")),
         model=getattr(raw, "model", "") or "",
         usage=usage_dict,
+        usage_source="estimated" if usage_dict.get("estimated") else "provider" if usage_dict else "",
         response_metadata=metadata,
     )
 

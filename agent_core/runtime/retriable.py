@@ -454,8 +454,8 @@ def is_empty_completion(err: BaseException) -> bool:
     layer but produced zero content tokens (reasoning-runaway,
     all-tokens-in-thinking, or an empty stream). Routed through
     :func:`is_retriable_with_fallback` so the caller retries the same key
-    first (a temperature>0 resample frequently recovers) and then advances
-    the chain to a different provider, which always recovers.
+    first (a temperature>0 resample can recover) and then may advance
+    a configured chain. Recovery remains bounded and can exhaust.
     """
     blob = _stringify(err)
     return any(p.search(blob) for p in _EMPTY_COMPLETION_PATTERNS)
@@ -474,7 +474,7 @@ def is_retriable_with_fallback(err: BaseException) -> bool:
     ``empty_completion`` also routes here: it isn't deterministic on the
     input (a temp>0 resample may recover), but the caller's same-key
     retry budget runs first, and advancing the chain afterwards is the
-    guaranteed recovery — so it belongs to the same predicate.
+    configured recovery — so it belongs to the same predicate.
     """
     return (
         is_overloaded_error(err)

@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from agent_core.completion import is_wholly_empty_response as is_wholly_empty_response
 from agent_core.llm import LLMResponse
 from agent_core.loop_types import UsageMetadata
 from agent_core.messages import Message
@@ -92,49 +93,6 @@ def extract_leaked_reasoning(response: Any) -> str:
     meta = getattr(response, "response_metadata", None) or {}
     value = meta.get(LEAKED_REASONING_KEY, "")
     return value if isinstance(value, str) else ""
-
-
-def is_wholly_empty_response(response: Any) -> bool:
-    """No content, tool calls, reasoning or usage on the original response.
-
-    Inspect before normalization: hiding reasoning or dropping opaque blocks
-    for display does not make an upstream response empty. Legacy wrappers may
-    carry reasoning and usage on their auxiliary metadata channels.
-    """
-    if getattr(response, "tool_calls", None):
-        return False
-    reasoning = getattr(response, "reasoning_content", "") or ""
-    if str(reasoning).strip():
-        return False
-    extra = getattr(response, "additional_kwargs", None) or {}
-    if isinstance(extra, dict) and str(extra.get("reasoning_content") or "").strip():
-        return False
-    if getattr(response, "usage", None) or getattr(response, "usage_metadata", None):
-        return False
-    metadata = getattr(response, "response_metadata", None) or {}
-    if isinstance(metadata, dict) and (
-        metadata.get("token_usage") or metadata.get("usage") or metadata.get("stop_details")
-    ):
-        return False
-    content = getattr(response, "content", None)
-    if isinstance(content, str):
-        return not content.strip()
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, str):
-                if block.strip():
-                    return False
-            elif isinstance(block, dict):
-                if (
-                    str(block.get("text") or block.get("content") or "").strip()
-                    or block.get("type") not in ("text", "")
-                ):
-                    return False
-            elif block is not None:
-                # Unknown payloads are not evidence of an empty response.
-                return False
-        return True
-    return content is None
 
 
 def _pick_int(*candidates: Any) -> int:
@@ -271,6 +229,8 @@ def extract_usage(response: Any) -> UsageMetadata | None:
             # invariant on the ``UsageMetadata`` return type.
             "reasoning_tokens": int(usage.get("reasoning_tokens", 0) or 0),
         }
+        if usage.get("estimated") or getattr(response, "usage_source", "") == "estimated" or rmd.get("usage_source") == "estimated":
+            out_dict["estimated"] = True
         return out_dict
 
     rmd = getattr(response, "response_metadata", None) or {}

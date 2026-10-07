@@ -12,6 +12,7 @@ from typing import Any
 from agent_core.errors import (
     LLMCallExhausted,
     LLMDeadlineExceeded,
+    LLMEmptyCompletion,
     LLMReasoningRunaway,
     LLMStreamStalled,
 )
@@ -37,7 +38,7 @@ from agent_core.runtime.retriable import (
 
 from ..async_utils import await_bounded, hold_until_settled
 from ._bind import _ensure_bound
-from ._response import _visible_response_text, extract_usage
+from ._response import _visible_response_text, extract_usage, is_wholly_empty_response
 from ._runaway import (
     _RUNAWAY_BACKOFF_S,
     _RUNAWAY_EXPAND_ENABLED,
@@ -215,6 +216,7 @@ async def call_llm(
     context_token_limit_hint: int | None = None,
     wall_deadline_remaining: Callable[[], float | None] | None = None,
     chain_fallback_active: Callable[[], bool] | None = None,
+    empty_completion_max_retries: int = 2,
 ) -> LLMResponse | None:
     """Call ``llm.chat`` (``llm.stream`` when ``on_delta`` is set) with
     exponential backoff on transient errors.
@@ -237,6 +239,15 @@ async def call_llm(
     - **Retries exhausted on transient errors** (timeout / stream stall
       / 5xx / 429 / proxy-wrap): raises (reason=``exhausted``) carrying
       the last transient exception.
+
+    ``empty_completion_max_retries`` is the same-leg resampling allowance
+    after a transport blank in either mode. It does not consume the generic
+    ``max_retries`` allowance. After that budget is spent, a prepared native
+    fallback cursor can advance to a matching next leg and gets a fresh empty
+    allowance; a configured external chain instead receives ``chain_advance``.
+    Otherwise exhaustion raises with reason ``empty_completion``. All of these
+    attempts share this call's original logical deadline. Empty attempts are
+    discarded/failed before any accepted event or history insertion.
 
     Streaming calls additionally run under the inter-chunk stall
     watchdog (:class:`LLMStreamStalled`,
@@ -421,7 +432,7 @@ async def call_llm(
     # ``llm_active`` may be re-bound with a reduced max_tokens after a
     # repeated reasoning runaway — error retries then reuse the bound
     # variant too, which is fine (the cap only applies post-runaway).
-    llm_active = _ensure_bound(llm)
+    llm_active = _ensure_bound(llm).for_logical_call()
     messages_active = messages
     retry_thinking: ThinkingRetryOverride | None = None
     guard_timeout_s = reasoning_only_timeout_s
@@ -432,7 +443,10 @@ async def call_llm(
     # from this number, so reusing it would emit two ``finished`` events
     # under one id and double-count that attempt's usage downstream.
     physical_attempt_index = 0
-    for attempt in range(max_retries):
+    empty_completions = 0
+    empty_budget = max(int(empty_completion_max_retries), 0)
+    attempt = 0
+    while attempt < max_retries:
         attempt_thinking = retry_thinking
         # Budget closure: clamp this attempt to the remaining wall (when
         # a deadline is stamped) so a retry chain can never outlive the
@@ -446,6 +460,7 @@ async def call_llm(
         attempt_index = physical_attempt_index
         attempt_started = time.monotonic()
         attempt_first_delta: float | None = None
+        response_ended_at: float | None = None
         active_cap = (
             getattr(llm_active, "max_tokens", None)
             or max_completion_tokens_hint
@@ -498,10 +513,15 @@ async def call_llm(
             attempt_delta = _attempt_delta
 
         async def _chat_active(read_timeout: float) -> LLMResponse:
+            chat_started = time.monotonic()
             with thinking_retry_override(attempt_thinking):
-                return await llm_active.chat(
-                    messages_active, timeout=read_timeout,
-                )
+                response = await llm_active.chat(messages_active, timeout=read_timeout)
+                if is_wholly_empty_response(response):
+                    raise LLMEmptyCompletion(
+                        chunks_seen=0, elapsed_s=time.monotonic() - chat_started,
+                        partial_response=response,
+                    )
+                return response
 
         async def _stream_active(read_timeout: float) -> LLMResponse:
             if attempt_delta is None:
@@ -554,6 +574,40 @@ async def call_llm(
             if response is not None:
                 event.update(_response_attempt_fields(response))
             await _emit_attempt(event)
+
+        async def _recover_empty_completion(exc: LLMEmptyCompletion) -> None:
+            nonlocal last_exc, empty_completions
+            last_exc = exc
+            empty_completions += 1
+            advance = False
+            if empty_completions > empty_budget:
+                advance = llm_active.advance_empty_completion(exc)
+                if advance:
+                    empty_completions = 0
+                else:
+                    reason = "chain_advance" if _chain_fallback_active() else "empty_completion"
+                    await _finish_attempt(
+                        outcome=ATTEMPT_FAILED, reason="empty_completion",
+                        recovery_action=reason, error=exc,
+                        response=exc.partial_response,
+                    )
+                    raise LLMCallExhausted(exc, reason) from exc
+            delay = 0 if advance else _transient_backoff(empty_completions - 1)
+            remaining, deadline_reason = _nearest_deadline()
+            if remaining is not None and delay + _WALL_DEADLINE_FLOOR_S > remaining:
+                deadline_exc = LLMDeadlineExceeded(deadline_reason, "no budget for empty resample")
+                await _finish_attempt(
+                    outcome=ATTEMPT_FAILED, reason=deadline_reason,
+                    recovery_action="abandon_retry", error=deadline_exc,
+                    response=exc.partial_response,
+                )
+                raise LLMCallExhausted(deadline_exc, deadline_reason, prior_exc=exc) from exc
+            await _finish_attempt(
+                outcome=ATTEMPT_DISCARDED, reason="empty_completion",
+                recovery_action="chain_advance" if advance else "retry_same_key",
+                error=exc, response=exc.partial_response,
+            )
+            await asyncio.sleep(delay)
 
         retry_reason = "transient_error"
         retry_error: BaseException | None = None
@@ -645,6 +699,8 @@ async def call_llm(
                         )
                         recovered: LLMResponse | None = None
                         recovery_error: BaseException | None = None
+                        replay_started: float | None = None
+                        replay_index = 0
                         try:
                             # Clamp to whatever is left of THIS attempt's own
                             # budget as well as the wall/logical deadline: the
@@ -670,6 +726,25 @@ async def call_llm(
                                     f"{effective_timeout:.0f}s attempt budget "
                                     f"left for the replay",
                                 )
+                            physical_attempt_index += 1
+                            replay_index = physical_attempt_index
+                            replay_started = time.monotonic()
+                            await _emit_attempt({
+                                "phase": "started", "attempt_index": replay_index,
+                                "max_tokens": active_cap,
+                                "thinking_mode": attempt_thinking.mode if attempt_thinking else "profile_default",
+                                "thinking_budget": attempt_thinking.thinking_budget if attempt_thinking else None,
+                            })
+                            # Observation hooks have their own grace period;
+                            # re-clamp before the actual replay request starts.
+                            recovery_timeout = min(
+                                _effective_timeout_or_deadline_exhausted(
+                                    attempt=attempt, reason="stream_empty_tool_arguments",
+                                )[0],
+                                max(attempt_deadline - time.monotonic(), 0.0),
+                            )
+                            if _stream_recovery_budget_too_small(recovery_timeout, float(effective_timeout)):
+                                raise TimeoutError("no useful replay budget remains after observation")
                             recovered = await await_bounded(
                                 _chat_active(recovery_timeout),
                                 recovery_timeout,
@@ -684,6 +759,23 @@ async def call_llm(
                             recovery_error = exc
 
                         if recovered is None:
+                            response_ended_at = stream_ended_at
+                            if replay_started is not None:
+                                replay_event: dict[str, Any] = {
+                                    "phase": "finished", "attempt_index": replay_index,
+                                    "outcome": ATTEMPT_FAILED,
+                                    "reason": "empty_completion" if isinstance(recovery_error, LLMEmptyCompletion) else "stream_empty_args_replay",
+                                    "recovery_action": "keep_streamed_response",
+                                    "duration_ms": int((time.monotonic() - replay_started) * 1000),
+                                    "ttft_ms": None, "max_tokens": active_cap,
+                                    "thinking_mode": attempt_thinking.mode if attempt_thinking else "profile_default",
+                                    "thinking_budget": attempt_thinking.thinking_budget if attempt_thinking else None,
+                                    "error_type": type(recovery_error).__name__,
+                                }
+                                partial = getattr(recovery_error, "partial_response", None)
+                                if partial is not None:
+                                    replay_event.update(_response_attempt_fields(partial))
+                                await _emit_attempt(replay_event)
                             logger.warning(
                                 "Non-streaming replay failed (%s: %s); keeping "
                                 "the streamed response with blank tool "
@@ -718,23 +810,9 @@ async def call_llm(
                                 response=streamed_response,
                                 ended_at=stream_ended_at,
                             )
-                            physical_attempt_index += 1
-                            attempt_index = physical_attempt_index
-                            attempt_started = stream_ended_at
+                            attempt_index = replay_index
+                            attempt_started = replay_started if replay_started is not None else stream_ended_at
                             attempt_first_delta = None
-                            await _emit_attempt({
-                                "phase": "started",
-                                "attempt_index": attempt_index,
-                                "max_tokens": active_cap,
-                                "thinking_mode": (
-                                    attempt_thinking.mode
-                                    if attempt_thinking else "profile_default"
-                                ),
-                                "thinking_budget": (
-                                    attempt_thinking.thinking_budget
-                                    if attempt_thinking else None
-                                ),
-                            })
                             response = recovered
                             response.response_metadata = {
                                 **(response.response_metadata or {}),
@@ -828,6 +906,7 @@ async def call_llm(
                         prior_turn_runaway,
                     )
                     await asyncio.sleep(_RUNAWAY_BACKOFF_S)
+                    attempt += 1
                     continue
                 if runaway_state is not None:
                     runaway_state["consecutive_turns"] = (
@@ -866,8 +945,12 @@ async def call_llm(
                 reason="",
                 recovery_action="accepted",
                 response=response,
+                ended_at=response_ended_at,
             )
             return response
+        except LLMEmptyCompletion as exc:
+            await _recover_empty_completion(exc)
+            continue
         except LLMCallExhausted as exc:
             await _finish_attempt(
                 outcome=ATTEMPT_FAILED,
@@ -952,6 +1035,7 @@ async def call_llm(
                     prior_turn_runaway,
                 )
                 await asyncio.sleep(_RUNAWAY_BACKOFF_S)
+                attempt += 1
                 continue
             if runaway_state is not None:
                 runaway_state["consecutive_turns"] = (
@@ -1054,6 +1138,13 @@ async def call_llm(
             )
             backoff = _transient_backoff(attempt)
         except Exception as exc:
+            if is_empty_completion(exc):
+                empty_exc = LLMEmptyCompletion(
+                    chunks_seen=0, elapsed_s=time.monotonic() - attempt_started,
+                )
+                empty_exc.__cause__ = exc
+                await _recover_empty_completion(empty_exc)
+                continue
             last_exc = exc
             retry_error = exc
             retry_reason = "transient_error"
@@ -1089,6 +1180,7 @@ async def call_llm(
                     turn, attempt + 1, max_retries, next_cap,
                     retry_thinking.thinking_budget,
                 )
+                attempt += 1
                 continue
             # Chain-aware shortcut: model_not_found / overload / credit
             # / safety_filter is deterministic on this (provider, input).
@@ -1237,6 +1329,8 @@ async def call_llm(
                 recovery_action="raise_exhausted",
                 error=retry_error,
             )
+
+        attempt += 1
 
     logger.error("LLM call failed after %d retries (turn=%d)", max_retries, turn)
     # Should always have an exception captured here — every except clause

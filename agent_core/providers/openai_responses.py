@@ -190,6 +190,7 @@ class OpenAIResponsesClient(LLMClient):
         kwargs["stream"] = True
         stream = await self._client.responses.create(**kwargs)
         activity = StreamActivity()
+        refusal_seen = False
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
@@ -199,6 +200,11 @@ class OpenAIResponsesClient(LLMClient):
                 if etype == "response.output_text.delta":
                     activity.mark_output()
                     yield StreamDelta(content=getattr(event, "delta", "") or "")
+                elif etype == "response.refusal.delta":
+                    refusal = getattr(event, "delta", "") or ""
+                    refusal_seen = refusal_seen or bool(refusal)
+                    activity.mark_output()
+                    yield StreamDelta(content=refusal, refusal=refusal)
                 elif etype in (
                     "response.reasoning_summary_text.delta",
                     "response.reasoning_text.delta",
@@ -211,6 +217,10 @@ class OpenAIResponsesClient(LLMClient):
                     )
                 elif etype in ("response.completed", "response.incomplete"):
                     resp = getattr(event, "response", None)
+                    parsed = _parse_responses_output(resp)
+                    refusal = parsed.response_metadata.get("refusal", "")
+                    if refusal and not refusal_seen:
+                        yield StreamDelta(content=refusal, refusal=refusal)
                     usage = _responses_usage_dict(getattr(resp, "usage", None))
                     reason = normalize_finish_reason(
                         _get(_get(resp, "incomplete_details", None) or {}, "reason", ""),
@@ -218,6 +228,8 @@ class OpenAIResponsesClient(LLMClient):
                     activity.mark_output()
                     yield StreamDelta(
                         usage=usage,
+                        stop_details=parsed.response_metadata.get("stop_details", {}),
+                        usage_source="estimated" if usage.get("estimated") else "provider" if usage else "",
                         model=getattr(resp, "model", "") or "",
                         finish_reason=reason or "stop",
                     )
@@ -379,6 +391,7 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
     if str(_get(raw, "status", "") or "") == "failed":
         raise _response_failure(raw, fallback="Responses request failed")
     blocks_out: list[dict[str, Any]] = []
+    refusal_parts: list[str] = []
     text_parts: list[str] = []
     summary_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -409,6 +422,11 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
                     txt = _get(part, "text", "") or ""
                     text_parts.append(txt)
                     blocks_out.append({"type": "text", "text": txt})
+                elif _get(part, "type", "") == "refusal":
+                    refusal = _get(part, "refusal", "") or ""
+                    refusal_parts.append(refusal)
+                    text_parts.append(refusal)
+                    blocks_out.append({"type": "text", "text": refusal})
         elif itype == "function_call":
             call_id = _get(item, "call_id", "") or _get(item, "id", "") or ""
             call_name = _get(item, "name", "") or ""
@@ -453,7 +471,11 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
         ),
         model=_get(raw, "model", "") or "",
         usage=_responses_usage_dict(_get(raw, "usage", None)),
-        response_metadata={"id": _get(raw, "id", "")},
+        usage_source="estimated" if _get(_get(raw, "usage", None), "estimated", False) else "provider" if _get(raw, "usage", None) is not None else "",
+        response_metadata={
+            "id": _get(raw, "id", ""),
+            **({"refusal": "\n".join(refusal_parts), "stop_details": {"type": "refusal"}} if refusal_parts else {}),
+        },
     )
 
 
@@ -496,6 +518,8 @@ def _responses_usage_dict(usage: Any) -> dict[str, int]:
     # — exist to avoid.
     if reasoning is not None:
         out["reasoning_tokens"] = int(reasoning)
+    if _get(usage, "estimated", False):
+        out["estimated"] = True
     return out
 
 

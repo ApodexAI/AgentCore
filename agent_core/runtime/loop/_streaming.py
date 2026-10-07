@@ -250,6 +250,8 @@ async def _stream_llm_response(
     # Terminal metadata streamed late by the provider — kept so the assembled
     # LLMResponse carries usage/finish_reason/model (else streaming runs report
     # 0 usage and observers never see finish_reason="length").
+    final_usage_source = ""
+    final_refusal = ""
     final_usage: dict[str, int] = {}
     final_finish_reason = ""
     final_model = ""
@@ -298,6 +300,8 @@ async def _stream_llm_response(
         response_metadata = (
             {"provider_actually_used": final_provider} if final_provider else {}
         )
+        if final_refusal:
+            response_metadata["refusal"] = final_refusal
         if final_stop_details:
             response_metadata["stop_details"] = final_stop_details
         if final_stop_reason:
@@ -373,6 +377,7 @@ async def _stream_llm_response(
             tool_calls=complete_tool_calls,
             reasoning_content=thinking_accum,
             usage=final_usage,
+            usage_source=final_usage_source,
             finish_reason=final_finish_reason,
             model=final_model,
             response_metadata=response_metadata,
@@ -400,7 +405,7 @@ async def _stream_llm_response(
                             continue
                     else:
                         chunks_seen += 1
-                    raw_visible = delta.content or ""
+                    raw_visible = delta.content or getattr(delta, "refusal", "") or ""
                     typed_thinking = delta.reasoning_content or ""
                     tc_chunks = delta.tool_call_deltas or []
                     # Capture terminal metadata as it arrives (usage on the
@@ -408,6 +413,9 @@ async def _stream_llm_response(
                     # content chunk). Last non-empty wins.
                     if getattr(delta, "usage", None):
                         final_usage = delta.usage
+                        final_usage_source = getattr(delta, "usage_source", "")
+                    if getattr(delta, "refusal", ""):
+                        final_refusal += delta.refusal
                     if getattr(delta, "finish_reason", ""):
                         final_finish_reason = delta.finish_reason
                     if getattr(delta, "model", ""):
@@ -618,6 +626,7 @@ async def _stream_llm_response(
         raise LLMEmptyCompletion(
             chunks_seen=chunks_seen,
             elapsed_s=time.monotonic() - stream_started,
+            partial_response=assembled,
         )
     return assembled
 

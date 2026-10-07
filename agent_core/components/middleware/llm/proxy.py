@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import itertools
 import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+from agent_core.completion import get_recovery_hook
 from agent_core.components.middleware.llm.base import (
     LLMCallContext,
 )
@@ -76,6 +78,20 @@ class LLMProxy:
         self.role_id = role_id
         self.model = getattr(inner, "model", "") or ""
         self._counter = itertools.count(1)
+
+    def for_logical_call(self) -> LLMProxy:
+        prepare = get_recovery_hook(self.inner, "for_logical_call")
+        if prepare is None:
+            return self
+        # Preserve middleware, role, subclasses and the shared atomic counter.
+        # Only the wrapped provider's routing cursor belongs to this call.
+        proxy = copy.copy(self)
+        proxy.inner = prepare()
+        return proxy
+
+    def advance_empty_completion(self, error: BaseException) -> bool:
+        advance = get_recovery_hook(self.inner, "advance_empty_completion")
+        return bool(advance(error)) if advance is not None else False
 
     @property
     def call_counter(self) -> int:
