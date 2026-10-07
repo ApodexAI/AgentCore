@@ -86,6 +86,8 @@ class LoopDetectionMiddleware(LLMMiddleware):
     async def after_llm(
         self, ctx: LLMCallContext, response: LLMResponse
     ) -> LLMResponse:
+        if ctx.metadata.get("_llm_stream_incomplete"):
+            return response
         key = self._scope_key(ctx)
         if key is None:
             return response

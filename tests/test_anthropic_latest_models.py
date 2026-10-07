@@ -330,7 +330,7 @@ async def test_blank_wrapper_response_retries_with_valid_anthropic_history(blank
         llm = BlankFirst()
         result = await run_agent_loop(
             system_prompt="s", user_message="u", llm=llm, tools=[],
-            config=LoopConfig(max_turns=1, max_llm_retries=1),
+            config=LoopConfig(max_turns=1, max_llm_retries=1, retry_wait_fixed=0),
             model_profile=ModelProfile(
                 model_id=client.model, provider="anthropic", protocol="anthropic",
                 thinking_format="content_block",

@@ -400,6 +400,11 @@ class OpenAIClient(LLMClient):
 
         stream = await self._open_stream(kwargs)
         activity = StreamActivity()
+        # ``refusal: ""`` is a refusal only when the turn carries nothing else;
+        # some gateways send it next to ordinary output. Hold that marker until
+        # normal EOF, when the whole turn is known even without finish_reason.
+        empty_refusal_seen = False
+        output_seen = False
         watch_done_sentinel(stream, activity)
         started = time.monotonic()
         chunks_seen = 0
@@ -418,7 +423,7 @@ class OpenAIClient(LLMClient):
                     # streaming usage/billing read 0).
                     if chunk_usage or chunk_model:
                         activity.mark_output()
-                        yield StreamDelta(usage=chunk_usage, model=chunk_model)
+                        yield StreamDelta(usage=chunk_usage, usage_source="estimated" if chunk_usage.get("estimated") else "provider", model=chunk_model)
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -426,13 +431,23 @@ class OpenAIClient(LLMClient):
                 if finish_reason:
                     last_finish_reason = finish_reason
                 activity.mark_output()
+                refusal = getattr(delta, "refusal", None)
+                tool_call_deltas = _tool_call_deltas(getattr(delta, "tool_calls", None))
+                empty_refusal_seen = empty_refusal_seen or refusal == ""
+                reasoning = _reasoning_text(delta)
+                output_seen = output_seen or bool(
+                    getattr(delta, "content", None) or refusal or tool_call_deltas or reasoning
+                )
                 yield StreamDelta(
-                    content=getattr(delta, "content", None) or "",
-                    reasoning_content=_reasoning_text(delta),
-                    tool_call_deltas=_tool_call_deltas(getattr(delta, "tool_calls", None)),
+                    content=getattr(delta, "content", None) or refusal or "",
+                    refusal=refusal or "",
+                    stop_details={"type": "refusal"} if refusal else {},
+                    reasoning_content=reasoning,
+                    tool_call_deltas=tool_call_deltas,
                     finish_reason=finish_reason,
                     model=chunk_model,
                     usage=chunk_usage,
+                    usage_source="estimated" if chunk_usage.get("estimated") else "provider" if chunk_usage else "",
                 )
         # Some compatible gateways omit finish_reason, while the SDK consumes
         # [DONE] without yielding it. Either signal proves a completed turn.
@@ -448,6 +463,11 @@ class OpenAIClient(LLMClient):
                 raise error
             logger.warning("Accepting stream without terminator (%s=0): %s",
                            STREAM_TERMINATOR_ENV, error)
+
+        # Do not put this in finally: errors and consumer cancellation must
+        # propagate, not manufacture a refusal from an incomplete turn.
+        if empty_refusal_seen and not output_seen:
+            yield StreamDelta(stop_details={"type": "refusal"})
 
     async def _open_stream(self, kwargs: dict[str, Any]) -> Any:
         """Open the stream, retrying once past a rejected ``reasoning_effort``."""
@@ -536,6 +556,8 @@ def _usage_dict(usage: Any) -> dict[str, int]:
     reasoning = getattr(ctd, "reasoning_tokens", None) if ctd is not None else None
     if reasoning is not None:
         out["reasoning_tokens"] = int(reasoning)
+    if getattr(usage, "estimated", False):
+        out["estimated"] = True
     return out
 
 
@@ -561,7 +583,14 @@ def _to_llm_response(raw: Any) -> LLMResponse:
             },
         })
     usage_dict = _usage_dict(getattr(raw, "usage", None))
-    content = getattr(msg, "content", "") or ""
+    refusal = getattr(msg, "refusal", None)
+    # ``refusal: ""`` alongside real output is gateway noise, not a decline.
+    reasoning = _reasoning_text(msg)
+    has_refusal = bool(refusal) or (
+        refusal == "" and not (getattr(msg, "content", None) or tool_calls or reasoning)
+    )
+    refusal = refusal or ""
+    content = getattr(msg, "content", "") or refusal
     # Mirror the streaming path (llm_client._stream_llm_response): a Qwen
     # ``</think>\n\n`` separator remnant is either the whole of ``content``
     # (whitespace-only → drop) or leads the real answer (``\n\nAnswer…`` →
@@ -572,11 +601,15 @@ def _to_llm_response(raw: Any) -> LLMResponse:
     return LLMResponse(
         content=content,
         tool_calls=tool_calls,
-        reasoning_content=_reasoning_text(msg),
+        reasoning_content=reasoning,
         finish_reason=getattr(choice, "finish_reason", "") or "",
         model=getattr(raw, "model", "") or "",
         usage=usage_dict,
-        response_metadata={"id": getattr(raw, "id", "")},
+        usage_source="estimated" if usage_dict.get("estimated") else "provider" if usage_dict else "",
+        response_metadata={
+            "id": getattr(raw, "id", ""),
+            **({"refusal": refusal, "stop_details": {"type": "refusal"}} if has_refusal else {}),
+        },
     )
 
 

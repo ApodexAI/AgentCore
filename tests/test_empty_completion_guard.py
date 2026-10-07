@@ -113,7 +113,7 @@ class _BlankThenAnswer:
 
 def _cfg(**kw: Any) -> LoopConfig:
     return LoopConfig(
-        max_turns=4, max_llm_retries=1,
+        max_turns=4, max_llm_retries=1, retry_wait_fixed=0,
         loop_policy=LoopPolicy(no_tool_behavior="stop"), **kw,
     )
 
@@ -247,7 +247,7 @@ async def test_nonempty_raw_responses_are_not_resampled(response, thinking_forma
         model_profile=ModelProfile(model_id="m", provider="p", thinking_format=thinking_format),
     )
     assert len(llm.requests) == 1
-    assert result.stopped_by == "no_tool"
+    assert result.stopped_by == ("refusal" if response.finish_reason == "refusal" else "no_tool")
     assert result.turns_used == 1
 
 
@@ -265,7 +265,7 @@ async def test_blank_resamples_on_the_only_available_turn() -> None:
     llm = _SequenceLLM([LLMResponse(), LLMResponse(), LLMResponse(content="finished")])
     result = await run_agent_loop(
         system_prompt="s", user_message="u", llm=llm, tools=[],
-        config=LoopConfig(max_turns=1, max_llm_retries=1),
+        config=LoopConfig(max_turns=1, max_llm_retries=1, retry_wait_fixed=0),
     )
     assert result.final_content == "finished"
     assert result.turns_used == 1

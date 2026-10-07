@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, cast
 
+from agent_core.completion import reported_usage, usage_count
 from agent_core.components.middleware.llm.base import (
     LLMCallContext,
     LLMMiddleware,
@@ -88,31 +89,16 @@ class TokenAccountingMiddleware(LLMMiddleware):
         return dict(self._usage.get(task_id, {"input": 0, "output": 0, "total": 0, "llm_calls": 0}))
 
     def _extract_usage(self, response: LLMResponse) -> tuple[int, int, int, int]:
-        """Extract (input, output, cache_read, cache_creation) token counts.
-
-        Native :class:`LLMResponse` carries a single flat ``usage`` dict in
-        OpenAI-wire shape regardless of provider — the infra clients
-        normalise both OpenAI (``prompt_tokens`` / ``completion_tokens`` /
-        ``prompt_tokens_details.cached_tokens``) and Anthropic
-        (``input_tokens`` / ``output_tokens`` / ``cache_read_input_tokens``)
-        into ``{prompt_tokens, completion_tokens, total_tokens,
-        cached_tokens}``. Cache-creation tokens are not surfaced by the
-        native clients, so that count is always 0.
-        """
-        raw_usage: object = getattr(response, "usage", None)
-        if not isinstance(raw_usage, dict):
+        """Read canonical usage with legacy aliases, preserving reported zeros."""
+        usage = reported_usage(response)
+        if usage is None:
             return 0, 0, 0, 0
-        usage = cast("dict[str, Any]", raw_usage)
-
-        inp = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
-        out = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
-        cache_read = (
-            usage.get("cached_tokens")
-            or usage.get("cache_read_input_tokens")
-            or 0
+        return (
+            usage_count(usage, "prompt_tokens", "input_tokens") or 0,
+            usage_count(usage, "completion_tokens", "output_tokens") or 0,
+            usage_count(usage, "cache_read_tokens", "cached_tokens", "cache_read_input_tokens") or 0,
+            usage_count(usage, "cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens") or 0,
         )
-        cache_create = usage.get("cache_creation_input_tokens", 0) or 0
-        return int(inp), int(out), int(cache_read), int(cache_create)
 
     async def after_llm(
         self, ctx: LLMCallContext, response: LLMResponse
@@ -120,7 +106,7 @@ class TokenAccountingMiddleware(LLMMiddleware):
         input_tokens, output_tokens, cache_read, cache_create = self._extract_usage(response)
         total = input_tokens + output_tokens
 
-        if total == 0:
+        if total == 0 and cache_read == 0 and cache_create == 0:
             return response
 
         task_id = ctx.task_id or "unknown"

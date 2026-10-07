@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 
+from agent_core.completion import reported_usage, usage_count
 from agent_core.components.middleware.llm.base import LLMCallContext, LLMMiddleware
 from agent_core.llm import LLMResponse
 from agent_core.messages import Message, text_of
@@ -59,6 +61,10 @@ class TokenBucket:
         )
         self._last_refill = now
 
+    def reservation_size(self, estimated_tokens: int) -> int:
+        """Amount actually reserved, capped at one full minute's capacity."""
+        return min(max(estimated_tokens, 0), int(self._tpm))
+
     async def acquire(self, estimated_tokens: int = 0) -> float:
         """Acquire rate limit capacity. Returns wait time in seconds.
 
@@ -69,7 +75,7 @@ class TokenBucket:
         # A single request cannot reserve more than a full minute's token
         # capacity. Capping avoids an infinite wait for an oversized prompt;
         # the provider remains the authority on whether that request is valid.
-        requested_tokens = min(max(estimated_tokens, 0), int(self._tpm))
+        requested_tokens = self.reservation_size(estimated_tokens)
 
         while True:
             async with self._lock:
@@ -128,6 +134,7 @@ class RateLimitMiddleware(LLMMiddleware):
     ) -> None:
         self._bucket = TokenBucket(requests_per_min, tokens_per_min)
         self._estimate_key = "_rate_limit_estimated_tokens"
+        self._reserved_key = f"_rate_limit_reserved_tokens_{uuid.uuid4().hex}"
 
     @property
     def name(self) -> str:
@@ -144,6 +151,9 @@ class RateLimitMiddleware(LLMMiddleware):
             len(str(text_of(m.get("content")))) for m in messages
         ) // 4
         ctx.metadata[self._estimate_key] = estimated
+        # acquire caps oversized reservations at one full token bucket. Correct
+        # against what was reserved, not the uncapped prompt estimate.
+        ctx.metadata[self._reserved_key] = self._bucket.reservation_size(estimated)
 
         wait = await self._bucket.acquire(estimated)
         if wait > 0:
@@ -157,22 +167,24 @@ class RateLimitMiddleware(LLMMiddleware):
         response: LLMResponse,
     ) -> LLMResponse:
         """Correct token bucket with actual usage from response."""
-        usage = (
-            response.usage
-            or response.response_metadata.get("token_usage")
-            or response.response_metadata.get("usage")
-            or {}
-        )
-        actual_total = (
-            usage.get("total_tokens")
-            or usage.get("prompt_tokens", 0)
-            + usage.get("completion_tokens", 0)
-            or usage.get("input_tokens", 0)
-            + usage.get("output_tokens", 0)
-        )
-        estimated = ctx.metadata.get(self._estimate_key, 0)
-
-        if actual_total and estimated:
-            self._bucket.adjust(actual_total, estimated)
+        usage = reported_usage(response)
+        if usage is None:
+            # Keep the original reservation when provider usage is unknown.
+            return response
+        actual_total = usage_count(usage, "total_tokens")
+        if actual_total is None:
+            inp = usage_count(usage, "prompt_tokens", "input_tokens")
+            out = usage_count(usage, "completion_tokens", "output_tokens")
+            if inp is None and out is None:
+                return response
+            actual_total = (inp or 0) + (out or 0)
+        reserved = usage_count(ctx.metadata, self._reserved_key)
+        if reserved is None:
+            # Compatibility for contexts created by older before hooks.
+            legacy_estimate = usage_count(ctx.metadata, self._estimate_key)
+            if legacy_estimate is not None:
+                reserved = self._bucket.reservation_size(legacy_estimate)
+        if reserved is not None:
+            self._bucket.adjust(actual_total, reserved)
 
         return response

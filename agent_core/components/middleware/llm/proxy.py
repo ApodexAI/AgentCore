@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import itertools
 import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+from agent_core.completion import get_recovery_hook
 from agent_core.components.middleware.llm.base import (
     LLMCallContext,
 )
@@ -18,10 +20,68 @@ from agent_core.execution_context import (
 from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.messages import Message
 from agent_core.runtime.async_utils import await_bounded, closing_stream
+from agent_core.stream_tools import StreamToolCalls
 
 logger = logging.getLogger(__name__)
 __all__ = ["LLMProxy"]
 _HOOK_TIMEOUT_S = 5.0
+
+
+class _StreamTerminal:
+    """Terminal metadata of one streamed attempt, folded like the loop's
+    stream assembler (``_streaming._assembled_response``) so ``after_llm``
+    sees usage, finish_reason and refusal signals, not just text."""
+
+    def __init__(self) -> None:
+        self.usage: dict[str, int] = {}
+        self.usage_source = ""
+        self.finish_reason = ""
+        self.model = ""
+        self.provider = ""
+        self.refusal = ""
+        self.stop_details: dict[str, Any] = {}
+        self.stop_reason = ""
+        self.tool_calls = StreamToolCalls()
+
+    def feed(self, delta: StreamDelta) -> None:
+        # Last non-empty wins, except refusal text, which streams in pieces.
+        if delta.usage:
+            self.usage = delta.usage
+            self.usage_source = delta.usage_source
+        if delta.finish_reason:
+            self.finish_reason = delta.finish_reason
+        if delta.model:
+            self.model = delta.model
+        if delta.provider:
+            self.provider = delta.provider
+        self.refusal += delta.refusal
+        if delta.stop_details:
+            self.stop_details = delta.stop_details
+        if delta.stop_reason:
+            self.stop_reason = delta.stop_reason
+        # Keep known usage/provenance even if a malformed tool fragment fails.
+        self.tool_calls.feed(delta.tool_call_deltas)
+
+    def response(self, content: str, reasoning: str) -> LLMResponse:
+        metadata: dict[str, Any] = {}
+        if self.provider:
+            metadata["provider_actually_used"] = self.provider
+        if self.refusal:
+            metadata["refusal"] = self.refusal
+        if self.stop_details:
+            metadata["stop_details"] = self.stop_details
+        if self.stop_reason:
+            metadata["stop_reason"] = self.stop_reason
+        return LLMResponse(
+            content=content,
+            tool_calls=self.tool_calls.complete(),
+            reasoning_content=reasoning,
+            finish_reason=self.finish_reason,
+            model=self.model,
+            usage=self.usage,
+            usage_source=self.usage_source,
+            response_metadata=metadata,
+        )
 
 
 async def _log_llm_exception(
@@ -76,6 +136,20 @@ class LLMProxy:
         self.role_id = role_id
         self.model = getattr(inner, "model", "") or ""
         self._counter = itertools.count(1)
+
+    def for_logical_call(self) -> LLMProxy:
+        prepare = get_recovery_hook(self.inner, "for_logical_call")
+        if prepare is None:
+            return self
+        # Preserve middleware, role, subclasses and the shared atomic counter.
+        # Only the wrapped provider's routing cursor belongs to this call.
+        proxy = copy.copy(self)
+        proxy.inner = prepare()
+        return proxy
+
+    def advance_empty_completion(self, error: BaseException) -> bool:
+        advance = get_recovery_hook(self.inner, "advance_empty_completion")
+        return bool(advance(error)) if advance is not None else False
 
     @property
     def call_counter(self) -> int:
@@ -187,12 +261,15 @@ class LLMProxy:
         start_time = time.time()
         full_content = ""
         full_reasoning = ""
+        terminal = _StreamTerminal()
+        stream_completed = False
         stream_error: Exception | None = None
         try:
             while True:
                 start_time = time.time()
                 full_content = ""
                 full_reasoning = ""
+                terminal = _StreamTerminal()
                 stream_error = None
                 any_chunk_yielded = False
                 try:
@@ -212,6 +289,7 @@ class LLMProxy:
                                 continue
                             full_content += delta.content or ""
                             full_reasoning += delta.reasoning_content or ""
+                            terminal.feed(delta)
                             any_chunk_yielded = True
                             # Per-chunk middleware hook. A middleware returning
                             # True (e.g. StreamRepetitionDetector noticing a
@@ -235,6 +313,7 @@ class LLMProxy:
                                     len(full_content),
                                 )
                                 break
+                    stream_completed = True
                     break
                 except Exception as e:
                     stream_error = e
@@ -264,6 +343,9 @@ class LLMProxy:
                 (time.time() - start_time) * 1000,
             )
             ctx.metadata["duration_ms"] = duration_ms
+            # Accounting may use reported usage from failed requests, but loop
+            # detection must not treat an abandoned proposal as a delivered turn.
+            ctx.metadata["_llm_stream_incomplete"] = not stream_completed
             if stream_error:
                 ctx.metadata["error"] = str(stream_error)
             # Stream after hooks are passive (their result is discarded), so
@@ -273,10 +355,7 @@ class LLMProxy:
             # response (e.g. output repair) and stay unbounded.
             await self.chain.run_after(
                 ctx,
-                LLMResponse(
-                    content=full_content,
-                    reasoning_content=full_reasoning,
-                ),
+                terminal.response(full_content, full_reasoning),
                 timeout_s=_HOOK_TIMEOUT_S,
             )
 

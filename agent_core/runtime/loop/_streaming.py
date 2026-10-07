@@ -15,8 +15,9 @@ from agent_core.errors import (
     LLMStreamStalled,
 )
 from agent_core.llm import LLMResponse
-from agent_core.messages import Message, ToolCall
+from agent_core.messages import Message
 from agent_core.runtime.async_utils import await_bounded
+from agent_core.stream_tools import StreamToolCalls
 
 from ._response import is_wholly_empty_response
 from ._runaway import _env_float, _env_int
@@ -243,13 +244,12 @@ async def _stream_llm_response(
     accumulated = ""
     thinking_accum = ""
     delta_index = 0
-    # Typed as ToolCall, not dict[str, Any]: the slots below are assembled
-    # in the wire shape LLMResponse.tool_calls declares, and the literal
-    # keeps ToolCall's fixed {id, type, function} key order.
-    tool_call_acc: dict[int, ToolCall] = {}
+    tool_calls = StreamToolCalls()
     # Terminal metadata streamed late by the provider — kept so the assembled
     # LLMResponse carries usage/finish_reason/model (else streaming runs report
     # 0 usage and observers never see finish_reason="length").
+    final_usage_source = ""
+    final_refusal = ""
     final_usage: dict[str, int] = {}
     final_finish_reason = ""
     final_model = ""
@@ -298,6 +298,8 @@ async def _stream_llm_response(
         response_metadata = (
             {"provider_actually_used": final_provider} if final_provider else {}
         )
+        if final_refusal:
+            response_metadata["refusal"] = final_refusal
         if final_stop_details:
             response_metadata["stop_details"] = final_stop_details
         if final_stop_reason:
@@ -327,15 +329,11 @@ async def _stream_llm_response(
         # NAMED calls to tools that do not exist are deliberately kept: those
         # reach the executor and come back as "unknown tool 'x'", which the
         # model can read and act on.
-        complete_tool_calls = [
-            tool_call_acc[k]
-            for k in sorted(tool_call_acc)
-            if tool_call_acc[k]["function"]["name"]
-        ]
+        complete_tool_calls = tool_calls.complete()
         # Warn rather than drop silently — a provider emitting these
         # consistently is a real upstream defect, and this is the only place
         # that can still see it.
-        dropped = len(tool_call_acc) - len(complete_tool_calls)
+        dropped = tool_calls.dropped_count
         if dropped:
             logger.warning(
                 "dropped %d streamed tool_call(s) with no function name", dropped,
@@ -373,6 +371,7 @@ async def _stream_llm_response(
             tool_calls=complete_tool_calls,
             reasoning_content=thinking_accum,
             usage=final_usage,
+            usage_source=final_usage_source,
             finish_reason=final_finish_reason,
             model=final_model,
             response_metadata=response_metadata,
@@ -400,7 +399,7 @@ async def _stream_llm_response(
                             continue
                     else:
                         chunks_seen += 1
-                    raw_visible = delta.content or ""
+                    raw_visible = delta.content or getattr(delta, "refusal", "") or ""
                     typed_thinking = delta.reasoning_content or ""
                     tc_chunks = delta.tool_call_deltas or []
                     # Capture terminal metadata as it arrives (usage on the
@@ -408,6 +407,9 @@ async def _stream_llm_response(
                     # content chunk). Last non-empty wins.
                     if getattr(delta, "usage", None):
                         final_usage = delta.usage
+                        final_usage_source = getattr(delta, "usage_source", "")
+                    if getattr(delta, "refusal", ""):
+                        final_refusal += delta.refusal
                     if getattr(delta, "finish_reason", ""):
                         final_finish_reason = delta.finish_reason
                     if getattr(delta, "model", ""):
@@ -443,18 +445,7 @@ async def _stream_llm_response(
                     ) else ""
                     # Stitch streamed tool-call deltas by index — id set
                     # once, name/arguments appended — into wire-shaped slots.
-                    for tcd in tc_chunks:
-                        idx = tcd.get("index") or 0
-                        slot = tool_call_acc.setdefault(idx, {
-                            "id": "", "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        })
-                        if tcd.get("id"):
-                            slot["id"] = tcd["id"]
-                        if tcd.get("name"):
-                            slot["function"]["name"] += tcd["name"]
-                        if tcd.get("arguments"):
-                            slot["function"]["arguments"] += tcd["arguments"]
+                    tool_calls.feed(tc_chunks)
                     if visible or thinking or tc_chunks:
                         if visible:
                             accumulated += visible
@@ -618,6 +609,7 @@ async def _stream_llm_response(
         raise LLMEmptyCompletion(
             chunks_seen=chunks_seen,
             elapsed_s=time.monotonic() - stream_started,
+            partial_response=assembled,
         )
     return assembled
 

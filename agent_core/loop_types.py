@@ -172,14 +172,10 @@ class LoopConfig:
     # a tool-less turn is the model choosing to stop, a truncated one is the
     # model being stopped, so a truncation must not spend the nudge budget.
     truncation_max_continuations: int = 2
-    # Resamples per consecutive empty-response episode: no text, no tool
-    # call, no reasoning and no usage. A non-empty reply resets this budget.
-    # Separate from both budgets above because it is a
-    # third signal — truncation is "stopped mid-sentence", a tool-less turn is
-    # "chose to stop", and this is "the transport returned nothing", which is
-    # not the model's statement at all. Two is enough: the failure is
-    # per-request, and a provider that returns blank three times running is
-    # down, not slow.
+    # Same-leg resamples after a wholly empty response, in both transports.
+    # Applies per logical call and per serving fallback leg, independently of
+    # max_llm_retries (the generic failure allowance). All resamples and chain
+    # advances share logical_call_timeout_s and the run's wall deadline.
     empty_completion_max_retries: int = 2
     max_llm_retries: int = 5
     # Fixed retry delay; None uses exponential backoff.
