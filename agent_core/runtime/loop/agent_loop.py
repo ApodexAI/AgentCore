@@ -454,7 +454,9 @@ async def _run_loop_inner(
         for observer in obs
     )
     protocol = getattr(profile, "protocol", "chat_completions")
-    if cfg.stream_llm_tokens is not None:
+    if cfg.stream_transport is not None:
+        stream_llm_tokens = cfg.stream_transport
+    elif cfg.stream_llm_tokens is not None:
         # The host stated it; the transport may be the reason (see LoopConfig).
         stream_llm_tokens = cfg.stream_llm_tokens
     else:
@@ -894,6 +896,7 @@ async def _call_llm_with_callbacks(
         response = await call_llm(
             llm_for_turn, messages_for_call, cfg.llm_timeout, cfg.max_llm_retries, turn,
             on_delta=_on_delta if stream_llm_tokens else None,
+            stream=stream_llm_tokens,
             retry_wait_fixed=cfg.retry_wait_fixed,
             runaway_state=metadata.setdefault(RUNAWAY_STATE_KEY, {}),
             first_chunk_s=cfg.first_chunk_timeout,
@@ -1465,6 +1468,36 @@ async def _execute_tool_calls(
             metadata.update(tcv.metadata_updates)
         if tcv.rewrite_args is not None:
             tc = {**tc, "args": tcv.rewrite_args}
+        invalid_reason = None if tcv.rewrite_args is not None else tc.get("_invalid_reason")
+        if invalid_reason is None:
+            tool = tool_map.get(str(tc.get("name", "") or ""))
+            if tool is not None and hasattr(tool, "to_openai_schema"):
+                from .tool_call_validation import validate_arguments
+
+                schema = cast("Any", tool).to_openai_schema()
+                function = schema.get("function", {}) if isinstance(schema, dict) else {}
+                parameters = function.get("parameters") if isinstance(function, dict) else None
+                if isinstance(parameters, dict):
+                    invalid_reason = validate_arguments(tc.get("args"), parameters)
+        if invalid_reason:
+            recorded = metadata.setdefault("invalid_tool_calls", [])
+            if isinstance(recorded, list):
+                recorded.append({
+                    "id": tc["id"], "name": tc.get("name"),
+                    "raw_arguments": tc.get("_raw_arguments"),
+                    "reason": invalid_reason,
+                })
+            invalid_args = tc.get("args")
+            synthetic.append((idx, ToolResult(
+                name=str(tc.get("name", "") or ""),
+                args=invalid_args if isinstance(invalid_args, dict) else {},
+                result=f"[invalid tool call] {invalid_reason}; re-issue the call with valid arguments.",
+                duration_ms=0,
+                tool_call_id=str(tc["id"]),
+                is_error=True,
+                error_kind="invalid_arguments",
+            )))
+            continue
         if tcv.skip_with_result is not None:
             raw_args = tc.get("args")
             synthetic.append((idx, ToolResult(

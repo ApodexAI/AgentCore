@@ -202,6 +202,9 @@ class LoopConfig:
     system_addendum_per_call: str | Callable[[], str] = ""
     system_addendum_min_turn: int = 0
     system_addendum_per_call_role: str = "system"
+    # Keyword-only to preserve every existing positional LoopConfig argument.
+    # When unset, retain the legacy stream_llm_tokens/watchdog selection.
+    stream_transport: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass

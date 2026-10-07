@@ -93,6 +93,27 @@ Code" channel, 2026-10-05: an identical `claude-opus-5-5` request at
 taking 242s. Concurrency was ruled out (five light requests in flight all
 succeeded; five heavy ones failed at the same 76s mark).
 
+`LoopConfig.stream_transport` is the explicit transport selector for new
+callers. It takes precedence over the older `stream_llm_tokens` field, and a
+streamed call can be drained into a final `LLMResponse` even when no delta
+observer is registered. At the lower-level call boundary,
+`call_llm(..., stream=True)` selects the same transport independently of
+`on_delta`. Leaving it unset retains the existing automatic choice and older
+call sites continue to work. The new `LoopConfig` field is keyword-only so
+existing positional construction retains its argument order.
+
+After a stream ends, native tool arguments are parsed and checked against the
+bound tool's JSON Schema. An invalid call triggers at most one streaming retry
+within the original attempt's time budget. The discarded request keeps its
+own usage and attempt record. A retry that remains invalid is returned with an
+explicit invalid-call diagnostic; execution produces an error tool result
+without invoking the tool. Raw arguments are retained in metadata for
+diagnosis. A missing call ID on a named tool call fails the LLM call before
+writing an unreplayable assistant turn into history. The stream assembler
+continues to discard nameless slots, as documented by its existing tests.
+For calls that matched the previous empty-required-arguments recovery condition,
+the `stream_empty_args_*` response metadata keys remain available as aliases.
+
 In automatic mode the choice is also gated by protocol:
 `UNVERIFIED_STREAM_PROTOCOLS` (`responses`, `bedrock`) stays non-streaming
 because no test here proves their streamed turn replays like its non-streaming

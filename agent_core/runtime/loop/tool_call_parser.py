@@ -118,14 +118,23 @@ def _normalize_native_tool_call(tc: Any) -> dict | None:
                 args = json.loads(raw_args) if raw_args.strip() else {}
             except (ValueError, TypeError):
                 args = {}
+                invalid_reason = "arguments are invalid JSON"
+            else:
+                invalid_reason = None if raw_args.strip() else "arguments are empty"
         elif isinstance(raw_args, dict):
             args = raw_args
+            invalid_reason = None
         else:
             args = {}
+            invalid_reason = "arguments are not a JSON object"
+        if not isinstance(args, dict):
+            invalid_reason = "arguments are not a JSON object"
         return {
             "name": fn.get("name", "") or "",
             "args": args if isinstance(args, dict) else {},
             "id": tc.get("id", "") or "",
+            "_invalid_reason": invalid_reason,
+            "_raw_arguments": raw_args,
         }
     # Already-parsed shape (legacy langchain AIMessage.tool_calls).
     return {

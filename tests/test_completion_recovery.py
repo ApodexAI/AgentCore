@@ -471,13 +471,13 @@ async def test_candidate_empty_fragments_survive_if_the_same_leg_later_gets_a_na
 
 
 @pytest.mark.parametrize("replay", ["blank", "success"])
-async def test_opportunistic_tool_argument_replay_has_its_own_attempt_events(replay):
+async def test_streaming_tool_argument_retry_has_its_own_attempt_events(replay):
     schema = {"type": "function", "function": {"name": "tool", "parameters": {
         "type": "object", "required": ["x"], "properties": {"x": {"type": "integer"}},
     }}}
-    recovered = LLMResponse() if replay == "blank" else LLMResponse(tool_calls=[{
-        "id": "good", "type": "function", "function": {"name": "tool", "arguments": '{"x":1}'},
-    }])
+    recovered = LLMResponse() if replay == "blank" else [StreamDelta(tool_call_deltas=[{
+        "index": 0, "id": "good", "name": "tool", "arguments": '{"x":1}',
+    }])]
     llm = bind_tools(Script([
         [StreamDelta(tool_call_deltas=[{"index": 0, "id": "original", "name": "tool", "arguments": "{}"}])],
         recovered,
@@ -488,13 +488,17 @@ async def test_opportunistic_tool_argument_replay_has_its_own_attempt_events(rep
     by_index = {e["attempt_index"]: e for e in finished(events)}
     assert len(finished(events)) == 2
     if replay == "blank":
-        assert by_index[1]["outcome"] == "accepted"
+        assert by_index[1]["outcome"] == "accepted_degraded"
         assert by_index[2]["outcome"] == "failed"
         assert by_index[2]["reason"] == "empty_completion"
         assert result.tool_calls[0]["id"] == "original"
+        assert result.response_metadata["invalid_tool_call_retry"] is False
         assert result.response_metadata["stream_empty_args_fallback"] is False
+        assert result.response_metadata["stream_empty_args_tools"] == ["tool"]
     else:
         assert by_index[1]["outcome"] == "discarded"
         assert by_index[2]["outcome"] == "accepted"
         assert result.tool_calls[0]["id"] == "good"
+        assert result.response_metadata["invalid_tool_call_retry"] is True
         assert result.response_metadata["stream_empty_args_fallback"] is True
+        assert result.response_metadata["stream_empty_args_tools"] == ["tool"]

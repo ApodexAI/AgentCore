@@ -57,6 +57,7 @@ from ._streaming import (
     _stream_stall_max_before_advance,
 )
 from .tool_call_recovery import stream_tool_calls_missing_required_arguments
+from .tool_call_validation import invalid_native_tool_calls
 
 logger = logging.getLogger(__name__)
 _OBSERVATION_TIMEOUT_S = 5.0
@@ -157,8 +158,8 @@ def _llm_gate() -> asyncio.Semaphore | None:
 # callback, so this package never touches context-local storage.
 _WALL_DEADLINE_FLOOR_S = 20.0
 
-# Floor for the non-streaming replay that recovers a tool call whose streamed
-# arguments came back empty. The replay is opportunistic: below this many
+# Floor for a streaming retry that recovers an invalid assembled tool call.
+# The retry is opportunistic: below this many
 # seconds of remaining attempt budget it would almost certainly time out, and
 # the streamed response we already hold is a better outcome than burning the
 # rest of the turn on a doomed second request.
@@ -169,14 +170,14 @@ def _stream_recovery_budget_too_small(
     remaining_s: float,
     attempt_budget_s: float,
 ) -> bool:
-    """Whether the empty-arguments replay should be skipped for lack of time.
+    """Whether the tool-call retry should be skipped for lack of time.
 
     Skipped only when the remaining budget is under the absolute floor *and*
     under half of what the attempt started with. The second term matters: a
     deployment that configures a short ``timeout`` would otherwise never get
     the recovery at all, since the post-stream remainder is always slightly
     below a floor set at or above ``timeout``. Being wrong here is cheap —
-    a failed replay falls back to the streamed response.
+    a failed retry falls back to the streamed response.
     """
     return (
         remaining_s < _STREAM_RECOVERY_MIN_TIMEOUT_S
@@ -217,8 +218,9 @@ async def call_llm(
     wall_deadline_remaining: Callable[[], float | None] | None = None,
     chain_fallback_active: Callable[[], bool] | None = None,
     empty_completion_max_retries: int = 2,
+    stream: bool | None = None,
 ) -> LLMResponse | None:
-    """Call ``llm.chat`` (``llm.stream`` when ``on_delta`` is set) with
+    """Call ``llm.chat`` or ``llm.stream`` (independent of delta delivery) with
     exponential backoff on transient errors.
 
     Default retry schedule (when ``retry_wait_fixed`` is ``None``):
@@ -297,7 +299,7 @@ async def call_llm(
     Admission queueing is bounded separately (``LLM_GATE_WAIT_S``, disabled by
     default) and never shrinks the generation budget; admission expiry ends
     the call with reason ``gate_wait`` without retrying. The per-attempt
-    ``timeout`` starts once a slot is held and also covers any same-attempt tool-argument replay. A
+    ``timeout`` starts once a slot is held and also covers any same-attempt tool-call retry. A
     slot is released only after an abandoned provider request settles.
     Cleanup and passive observation have separate bounded grace periods so
     cancellation cannot wait indefinitely for I/O finalizers.
@@ -479,6 +481,20 @@ async def call_llm(
         })
 
         attempt_delta = on_delta
+        use_stream = stream if stream is not None else on_delta is not None
+        if use_stream and attempt_delta is None:
+            async def _discard_delta(
+                delta: str, _accumulated: str, _index: int,
+                thinking_delta: str = "", *,
+                tool_call_args_chunks: list[dict] | None = None,
+            ) -> None:
+                nonlocal attempt_first_delta
+                if attempt_first_delta is None and (
+                    delta or thinking_delta or tool_call_args_chunks
+                ):
+                    attempt_first_delta = time.monotonic()
+
+            attempt_delta = _discard_delta
         if on_delta is not None:
             downstream_accepts_tool_chunks = _accepts_tool_call_arg_chunks(
                 on_delta,
@@ -674,7 +690,7 @@ async def call_llm(
                 # Generation budget starts once a slot is held; a same-attempt
                 # replay below draws from what is left of it.
                 attempt_deadline = time.monotonic() + effective_timeout
-                if attempt_delta is None:
+                if not use_stream:
                     response = await await_bounded(
                         _chat_active(effective_timeout),
                         effective_timeout,
@@ -682,21 +698,25 @@ async def call_llm(
                     )
                 else:
                     response = await _stream_active(effective_timeout)
-                    empty_arg_tools = stream_tool_calls_missing_required_arguments(
+                    invalid_calls = invalid_native_tool_calls(
                         response, llm_active,
                     )
-                    if empty_arg_tools:
+                    if invalid_calls:
                         # The stream has only been observed/assembled here: no
                         # assistant history or tool execution has happened yet,
-                        # so replacing it with one non-streaming replay cannot
+                        # so replacing it with one streaming retry cannot
                         # duplicate a side effect.
                         streamed_response = response
                         stream_ended_at = time.monotonic()
+                        stream_first_delta = attempt_first_delta
+                        legacy_empty_args_tools = stream_tool_calls_missing_required_arguments(
+                            streamed_response, llm_active,
+                        )
                         logger.warning(
-                            "Streamed tool call(s) %s had blank arguments despite "
-                            "required schema fields (turn=%d, attempt=%d/%d); "
-                            "replaying the same request non-streaming",
-                            empty_arg_tools, turn, attempt + 1, max_retries,
+                            "Streamed tool call(s) failed validation: %s "
+                            "(turn=%d, attempt=%d/%d); retrying with streaming",
+                            [issue["reason"] for issue in invalid_calls],
+                            turn, attempt + 1, max_retries,
                         )
                         recovered: LLMResponse | None = None
                         recovery_error: BaseException | None = None
@@ -705,14 +725,14 @@ async def call_llm(
                         try:
                             # Clamp to whatever is left of THIS attempt's own
                             # budget as well as the wall/logical deadline: the
-                            # replay is a second physical request inside one
+                            # retry is a second physical request inside one
                             # attempt, so without the first term a turn could
                             # quietly cost 2x ``timeout`` whenever no deadline
                             # is stamped (direct loop use, SDK, tests).
                             recovery_timeout = min(
                                 _effective_timeout_or_deadline_exhausted(
                                     attempt=attempt,
-                                    reason="stream_empty_tool_arguments",
+                                    reason="stream_invalid_tool_call",
                                 )[0],
                                 max(
                                     attempt_deadline - stream_ended_at,
@@ -725,7 +745,7 @@ async def call_llm(
                                 raise TimeoutError(
                                     f"only {recovery_timeout:.0f}s of the "
                                     f"{effective_timeout:.0f}s attempt budget "
-                                    f"left for the replay",
+                                    f"left for the retry",
                                 )
                             physical_attempt_index += 1
                             replay_index = physical_attempt_index
@@ -740,17 +760,14 @@ async def call_llm(
                             # re-clamp before the actual replay request starts.
                             recovery_timeout = min(
                                 _effective_timeout_or_deadline_exhausted(
-                                    attempt=attempt, reason="stream_empty_tool_arguments",
+                                    attempt=attempt, reason="stream_invalid_tool_call",
                                 )[0],
                                 max(attempt_deadline - time.monotonic(), 0.0),
                             )
                             if _stream_recovery_budget_too_small(recovery_timeout, float(effective_timeout)):
-                                raise TimeoutError("no useful replay budget remains after observation")
-                            recovered = await await_bounded(
-                                _chat_active(recovery_timeout),
-                                recovery_timeout,
-                                hold=True,
-                            )
+                                raise TimeoutError("no useful streaming retry budget remains after observation")
+                            attempt_first_delta = None
+                            recovered = await _stream_active(recovery_timeout)
                         except Exception as exc:
                             # Recovery is opportunistic. Anything it raises —
                             # an exhausted deadline, a timeout, a provider 5xx
@@ -761,11 +778,12 @@ async def call_llm(
 
                         if recovered is None:
                             response_ended_at = stream_ended_at
+                            attempt_first_delta = stream_first_delta
                             if replay_started is not None:
                                 replay_event: dict[str, Any] = {
                                     "phase": "finished", "attempt_index": replay_index,
                                     "outcome": ATTEMPT_FAILED,
-                                    "reason": "empty_completion" if isinstance(recovery_error, LLMEmptyCompletion) else "stream_empty_args_replay",
+                                    "reason": "empty_completion" if isinstance(recovery_error, LLMEmptyCompletion) else "stream_invalid_tool_call_retry",
                                     "recovery_action": "keep_streamed_response",
                                     "duration_ms": int((time.monotonic() - replay_started) * 1000),
                                     "ttft_ms": None, "max_tokens": active_cap,
@@ -778,19 +796,24 @@ async def call_llm(
                                     replay_event.update(_response_attempt_fields(partial))
                                 await _emit_attempt(replay_event)
                             logger.warning(
-                                "Non-streaming replay failed (%s: %s); keeping "
-                                "the streamed response with blank tool "
-                                "arguments (turn=%d, attempt=%d/%d)",
+                                "Streaming tool-call retry failed (%s: %s); keeping "
+                                "the first response for invalid-call feedback "
+                                "(turn=%d, attempt=%d/%d)",
                                 type(recovery_error).__name__, recovery_error,
                                 turn, attempt + 1, max_retries,
                             )
                             response.response_metadata = {
                                 **(response.response_metadata or {}),
-                                "stream_empty_args_fallback": False,
-                                "stream_empty_args_tools": empty_arg_tools,
-                                "stream_empty_args_recovery_error": type(
+                                "invalid_tool_call_retry": False,
+                                "invalid_tool_calls": invalid_calls,
+                                "invalid_tool_call_recovery_error": type(
                                     recovery_error,
                                 ).__name__,
+                                **({
+                                    "stream_empty_args_fallback": False,
+                                    "stream_empty_args_tools": legacy_empty_args_tools,
+                                    "stream_empty_args_recovery_error": type(recovery_error).__name__,
+                                } if legacy_empty_args_tools else {}),
                             }
                         else:
                             # Close the discarded stream as its own attempt.
@@ -798,33 +821,48 @@ async def call_llm(
                             # the same, and downstream depends on it twice:
                             # a protocol stream observer drains its sentence /
                             # ``<think>`` filters on a non-delivered outcome so
-                            # the abandoned bytes cannot bleed into the replay,
+                            # the abandoned bytes cannot bleed into the retry,
                             # and attempt-finished is the billing record for a
                             # request whose payload never reaches the loop.
-                            # That is also why the replay keeps its OWN usage
+                            # That is also why the retry keeps its OWN usage
                             # untouched: merging the two would bill the stream
                             # a second time.
+                            replay_first_delta = attempt_first_delta
+                            attempt_first_delta = stream_first_delta
                             await _finish_attempt(
                                 outcome=ATTEMPT_DISCARDED,
-                                reason="stream_empty_tool_arguments",
-                                recovery_action="replay_non_streaming",
+                                reason="stream_invalid_tool_call",
+                                recovery_action="retry_streaming",
                                 response=streamed_response,
                                 ended_at=stream_ended_at,
                             )
                             attempt_index = replay_index
                             attempt_started = replay_started if replay_started is not None else stream_ended_at
-                            attempt_first_delta = None
+                            attempt_first_delta = replay_first_delta
                             response = recovered
                             response.response_metadata = {
                                 **(response.response_metadata or {}),
-                                "stream_empty_args_fallback": True,
-                                "stream_empty_args_tools": empty_arg_tools,
+                                "invalid_tool_call_retry": True,
+                                "invalid_tool_calls": invalid_native_tool_calls(recovered, llm_active),
                                 "stream_finish_reason": (
                                     streamed_response.finish_reason or ""
                                 ),
+                                **({
+                                    "stream_empty_args_fallback": True,
+                                    "stream_empty_args_tools": legacy_empty_args_tools,
+                                } if legacy_empty_args_tools else {}),
                             }
             finally:
                 slot_lease.close()
+            incomplete_identity = [
+                issue for issue in invalid_native_tool_calls(response, llm_active)
+                if issue["reason"] in {"missing tool name", "missing tool call id"}
+            ]
+            if incomplete_identity:
+                raise LLMCallExhausted(
+                    ValueError(f"incomplete tool-call identity: {incomplete_identity}"),
+                    "invalid_tool_call",
+                )
             if _is_runaway_response(response):
                 last_runaway_reason = "reasoning_runaway"
                 if runaway_state is not None:
@@ -941,10 +979,11 @@ async def call_llm(
                     runaway_state["last_call_reason"] = (
                         last_runaway_reason or "reasoning_runaway"
                     )
+            remaining_invalid = invalid_native_tool_calls(response, llm_active)
             await _finish_attempt(
-                outcome=ATTEMPT_ACCEPTED,
-                reason="",
-                recovery_action="accepted",
+                outcome=(ATTEMPT_ACCEPTED_DEGRADED if remaining_invalid else ATTEMPT_ACCEPTED),
+                reason="invalid_tool_call" if remaining_invalid else "",
+                recovery_action="return_invalid_tool_feedback" if remaining_invalid else "accepted",
                 response=response,
                 ended_at=response_ended_at,
             )

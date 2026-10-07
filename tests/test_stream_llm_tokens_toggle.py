@@ -10,6 +10,7 @@ waiting for response headers, which for a slow model is most real turns.
 """
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import pytest
@@ -108,6 +109,13 @@ async def test_explicit_true_streams_on_any_protocol(protocol) -> None:
 
 
 @pytest.mark.asyncio
+async def test_transport_can_stream_without_delta_observers() -> None:
+    llm = RecordingLLM()
+    await _run(llm, protocol="chat_completions", stream_transport=True)
+    assert (llm.stream_calls, llm.chat_calls) == (1, 0)
+
+
+@pytest.mark.asyncio
 async def test_explicit_false_outranks_a_delta_hungry_observer() -> None:
     llm, observer = RecordingLLM(), DeltaObserver()
     await _run(llm, protocol="chat_completions", observers=[observer],
@@ -135,3 +143,7 @@ def test_the_verified_set_is_stated_not_guessed() -> None:
     """``anthropic`` leaving this set is the behaviour change; pin it so a
     future edit has to be deliberate."""
     assert frozenset({"responses", "bedrock"}) == UNVERIFIED_STREAM_PROTOCOLS
+
+
+def test_new_transport_knob_preserves_positional_loop_config_arguments() -> None:
+    assert inspect.signature(LoopConfig).parameters["stream_transport"].kind is inspect.Parameter.KEYWORD_ONLY
