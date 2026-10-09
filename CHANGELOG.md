@@ -7,6 +7,14 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.17.0] - 2026-10-09
+
+### Added
+
+- Reasoning-runaway recovery now works on the native Anthropic adapter. Its retry ladder applies `ThinkingRetryOverride.reasoning_effort` to `output_config.effort` without sending unsupported `thinking={"type": "disabled"}` to adaptive-only models.
+
+  When all call-level retries fail, the loop gives a reasoning-only response one bounded recovery attempt instead of ending it as `no_tool`. This applies both to completions that exhaust the output cap and to streams stopped early by the reasoning watchdog, whose terminal usage and finish reason may never arrive. Recovery remains available on the final allowed turn without consuming an additional logical turn. If recovery also fails, the loop stops with `stop_reason="reasoning_runaway"`; AgentBus fan-in treats that reason as an incomplete report. Consumers that enumerate stop reasons should add it.
+
 ## [0.16.1] - 2026-10-07
 
 ### Fixed
