@@ -40,6 +40,7 @@ from agent_core.providers._stream_activity import (
     stream_terminator_required,
 )
 from agent_core.providers.finish_reason import normalize_finish_reason
+from agent_core.runtime.llm_request_overrides import current_thinking_retry_override
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,33 @@ class AnthropicClient(LLMClient):
                 default_headers=default_headers,
             )
 
+    def _retry_effort(self) -> str:
+        """The construction-time effort, unless a runaway retry overrides it.
+
+        The runaway ladder in ``_call.py`` steps thinking down by setting a
+        task-local :class:`ThinkingRetryOverride`. This adapter used to ignore it
+        entirely: every rung went out with the profile's ``effort`` and only a
+        smaller ``max_tokens``, so a model that spent its whole cap thinking at
+        ``effort=max`` was asked to do the same thing in less room, and failed
+        the same way on every rung (GDPval 2026-10-08: three tasks lost whole
+        turns to ``8192 → 4096 → 2048``, every one pure thinking).
+
+        Effort is the only lever: ``claude-opus-5-5`` rejects
+        ``thinking={"type": "disabled"}`` outright (400, "Use thinking.type.adaptive
+        and output_config.effort to control thinking behavior"), so the
+        ``disabled`` rung is expressed through the effort the ladder pairs with
+        it, and the ``thinking`` field itself is never touched. Measured on the
+        same runaway prompt at an 8192 cap: ``max`` ended at the cap with no text;
+        ``high``/``medium``/``low`` all finished with a full answer.
+
+        Like the OpenAI adapter, this only *replaces* an effort the profile
+        already opted into; a client built without one keeps sending none.
+        """
+        override = current_thinking_retry_override()
+        if override is not None and override.reasoning_effort:
+            return override.reasoning_effort
+        return self._effort
+
     def _build_kwargs(
         self,
         messages: list[Message],
@@ -151,7 +179,7 @@ class AnthropicClient(LLMClient):
         # Current Claude models think adaptively even when thinking is omitted.
         # Keep effort independent of that optional display/configuration field.
         if self._effort:
-            kwargs["extra_body"] = {"output_config": {"effort": self._effort}}
+            kwargs["extra_body"] = {"output_config": {"effort": self._retry_effort()}}
         if tools:
             kwargs["tools"] = [_to_anthropic_tool(t) for t in tools]
         if extra_headers:

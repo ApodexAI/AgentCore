@@ -968,8 +968,8 @@ async def call_llm(
                 if runaway_state is not None:
                     runaway_state["last_call_reason"] = "reasoning_runaway"
                 # DELIVERED, not failed: this response is returned below, so
-                # the loop appends it to history, bills it, and salvages the
-                # turn with its no-tool nudge. Marking it ``failed`` would
+                # the loop appends it to history, bills it, and tries bounded
+                # runaway recovery. Marking it ``failed`` would
                 # make consumers drop bytes the loop actually used and would
                 # flip the enclosing trace call to ``status="failed"`` even
                 # though it produced a turn. ``reason`` carries the health.
@@ -1101,6 +1101,13 @@ async def call_llm(
                 "loop-level nudge handling",
                 turn, exc.trigger, exc.elapsed_s, exc.estimated_tokens,
             )
+            # The stream ended before its terminal finish reason and usage
+            # arrived. Carry the watchdog's diagnosis to the loop rather than
+            # letting this empty response look like a chosen no-tool finish.
+            partial_response.response_metadata = {
+                **(partial_response.response_metadata or {}),
+                "reasoning_runaway_early": True,
+            }
             await _finish_attempt(
                 outcome=ATTEMPT_ACCEPTED_DEGRADED,
                 reason="reasoning_runaway_early",

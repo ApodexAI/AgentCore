@@ -26,9 +26,8 @@ logger = logging.getLogger(__name__)
 # runaway switches the retry to a reduced ``max_tokens`` and appends a
 # transient, throwaway reminder asking for concise reasoning plus visible
 # output/tool use. The reminder never enters durable message history.
-# If the retry budget is exhausted the response is returned as-is so the
-# loop's existing no-tool nudge stays the behavioural floor — a runaway must
-# never escalate into a fatal ``llm_error`` stop past turn 1.
+# If the retry budget is exhausted the response is returned to the loop for
+# bounded recovery; a runaway must never become a clean ``no_tool`` finish.
 
 _RUNAWAY_MIN_OUTPUT_TOKENS = 1024
 # Ceiling for retry caps after a confirmed runaway. The actual bound cap
@@ -128,16 +127,20 @@ _RUNAWAY_EXPANDED_OUTPUT_RESERVE = 0.25
 RUNAWAY_STATE_KEY = "_runaway_state"
 
 def _is_runaway_response(response: Any) -> bool:
-    """True for a successful response whose budget went entirely to
-    reasoning: no visible content, no tool calls, and either
-    ``finish_reason="length"`` or a completion-token count too large to
-    be a plain empty reply (gateways that drop ``finish_reason``)."""
+    """True when a response was stopped after producing only reasoning.
+
+    Completed streams have a length finish reason or high token usage. An
+    early-stopped stream has neither terminal field, so ``call_llm`` marks the
+    partial response explicitly when its retry allowance is exhausted.
+    """
     if not isinstance(response, LLMResponse):
         return False
     if response.tool_calls:
         return False
     if _visible_response_text(response):
         return False
+    if (response.response_metadata or {}).get("reasoning_runaway_early"):
+        return True
     if response.finish_reason == "length":
         return True
     usage = extract_usage(response) or {}
@@ -153,6 +156,33 @@ TRUNCATION_CONTINUATION_GUIDANCE = (
     "where it stopped — do not repeat what you already wrote, and do not start "
     "over. Be brief and reach a tool call or a complete answer this time."
 )
+
+
+# Asked of a model after ``call_llm`` already spent its whole resample ladder on
+# the turn and every rung came back as pure reasoning. Unlike the per-call
+# guidance this lands in the conversation, so it can name the usual cause: a
+# model with no network trying to *recall* data it was told to look up.
+RUNAWAY_LOOP_RECOVERY_GUIDANCE = (
+    "[system reminder] Your last several replies spent the entire output budget "
+    "on private reasoning and produced no visible text or tool call. Do not "
+    "try to reconstruct large amounts of external data (prices, listings, "
+    "constituents, product catalogues) from memory. Act now: either make one "
+    "tool call that advances the task, or write the deliverable with what you "
+    "can support and clearly mark what could not be verified."
+)
+
+
+def is_runaway_response(response: Any) -> bool:
+    """True for a reply whose whole budget went to reasoning (see below).
+
+    The loop-facing name for :func:`_is_runaway_response`. ``call_llm`` returns
+    such a response once its own resample ladder is exhausted, logging that it
+    is "returning empty response for loop-level nudge handling" — but the loop
+    had no branch for it. With no text and no tool call it fell into
+    ``if not parsed_calls``, and under ``no_tool_behavior="stop"`` ended the run
+    as an ordinary ``no_tool`` finish with nothing delivered.
+    """
+    return _is_runaway_response(response)
 
 
 def is_truncated_with_text(response: Any) -> bool:

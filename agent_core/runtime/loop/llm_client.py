@@ -36,8 +36,10 @@ from agent_core.runtime.loop._response import (
     usage_output_tokens,
 )
 from agent_core.runtime.loop._runaway import (
+    RUNAWAY_LOOP_RECOVERY_GUIDANCE,
     RUNAWAY_STATE_KEY,
     TRUNCATION_CONTINUATION_GUIDANCE,
+    is_runaway_response,
     is_truncated_with_text,
 )
 from agent_core.runtime.loop._streaming import ThinkTagSplitter
@@ -48,6 +50,7 @@ from agent_core.tokens import (
 
 __all__ = [
     "DEFAULT_SESSION_HEADER_NAMES",
+    "RUNAWAY_LOOP_RECOVERY_GUIDANCE",
     "RUNAWAY_STATE_KEY",
     "TRUNCATION_CONTINUATION_GUIDANCE",
     "LLMCallExhausted",
@@ -66,6 +69,7 @@ __all__ = [
     "extract_leaked_reasoning",
     "extract_model_name",
     "extract_usage",
+    "is_runaway_response",
     "is_truncated_with_text",
     "is_wholly_empty_response",
     "usage_input_tokens",

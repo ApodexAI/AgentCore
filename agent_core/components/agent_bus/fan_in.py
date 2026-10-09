@@ -58,6 +58,10 @@ INCOMPLETE_STOP_REASONS: frozenset[str] = frozenset({
     # ``no_tool``: the agent never chose to stop, so its report is unfinished
     # rather than merely answer-less.
     "response_truncated",
+    # Every reply in a turn, and the loop-level recovery after it, spent the
+    # whole output budget on private reasoning. Distinct from ``no_tool`` for
+    # the same reason as ``response_truncated``: the agent was stopped.
+    "reasoning_runaway",
     "exception",
     "thrash_no_progress",
 })
@@ -71,6 +75,10 @@ _INCOMPLETE_NOTES: dict[str, str] = {
     "no_tool": "agent stopped without producing a final answer",
     "response_truncated": (
         "agent's replies kept hitting the output token limit; report is partial"
+    ),
+    "reasoning_runaway": (
+        "agent's replies kept spending the whole output budget on reasoning "
+        "without a visible answer; report is partial"
     ),
     "budget_exhausted": "agent exhausted its token budget; report is partial",
     "wall_deadline": (

@@ -53,6 +53,7 @@ from agent_core.runtime.loop.compact import (
 from agent_core.runtime.loop.image_attach import attach_images, evict_old_images
 from agent_core.runtime.loop.llm_client import (
     DEFAULT_SESSION_HEADER_NAMES,
+    RUNAWAY_LOOP_RECOVERY_GUIDANCE,
     RUNAWAY_STATE_KEY,
     TRUNCATION_CONTINUATION_GUIDANCE,
     LLMCallExhausted,
@@ -65,6 +66,7 @@ from agent_core.runtime.loop.llm_client import (
     extract_final_content,
     extract_leaked_reasoning,
     extract_usage,
+    is_runaway_response,
     is_truncated_with_text,
 )
 from agent_core.runtime.loop.model_profile import (
@@ -444,6 +446,7 @@ async def _run_loop_inner(
     total_tool_calls = 0
     no_tool_retries = 0
     truncation_continuations = 0
+    runaway_recoveries = 0
     truncated_text_parts: list[str] = []
 
     last_input_tokens = 0
@@ -607,6 +610,31 @@ async def _run_loop_inner(
             )
             break
 
+        # The empty half of the same "the model was stopped" signal: ``call_llm``
+        # spent its resample ladder and every rung was pure reasoning. Falling
+        # through to ``no_tool`` would end the run with nothing delivered (GDPval
+        # 2026-10-08: three whole tasks, all asked to look up data offline).
+        if not parsed_calls and is_runaway_response(response):
+            runaway_recoveries += 1
+            if runaway_recoveries <= cfg.runaway_max_loop_recoveries:
+                logger.warning(
+                    "turn=%d reasoning runaway survived the call-level resamples "
+                    "— recovering at loop level (%d/%d)",
+                    turn, runaway_recoveries, cfg.runaway_max_loop_recoveries,
+                )
+                messages.append(user_msg(RUNAWAY_LOOP_RECOVERY_GUIDANCE))
+                # This is a retry of the interrupted turn, including when the
+                # runaway happened on the final allowed turn.
+                turn -= 1
+                continue
+            stop_reason = "reasoning_runaway"
+            logger.warning(
+                "turn=%d reasoning runaway after %d loop-level recover%s — stopping",
+                turn, cfg.runaway_max_loop_recoveries,
+                "y" if cfg.runaway_max_loop_recoveries == 1 else "ies",
+            )
+            break
+
         if not parsed_calls:
             no_tool_retries += 1
             stops_for_no_tool = (
@@ -634,6 +662,7 @@ async def _run_loop_inner(
 
         no_tool_retries = 0
         truncation_continuations = 0
+        runaway_recoveries = 0
         truncated_text_parts.clear()
 
         if not skip_tool_execution:
