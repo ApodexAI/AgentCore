@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent_core.llm import LLMResponse
+from agent_core.llm import LLMResponse, StreamDelta
 from agent_core.loop_types import LoopConfig, LoopPolicy
 from agent_core.providers import anthropic as ac
 from agent_core.runtime.llm_request_overrides import (
@@ -129,12 +129,15 @@ def _tool() -> MagicMock:
     return tool
 
 
-async def _run(llm: _Scripted, tool: MagicMock, **cfg: Any) -> Any:
+async def _run(
+    llm: Any, tool: MagicMock, *, max_turns: int = 8,
+    max_llm_retries: int = 2, stream_llm_tokens: bool = False, **cfg: Any,
+) -> Any:
     return await run_agent_loop(
         system_prompt="system", user_message="start", llm=llm, tools=[tool],
         config=LoopConfig(
-            max_turns=8, max_llm_retries=2, retry_wait_fixed=0,
-            stream_llm_tokens=False,
+            max_turns=max_turns, max_llm_retries=max_llm_retries,
+            retry_wait_fixed=0, stream_llm_tokens=stream_llm_tokens,
             loop_policy=LoopPolicy(no_tool_behavior="stop"),
             **cfg,
         ),
@@ -153,6 +156,30 @@ async def test_runaway_turn_is_recovered_instead_of_ending_as_no_tool() -> None:
     assert result.final_content == "done"
     assert result.stopped_by == "no_tool"  # the real, chosen finish
     assert any(m.get("content") == RUNAWAY_LOOP_RECOVERY_GUIDANCE for m in llm.requests[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_call_ladder")
+async def test_runaway_on_last_turn_still_gets_its_recovery() -> None:
+    llm, tool = _Scripted(_runaway(), _final()), _tool()
+
+    result = await _run(llm, tool, max_turns=1)
+
+    assert len(llm.requests) == 2
+    assert result.final_content == "done"
+    assert result.stopped_by == "no_tool"
+    assert result.turns_used == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_call_ladder")
+async def test_persistent_runaway_on_last_turn_names_the_failure() -> None:
+    llm, tool = _Scripted(_runaway(), _runaway()), _tool()
+
+    result = await _run(llm, tool, max_turns=1)
+
+    assert len(llm.requests) == 2
+    assert result.stopped_by == "reasoning_runaway"
 
 
 @pytest.mark.asyncio
@@ -188,3 +215,36 @@ async def test_zero_allowance_still_names_the_failure() -> None:
 
     assert len(llm.requests) == 1
     assert result.stopped_by == "reasoning_runaway"
+
+
+class _EarlyRunawayStream:
+    model = "fake"
+
+    def __init__(self, *, recover: bool) -> None:
+        self.recover = recover
+        self.requests: list[list[Any]] = []
+
+    async def stream(self, messages: list[Any], **_kwargs: Any) -> Any:
+        self.requests.append(list(messages))
+        if self.recover and len(self.requests) == 2:
+            yield StreamDelta(content="done", finish_reason="stop")
+        else:
+            # The guard fires before the provider's terminal usage/finish chunk.
+            yield StreamDelta(reasoning_content="x" * 400)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_call_ladder")
+@pytest.mark.parametrize("recover", [True, False])
+async def test_early_stream_runaway_reaches_loop_recovery(recover: bool) -> None:
+    llm, tool = _EarlyRunawayStream(recover=recover), _tool()
+
+    result = await _run(
+        llm, tool, max_turns=1, max_llm_retries=1,
+        stream_llm_tokens=True, reasoning_only_max_tokens=100,
+    )
+
+    assert len(llm.requests) == 2
+    assert any(m.get("content") == RUNAWAY_LOOP_RECOVERY_GUIDANCE for m in llm.requests[1])
+    assert result.stopped_by == ("no_tool" if recover else "reasoning_runaway")
+    assert result.final_content == ("done" if recover else "")

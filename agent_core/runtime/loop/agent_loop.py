@@ -623,6 +623,9 @@ async def _run_loop_inner(
                     turn, runaway_recoveries, cfg.runaway_max_loop_recoveries,
                 )
                 messages.append(user_msg(RUNAWAY_LOOP_RECOVERY_GUIDANCE))
+                # This is a retry of the interrupted turn, including when the
+                # runaway happened on the final allowed turn.
+                turn -= 1
                 continue
             stop_reason = "reasoning_runaway"
             logger.warning(
