@@ -172,6 +172,12 @@ class LoopConfig:
     # a tool-less turn is the model choosing to stop, a truncated one is the
     # model being stopped, so a truncation must not spend the nudge budget.
     truncation_max_continuations: int = 2
+    # Loop-level recoveries for a turn that ``call_llm`` returned as a reasoning
+    # runaway (cap hit, no text, no tool call) after its own resample ladder ran
+    # out. Like truncation, this is the model being stopped, not choosing to
+    # stop, so it must not reach the ``no_tool`` exit; when these run out too the
+    # run ends with ``stop_reason="reasoning_runaway"`` so the failure is named.
+    runaway_max_loop_recoveries: int = 1
     # Same-leg resamples after a wholly empty response, in both transports.
     # Applies per logical call and per serving fallback leg, independently of
     # max_llm_retries (the generic failure allowance). All resamples and chain

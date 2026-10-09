@@ -155,6 +155,33 @@ TRUNCATION_CONTINUATION_GUIDANCE = (
 )
 
 
+# Asked of a model after ``call_llm`` already spent its whole resample ladder on
+# the turn and every rung came back as pure reasoning. Unlike the per-call
+# guidance this lands in the conversation, so it can name the usual cause: a
+# model with no network trying to *recall* data it was told to look up.
+RUNAWAY_LOOP_RECOVERY_GUIDANCE = (
+    "[system reminder] Your last several replies spent the entire output budget "
+    "on private reasoning and produced no visible text or tool call. Do not "
+    "try to reconstruct large amounts of external data (prices, listings, "
+    "constituents, product catalogues) from memory. Act now: either make one "
+    "tool call that advances the task, or write the deliverable with what you "
+    "can support and clearly mark what could not be verified."
+)
+
+
+def is_runaway_response(response: Any) -> bool:
+    """True for a reply whose whole budget went to reasoning (see below).
+
+    The loop-facing name for :func:`_is_runaway_response`. ``call_llm`` returns
+    such a response once its own resample ladder is exhausted, logging that it
+    is "returning empty response for loop-level nudge handling" — but the loop
+    had no branch for it. With no text and no tool call it fell into
+    ``if not parsed_calls``, and under ``no_tool_behavior="stop"`` ended the run
+    as an ordinary ``no_tool`` finish with nothing delivered.
+    """
+    return _is_runaway_response(response)
+
+
 def is_truncated_with_text(response: Any) -> bool:
     """True for a reply the token cap cut off *after* it had produced text.
 
