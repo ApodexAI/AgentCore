@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.18.0] - 2026-10-13
+
+### Fixed
+
+- Compaction now counts `reasoning_content` in loop and middleware token estimates and drops it from older assistant turns (Tier 1 keeps at least the latest turn, or the last `keep_tool_result` turns when greater than one; tool-result compression and the Tier 2 input keep only the latest). Long `thinking_format: reasoning_content` runs previously looked ~19x smaller than their real prompts, so compaction rarely fired; expect compaction to trigger earlier and prompts to shrink on those profiles. Proxy compatibility was verified with llm-hub deepseek-flash; the self-hosted DSV4 checkpoint and long-task quality were not tested.
+
 ## [0.17.0] - 2026-10-09
 
 ### Added
