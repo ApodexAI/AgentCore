@@ -60,7 +60,7 @@ def _estimate_tokens_heuristic(messages: list[Message]) -> int:
     """
     total = 0
     for m in messages:
-        text = text_of(m.get("content"))
+        text = text_of(m.get("content")) + str(m.get("reasoning_content") or "")
         cjk_count = len(_CJK_RE.findall(text))
         other_count = len(text) - cjk_count
         total += cjk_count + (other_count // 4) + _MSG_OVERHEAD
@@ -84,7 +84,9 @@ def estimate_tokens(messages: list[Message]) -> int:
             for m in messages:
                 total += len(
                     encoder.encode(
-                        text_of(m.get("content")), disallowed_special=()
+                        text_of(m.get("content"))
+                        + str(m.get("reasoning_content") or ""),
+                        disallowed_special=(),
                     )
                 ) + _MSG_OVERHEAD
             return total

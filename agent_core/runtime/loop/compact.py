@@ -388,7 +388,7 @@ def compress_tool_results(
             continue
         clone["content"] = _condense(content, budget)
         compacted.append(clone)
-    return compacted
+    return strip_stale_reasoning(compacted, keep_last=1)
 
 
 @runtime_checkable
@@ -428,7 +428,33 @@ def estimate_tokens(messages: list[Message]) -> int:
     total = 0
     for msg in messages:
         total += _est(text_of(msg.get("content"))) + 4  # +4 per message overhead
+        # ``reasoning_content`` rides the wire on DeepSeek-V4 / o-series turns
+        # (see ``WIRE_MESSAGE_KEYS``); leaving it out undercounts those prompts
+        # by an order of magnitude and compaction never fires.
+        total += _est(str(msg.get("reasoning_content") or ""))
     return total
+
+
+def strip_stale_reasoning(messages: list[Message], keep_last: int) -> list[Message]:
+    """Drop ``reasoning_content`` from all but the last ``keep_last`` assistants.
+
+    Providers that require reasoning round-trip only need it on the current
+    tool-call chain; older traces are the bulk of a long thinking run's prompt.
+    ``keep_last < 0`` keeps everything. Returns the input list when unchanged.
+    """
+    if keep_last < 0:
+        return messages
+    idx = [i for i, m in enumerate(messages)
+           if is_assistant_msg(m) and m.get("reasoning_content")]
+    stale = set(idx[:-keep_last] if keep_last else idx)
+    if not stale:
+        return messages
+    out: list[Message] = []
+    for i, m in enumerate(messages):
+        if i in stale:
+            m = cast(Message, {k: v for k, v in m.items() if k != "reasoning_content"})
+        out.append(m)
+    return out
 
 
 def partition_for_compaction(
@@ -695,6 +721,8 @@ class KeepLastNToolResultsCompactor:
     ) -> list[Message]:
         if self._keep == -1:
             return messages
+        # Old thinking traces go with old tool bodies: same window, same reason.
+        messages = strip_stale_reasoning(messages, keep_last=max(self._keep, 1))
 
         tool_indices = [i for i, m in enumerate(messages) if is_tool_msg(m)]
         if not tool_indices:
