@@ -438,9 +438,9 @@ def estimate_tokens(messages: list[Message]) -> int:
 def strip_stale_reasoning(messages: list[Message], keep_last: int) -> list[Message]:
     """Drop ``reasoning_content`` from all but the last ``keep_last`` assistants.
 
-    Providers that require reasoning round-trip only need it on the current
-    tool-call chain; older traces are the bulk of a long thinking run's prompt.
-    ``keep_last < 0`` keeps everything. Returns the input list when unchanged.
+    Older traces are the bulk of a long thinking run's prompt. The caller
+    chooses how many recent traces to retain for its provider. ``keep_last < 0``
+    keeps everything. Returns the input list when unchanged.
     """
     if keep_last < 0:
         return messages
@@ -663,10 +663,10 @@ class KeepLastNToolResultsCompactor:
     later turn from re-issuing a query whose result it can no longer see. When no
     spill is configured and the card would not be shorter than the body it
     replaces, the body is kept verbatim instead.
-    ``SystemMessage``, ``HumanMessage``, and every ``AIMessage`` (including
-    its thinking trace) are left intact, so the model retains its full
-    chain of reasoning and tool-call metadata while dropping the bulk of
-    old tool-result bodies (the dominant context cost in long ReAct runs).
+    ``SystemMessage`` and ``HumanMessage`` are left intact. Assistant content
+    and tool-call metadata stay intact, while old ``reasoning_content`` is
+    removed. At least the latest assistant reasoning is retained, including
+    when ``keep_tool_result`` is zero.
 
     Idempotent: already-placeheld messages are detected by content match
     and left alone, so this is safe to invoke on every turn.

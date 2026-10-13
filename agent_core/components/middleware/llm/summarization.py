@@ -70,8 +70,9 @@ class SummarizationMiddleware(LLMMiddleware):
         try:
             total = 0
             for m in messages:
+                text = text_of(m.get("content")) + str(m.get("reasoning_content") or "")
                 total += (
-                    len(encoder.encode(text_of(m.get("content")), disallowed_special=()))
+                    len(encoder.encode(text, disallowed_special=()))
                     + self._MSG_OVERHEAD
                 )
             return total
@@ -82,7 +83,7 @@ class SummarizationMiddleware(LLMMiddleware):
         """Regex-based heuristic for mixed CJK/English text."""
         total = 0
         for m in messages:
-            text = text_of(m.get("content"))
+            text = text_of(m.get("content")) + str(m.get("reasoning_content") or "")
             cjk_count = len(self._CJK_RE.findall(text))
             other_count = len(text) - cjk_count
             total += cjk_count + (other_count // 4) + self._MSG_OVERHEAD
