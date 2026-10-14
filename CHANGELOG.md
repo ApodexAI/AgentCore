@@ -7,6 +7,12 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.18.1] - 2026-10-14
+
+### Fixed
+
+- `OpenAIResponsesClient.stream` now streams function-call arguments and returns the completed response's verbatim block list (`encrypted_content` reasoning + function calls in provider order), so a streamed Responses turn replays exactly like the non-streaming one; previously streaming dropped every tool call and reasoning item. Argument deltas still provide progress when a gateway omits `response.output_item.added`, while the completed response controls tool execution if streamed fragments are missing or divergent. `responses` is removed from `UNVERIFIED_STREAM_PROTOCOLS`, so it now streams automatically when an observer or the reasoning-only watchdog asks for deltas.
+
 ## [0.18.0] - 2026-10-13
 
 ### Fixed
