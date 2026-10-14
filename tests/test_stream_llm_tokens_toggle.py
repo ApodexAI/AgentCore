@@ -89,7 +89,7 @@ async def test_anthropic_streams_when_an_observer_wants_deltas() -> None:
 async def test_unverified_protocols_stay_non_streaming_but_say_so(
     protocol, caplog,
 ) -> None:
-    """Silence was the bug, not the suppression: these two have no test proving
+    """Silence was the bug, not the suppression: these have no test proving
     their streamed replay, so the default holds — and now announces itself."""
     llm = RecordingLLM()
     with caplog.at_level("WARNING"):
@@ -99,7 +99,7 @@ async def test_unverified_protocols_stay_non_streaming_but_say_so(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["anthropic", "bedrock", "chat_completions"])
+@pytest.mark.parametrize("protocol", ["anthropic", "bedrock", "chat_completions", "responses"])
 async def test_explicit_true_streams_on_any_protocol(protocol) -> None:
     """The transport, not the observers, can be the reason to stream: a host
     that states it takes responsibility for its protocol's replay fidelity."""
@@ -142,8 +142,17 @@ async def test_reasoning_only_watchdog_also_selects_streaming() -> None:
 def test_the_verified_set_is_stated_not_guessed() -> None:
     """``anthropic`` leaving this set is the behaviour change; pin it so a
     future edit has to be deliberate."""
-    assert frozenset({"responses", "bedrock"}) == UNVERIFIED_STREAM_PROTOCOLS
+    assert frozenset({"bedrock"}) == UNVERIFIED_STREAM_PROTOCOLS
 
 
 def test_new_transport_knob_preserves_positional_loop_config_arguments() -> None:
     assert inspect.signature(LoopConfig).parameters["stream_transport"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.mark.asyncio
+async def test_responses_streams_when_an_observer_wants_deltas() -> None:
+    """``responses`` left the unverified set once its streamed replay was
+    proven (``test_responses_stream_replay.py``)."""
+    llm = RecordingLLM()
+    await _run(llm, protocol="responses", observers=[DeltaObserver()])
+    assert (llm.stream_calls, llm.chat_calls) == (1, 0)

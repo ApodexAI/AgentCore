@@ -12,11 +12,12 @@ extended-thinking signature replay). Function tools + reasoning are supported
 here (the Chat Completions endpoint 400s on that combo).
 
 Selected via a profile ``protocol: responses``. Reasoning is returned as a
-typed block list, so the agent loop runs this client NON-STREAMING (see
-``agent_loop`` protocol gate) — the verbatim reasoning items (incl.
-``encrypted_content``) only survive intact on the non-streaming response, and
+typed block list that
 :class:`~agent_core.runtime.loop.model_profile.DefaultThinkingParser`
-(``content_block`` format) keeps them as ``raw_content_blocks``.
+(``content_block`` format) keeps as ``raw_content_blocks``. ``chat`` and
+``stream`` produce the same list — ``stream`` takes it from the terminal
+``response.completed`` event — so the loop streams this protocol like any
+other (``tests/test_responses_stream_replay.py``).
 
 LIVE-VERIFIED 2026-07-09 against a real Responses endpoint (gpt-5.5 via the
 miromind proxy): single-turn reasoning capture AND multi-turn
@@ -184,11 +185,12 @@ class OpenAIResponsesClient(LLMClient):
         extra_headers: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> AsyncIterator[StreamDelta]:
-        # Provided for Protocol conformance. The agent loop forces this client
-        # non-streaming (reasoning blocks / encrypted_content only survive on
-        # the non-streaming response), so this path is not used to preserve
-        # verbatim reasoning — it maps the Responses semantic events to
-        # ``StreamDelta`` for any caller that streams anyway.
+        # Text / reasoning-summary / function-call argument deltas stream as
+        # they arrive; the terminal ``response`` is authoritative for replay.
+        # Its parsed block list (reasoning items with ``encrypted_content`` and
+        # function calls in provider order) rides on ``reasoning_blocks`` —
+        # exactly the ``content`` the non-streaming path returns — and any call
+        # whose events a gateway did not forward is emitted from it whole.
         kwargs = self._build_kwargs(
             messages, tools=tools, temperature=temperature,
             max_tokens=max_tokens, extra_headers=extra_headers, timeout=timeout,
@@ -201,6 +203,8 @@ class OpenAIResponsesClient(LLMClient):
         events_seen = 0
         last_event = ""
         saw_terminal = False
+        # output_index -> (call_id, arguments streamed so far)
+        streamed_calls: dict[int, tuple[str, str]] = {}
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
@@ -217,6 +221,28 @@ class OpenAIResponsesClient(LLMClient):
                     refusal_seen = refusal_seen or bool(refusal)
                     activity.mark_output()
                     yield StreamDelta(content=refusal, refusal=refusal)
+                elif etype == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    if _get(item, "type", "") == "function_call":
+                        index = int(getattr(event, "output_index", 0) or 0)
+                        call_id = _get(item, "call_id", "") or _get(item, "id", "") or ""
+                        args = _get(item, "arguments", "") or ""
+                        streamed_calls[index] = (call_id, args)
+                        activity.mark_output()
+                        yield StreamDelta(tool_call_deltas=[{
+                            "index": index, "id": call_id,
+                            "name": _get(item, "name", "") or "", "arguments": args,
+                        }])
+                elif etype == "response.function_call_arguments.delta":
+                    index = int(getattr(event, "output_index", 0) or 0)
+                    chunk = getattr(event, "delta", "") or ""
+                    if index in streamed_calls and chunk:
+                        call_id, args = streamed_calls[index]
+                        streamed_calls[index] = (call_id, args + chunk)
+                        activity.mark_output()
+                        yield StreamDelta(tool_call_deltas=[{
+                            "index": index, "id": None, "name": None, "arguments": chunk,
+                        }])
                 elif etype in (
                     "response.reasoning_summary_text.delta",
                     "response.reasoning_text.delta",
@@ -242,7 +268,10 @@ class OpenAIResponsesClient(LLMClient):
                     refusal = parsed.response_metadata.get("refusal", "")
                     if refusal and not refusal_seen:
                         yield StreamDelta(content=refusal, refusal=refusal)
-                    usage = _responses_usage_dict(getattr(resp, "usage", None))
+                    missing = _unstreamed_call_deltas(resp, streamed_calls)
+                    if missing:
+                        yield StreamDelta(tool_call_deltas=missing)
+                    usage = _responses_usage_dict(_get(resp, "usage", None))
                     reason = normalize_finish_reason(
                         _get(_get(resp, "incomplete_details", None) or {}, "reason", ""),
                     )
@@ -250,9 +279,10 @@ class OpenAIResponsesClient(LLMClient):
                     yield StreamDelta(
                         usage=usage,
                         stop_details=parsed.response_metadata.get("stop_details", {}),
-                        usage_source="estimated" if usage.get("estimated") else "provider" if usage else "",
-                        model=getattr(resp, "model", "") or "",
+                        usage_source=parsed.usage_source,
+                        model=parsed.model,
                         finish_reason=reason or "stop",
+                        reasoning_blocks=parsed.content if isinstance(parsed.content, list) else [],
                     )
         if not saw_terminal:
             error = LLMOpenAITruncatedStream(
@@ -265,6 +295,37 @@ class OpenAIResponsesClient(LLMClient):
                 raise error
             logger.warning("Accepting stream without terminator (%s=0): %s",
                            STREAM_TERMINATOR_ENV, error)
+
+
+def _unstreamed_call_deltas(
+    resp: Any, streamed: dict[int, tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Tool-call deltas that complete the streamed calls from the final response.
+
+    A call the stream never opened is emitted whole; a call whose streamed
+    arguments are a prefix of the final ones gets the remainder. Arguments that
+    DIVERGE cannot be corrected through an append-only channel — logged, and the
+    streamed bytes stand (the verbatim block list still carries the final ones).
+    """
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(_get(resp, "output", None) or []):
+        if _get(item, "type", "") != "function_call":
+            continue
+        call_id = _get(item, "call_id", "") or _get(item, "id", "") or ""
+        final_args = _get(item, "arguments", "") or "{}"
+        if index not in streamed:
+            out.append({"index": index, "id": call_id,
+                        "name": _get(item, "name", "") or "", "arguments": final_args})
+            continue
+        _, partial = streamed[index]
+        if final_args.startswith(partial):
+            if final_args != partial:
+                out.append({"index": index, "id": None, "name": None,
+                            "arguments": final_args[len(partial):]})
+        else:
+            logger.warning("Responses call %s streamed arguments diverge from the "
+                           "completed response; keeping the streamed bytes", call_id)
+    return out
 
 
 # ── Conversion helpers (pure — unit-tested) ────────────────────────────────
