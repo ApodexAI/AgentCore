@@ -84,6 +84,9 @@ class StreamDelta:
     usage_source: str = ""
     # Refusal text has its own SDK channel on OpenAI Chat and Responses.
     refusal: str = ""
+    # A provider's completed response may correct missing or divergent streamed
+    # fragments. None means no override; an empty list clears partial calls.
+    final_tool_calls: list[ToolCall] | None = None
 
 
 @runtime_checkable

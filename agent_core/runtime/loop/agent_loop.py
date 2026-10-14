@@ -111,15 +111,18 @@ EXTRA_ATTEMPTS_BUFFER = 200
 #: payload a ``redacted_thinking`` block carries with no deltas at all, and
 #: ``test_anthropic_latest_models.py`` runs the signature round-trip, the
 #: prefix-bound retry and the reset commit parametrized over streaming.
-#: ``responses`` has one streaming test and it only covers error routing;
-#: ``bedrock`` has none, and its transport is a different SDK client.
+#: ``responses`` clears it too — ``stream`` hands back the completed response's
+#: block list (``encrypted_content`` reasoning and function calls in provider
+#: order), and ``test_responses_stream_replay.py`` requires a streamed tool turn
+#: to produce the same history and follow-up request as the non-streaming one.
+#: ``bedrock`` has no such test, and its transport is a different SDK client.
 #:
 #: The three were suppressed together and unconditionally when the loop engine
 #: was extracted (2026-09-01), one day BEFORE the provider substrate landed
 #: that block-list fidelity (2026-09-02) — so this was once correct for all
 #: three and nobody revisited it. Removing a protocol from this set is a matter
 #: of writing the test that proves its streamed replay.
-UNVERIFIED_STREAM_PROTOCOLS = frozenset({"responses", "bedrock"})
+UNVERIFIED_STREAM_PROTOCOLS = frozenset({"bedrock"})
 
 
 # Signature: (turn_index, messages_snapshot, metadata) -> awaitable None.
