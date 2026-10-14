@@ -203,8 +203,8 @@ class OpenAIResponsesClient(LLMClient):
         events_seen = 0
         last_event = ""
         saw_terminal = False
-        # output_index -> (call_id, arguments streamed so far)
-        streamed_calls: dict[int, tuple[str, str]] = {}
+        # output_index -> (call_id, name, arguments streamed so far)
+        streamed_calls: dict[int, tuple[str, str, str]] = {}
         async with contextlib.aclosing(stream_events_with_activity(stream, activity)) as events:
             async for event in events:
                 if event is None:
@@ -227,18 +227,19 @@ class OpenAIResponsesClient(LLMClient):
                         index = int(getattr(event, "output_index", 0) or 0)
                         call_id = _get(item, "call_id", "") or _get(item, "id", "") or ""
                         args = _get(item, "arguments", "") or ""
-                        streamed_calls[index] = (call_id, args)
+                        name = _get(item, "name", "") or ""
+                        streamed_calls[index] = (call_id, name, args)
                         activity.mark_output()
                         yield StreamDelta(tool_call_deltas=[{
                             "index": index, "id": call_id,
-                            "name": _get(item, "name", "") or "", "arguments": args,
+                            "name": name, "arguments": args,
                         }])
                 elif etype == "response.function_call_arguments.delta":
                     index = int(getattr(event, "output_index", 0) or 0)
                     chunk = getattr(event, "delta", "") or ""
-                    if index in streamed_calls and chunk:
-                        call_id, args = streamed_calls[index]
-                        streamed_calls[index] = (call_id, args + chunk)
+                    if chunk:
+                        call_id, name, args = streamed_calls.get(index, ("", "", ""))
+                        streamed_calls[index] = (call_id, name, args + chunk)
                         activity.mark_output()
                         yield StreamDelta(tool_call_deltas=[{
                             "index": index, "id": None, "name": None, "arguments": chunk,
@@ -283,6 +284,7 @@ class OpenAIResponsesClient(LLMClient):
                         model=parsed.model,
                         finish_reason=reason or "stop",
                         reasoning_blocks=parsed.content if isinstance(parsed.content, list) else [],
+                        final_tool_calls=parsed.tool_calls,
                     )
         if not saw_terminal:
             error = LLMOpenAITruncatedStream(
@@ -298,14 +300,14 @@ class OpenAIResponsesClient(LLMClient):
 
 
 def _unstreamed_call_deltas(
-    resp: Any, streamed: dict[int, tuple[str, str]],
+    resp: Any, streamed: dict[int, tuple[str, str, str]],
 ) -> list[dict[str, Any]]:
     """Tool-call deltas that complete the streamed calls from the final response.
 
     A call the stream never opened is emitted whole; a call whose streamed
-    arguments are a prefix of the final ones gets the remainder. Arguments that
-    DIVERGE cannot be corrected through an append-only channel — logged, and the
-    streamed bytes stand (the verbatim block list still carries the final ones).
+    arguments are a prefix of the final ones gets the remainder. The terminal
+    ``final_tool_calls`` separately supplies the authoritative executable calls
+    when an append-only delta cannot correct divergent streamed arguments.
     """
     out: list[dict[str, Any]] = []
     for index, item in enumerate(_get(resp, "output", None) or []):
@@ -317,14 +319,19 @@ def _unstreamed_call_deltas(
             out.append({"index": index, "id": call_id,
                         "name": _get(item, "name", "") or "", "arguments": final_args})
             continue
-        _, partial = streamed[index]
+        seen_id, seen_name, partial = streamed[index]
+        missing_id = call_id if not seen_id else None
+        missing_name = (_get(item, "name", "") or "") if not seen_name else None
         if final_args.startswith(partial):
-            if final_args != partial:
-                out.append({"index": index, "id": None, "name": None,
+            if final_args != partial or missing_id or missing_name:
+                out.append({"index": index, "id": missing_id, "name": missing_name,
                             "arguments": final_args[len(partial):]})
         else:
             logger.warning("Responses call %s streamed arguments diverge from the "
-                           "completed response; keeping the streamed bytes", call_id)
+                           "completed response; using the completed call for execution", call_id)
+            if missing_id or missing_name:
+                out.append({"index": index, "id": missing_id, "name": missing_name,
+                            "arguments": ""})
     return out
 
 

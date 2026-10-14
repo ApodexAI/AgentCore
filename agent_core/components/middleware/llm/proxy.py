@@ -18,7 +18,7 @@ from agent_core.execution_context import (
     get_current_execution_scope,
 )
 from agent_core.llm import LLMResponse, StreamDelta
-from agent_core.messages import Message
+from agent_core.messages import Message, ToolCall
 from agent_core.runtime.async_utils import await_bounded, closing_stream
 from agent_core.stream_tools import StreamToolCalls
 
@@ -42,6 +42,7 @@ class _StreamTerminal:
         self.stop_details: dict[str, Any] = {}
         self.stop_reason = ""
         self.tool_calls = StreamToolCalls()
+        self.final_tool_calls: list[ToolCall] | None = None
 
     def feed(self, delta: StreamDelta) -> None:
         # Last non-empty wins, except refusal text, which streams in pieces.
@@ -61,6 +62,8 @@ class _StreamTerminal:
             self.stop_reason = delta.stop_reason
         # Keep known usage/provenance even if a malformed tool fragment fails.
         self.tool_calls.feed(delta.tool_call_deltas)
+        if delta.final_tool_calls is not None:
+            self.final_tool_calls = delta.final_tool_calls
 
     def response(self, content: str, reasoning: str) -> LLMResponse:
         metadata: dict[str, Any] = {}
@@ -74,7 +77,8 @@ class _StreamTerminal:
             metadata["stop_reason"] = self.stop_reason
         return LLMResponse(
             content=content,
-            tool_calls=self.tool_calls.complete(),
+            tool_calls=(self.final_tool_calls if self.final_tool_calls is not None
+                        else self.tool_calls.complete()),
             reasoning_content=reasoning,
             finish_reason=self.finish_reason,
             model=self.model,

@@ -15,7 +15,7 @@ from agent_core.errors import (
     LLMStreamStalled,
 )
 from agent_core.llm import LLMResponse
-from agent_core.messages import Message
+from agent_core.messages import Message, ToolCall
 from agent_core.runtime.async_utils import await_bounded
 from agent_core.stream_tools import StreamToolCalls
 
@@ -245,6 +245,7 @@ async def _stream_llm_response(
     thinking_accum = ""
     delta_index = 0
     tool_calls = StreamToolCalls()
+    final_tool_calls: list[ToolCall] | None = None
     # Terminal metadata streamed late by the provider — kept so the assembled
     # LLMResponse carries usage/finish_reason/model (else streaming runs report
     # 0 usage and observers never see finish_reason="length").
@@ -329,7 +330,7 @@ async def _stream_llm_response(
         # NAMED calls to tools that do not exist are deliberately kept: those
         # reach the executor and come back as "unknown tool 'x'", which the
         # model can read and act on.
-        complete_tool_calls = tool_calls.complete()
+        complete_tool_calls = final_tool_calls if final_tool_calls is not None else tool_calls.complete()
         # Warn rather than drop silently — a provider emitting these
         # consistently is a real upstream defect, and this is the only place
         # that can still see it.
@@ -402,6 +403,8 @@ async def _stream_llm_response(
                     raw_visible = delta.content or getattr(delta, "refusal", "") or ""
                     typed_thinking = delta.reasoning_content or ""
                     tc_chunks = delta.tool_call_deltas or []
+                    if delta.final_tool_calls is not None:
+                        final_tool_calls = delta.final_tool_calls
                     # Capture terminal metadata as it arrives (usage on the
                     # late ``include_usage`` chunk, finish_reason on the last
                     # content chunk). Last non-empty wins.

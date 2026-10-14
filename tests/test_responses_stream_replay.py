@@ -46,7 +46,8 @@ FINAL_TURN = {
 }
 
 
-def _events(payload: dict[str, Any], *, item_events: bool):
+def _events(payload: dict[str, Any], *, item_events: bool,
+            drop_middle_chunk: bool = False):
     """SDK-shaped semantic events for ``payload``, ending in ``completed``.
 
     ``item_events=False`` models a gateway that forwards only the deltas and
@@ -68,9 +69,12 @@ def _events(payload: dict[str, Any], *, item_events: bool):
                 for chunk in (text[:2], text[2:]):
                     out.append(ev(type="response.output_text.delta",
                                   output_index=index, delta=chunk))
-        elif item["type"] == "function_call" and item_events:
+        elif item["type"] == "function_call":
             args = item["arguments"]
-            for chunk in (args[:3], args[3:]):
+            chunks = (args[:5], args[5:-1], args[-1:])
+            for chunk_index, chunk in enumerate(chunks):
+                if drop_middle_chunk and index == 1 and chunk_index == 1:
+                    continue
                 out.append(ev(type="response.function_call_arguments.delta",
                               output_index=index, item_id=item["id"], delta=chunk))
     out.append(ev(type="response.completed", response=payload))
@@ -81,14 +85,16 @@ def _events(payload: dict[str, Any], *, item_events: bool):
     return gen()
 
 
-def _client(*, streaming: bool, item_events: bool = True):
+def _client(*, streaming: bool, item_events: bool = True,
+            drop_middle_chunk: bool = False):
     requests: list[dict[str, Any]] = []
 
     async def create(**kwargs):
         requests.append(json.loads(json.dumps(kwargs["input"])))
         assert bool(kwargs.get("stream")) is streaming
         payload = TOOL_TURN if len(requests) == 1 else FINAL_TURN
-        return _events(payload, item_events=item_events) if streaming else payload
+        return (_events(payload, item_events=item_events,
+                        drop_middle_chunk=drop_middle_chunk) if streaming else payload)
 
     client = rc.OpenAIResponsesClient("gpt-x", api_key="x")
     client._client = SimpleNamespace(responses=SimpleNamespace(create=create))
@@ -107,8 +113,10 @@ class Search:
         }}
 
 
-async def _run(*, streaming: bool, item_events: bool = True):
-    client, requests = _client(streaming=streaming, item_events=item_events)
+async def _run(*, streaming: bool, item_events: bool = True,
+               drop_middle_chunk: bool = False):
+    client, requests = _client(streaming=streaming, item_events=item_events,
+                               drop_middle_chunk=drop_middle_chunk)
     result = await run_agent_loop(
         system_prompt="s", user_message="hi", llm=client, tools=[Search()],
         config=LoopConfig(
@@ -125,9 +133,12 @@ async def _run(*, streaming: bool, item_events: bool = True):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("item_events", [True, False])
-async def test_streamed_tool_turn_replays_like_non_streaming(item_events):
+@pytest.mark.parametrize("drop_middle_chunk", [True, False])
+async def test_streamed_tool_turn_replays_like_non_streaming(item_events, drop_middle_chunk):
     batch, batch_requests = await _run(streaming=False)
-    streamed, streamed_requests = await _run(streaming=True, item_events=item_events)
+    streamed, streamed_requests = await _run(
+        streaming=True, item_events=item_events, drop_middle_chunk=drop_middle_chunk,
+    )
 
     assert batch.final_content == streamed.final_content == "done"
     assert len(streamed_requests) == len(batch_requests) == 2
@@ -154,3 +165,24 @@ async def test_stream_yields_each_call_once_with_full_arguments():
         ("call_a", '{"q": "a"}'), ("call_b", '{"q": "b"}'),
     ]
     assert deltas[-1].reasoning_blocks == rc._parse_responses_output(TOOL_TURN).content
+
+
+@pytest.mark.asyncio
+async def test_argument_deltas_arrive_without_item_added():
+    client, _ = _client(streaming=True, item_events=False)
+    deltas = [d async for d in client.stream([{"role": "user", "content": "hi"}])]
+    arg_chunks = [part["arguments"] for delta in deltas[:-1]
+                  for part in delta.tool_call_deltas if part.get("arguments")]
+    assert arg_chunks[:3] == ['{"q":', ' "a"', '}']
+    assert deltas[-1].final_tool_calls == rc._parse_responses_output(TOOL_TURN).tool_calls
+
+
+@pytest.mark.asyncio
+async def test_terminal_calls_override_divergent_fragments_in_proxy():
+    from agent_core.components.middleware.llm.proxy import _StreamTerminal
+
+    client, _ = _client(streaming=True, drop_middle_chunk=True)
+    terminal = _StreamTerminal()
+    for delta in [d async for d in client.stream([{"role": "user", "content": "hi"}])]:
+        terminal.feed(delta)
+    assert terminal.response("", "").tool_calls == rc._parse_responses_output(TOOL_TURN).tool_calls
