@@ -24,6 +24,7 @@ from agent_core.loop_types import (
     ToolResult,
     TurnContext,
 )
+from agent_core.messages import Message
 from agent_core.tool_content import redacted_for_trace, redacted_tool_result_content
 
 _FORMATS: tuple[str, ...] = ("json", "jsonl")
@@ -54,7 +55,7 @@ def _env_int(name: str, default: int) -> int:
 # ── Trajectory memory guardrails ──────
 #
 # One instance of this observer exists per agent (main + every sub-agent).
-# Messages are spooled one-per-line to disk, and two additional bounds keep
+# History is streamed one message at a time to disk, and two bounds keep
 # each public JSON snapshot cheap:
 #
 #   _BODY_MAX_CHARS — per tool-result body kept in the JSON envelope.
@@ -101,9 +102,17 @@ def _resolve_formats(
 
 
 class TrajectoryFileObserver(BaseObserver):
-    """Saves an agent's main / sub-agent traces in one or more formats."""
+    """Save conversation snapshots (JSON) and execution events (JSONL).
 
-    critical: bool = False
+    JSON follows the loop's current history, including rewrites and synthetic
+    replies, with diagnostic annotations, image redaction and the configured
+    tool-body cap. JSONL retains original events even after history is pruned.
+    """
+
+    # These hooks do synchronous file I/O without yielding. Awaiting them
+    # preserves event order even when a synthetic result needs no async tool
+    # execution; a background on_llm_response can otherwise run AFTER it.
+    critical: bool = True
 
     def __init__(
         self,
@@ -168,14 +177,16 @@ class TrajectoryFileObserver(BaseObserver):
         self._tool_calls_count: int = 0
         self._stopped_by: str = ""
 
-        # JSON envelope state. Messages are append-only on disk rather than
-        # retained in a per-agent list for the whole run. The public
-        # ``<stem>.json`` snapshot is streamed from this spool.
+        # Borrow the loop's live history instead of reconstructing it from
+        # execution events. The spool is refreshed only when a snapshot is due.
+        # No second in-memory copy of the message bodies is retained.
+        self._history: list[Message] | None = None
+        # Diagnostic fields are separate from history. Identity checks avoid
+        # annotating a replacement message after compaction/rollback. Discarded
+        # references are released at the next coalesced snapshot.
+        self._response_metadata: dict[int, tuple[Message, dict[str, Any]]] = {}
         self._message_spool_handle: IO[str] | None = None
         self._message_count: int = 0
-        self._emitted_prior: bool = False
-        self._tool_call_ids: dict[int, list[str]] = {}
-        self._tool_results_seen: dict[int, int] = {}
         # Flush coalescing cursors (see ``_flush_json``). ``0.0`` rather than
         # ``time.monotonic()`` so the FIRST flush is always due: the envelope
         # then appears on disk immediately instead of only after the first
@@ -276,7 +287,7 @@ class TrajectoryFileObserver(BaseObserver):
     # ── JSON envelope writer ────────────────────────────────────────────
 
     def _append_message(self, message: dict) -> None:
-        """Append one OpenAI message to the private on-disk spool."""
+        """Append a message; the snapshot writer flushes the complete spool."""
         if self._message_spool_handle is None:
             self._message_spool_handle = open(  # noqa: SIM115
                 self._message_spool_path(), "w", encoding="utf-8",
@@ -284,7 +295,6 @@ class TrajectoryFileObserver(BaseObserver):
         for chunk in _STREAM_ENCODER.iterencode(message):
             self._message_spool_handle.write(chunk)
         self._message_spool_handle.write("\n")
-        self._message_spool_handle.flush()
         self._message_count += 1
 
     def _close_message_spool(self, *, cleanup: bool = False) -> None:
@@ -294,6 +304,35 @@ class TrajectoryFileObserver(BaseObserver):
         if cleanup:
             with contextlib.suppress(FileNotFoundError):
                 self._message_spool_path().unlink()
+
+    def _sync_history(self) -> None:
+        """Replace the spool with the real history, including in-place edits.
+
+        A length/delta cursor is insufficient: compaction, rollback, thinking
+        resets and image eviction can replace or edit already-recorded messages.
+        Streaming at the coalesced flush boundary keeps those changes faithful
+        without a full history copy or an O(n) rewrite on every tool callback.
+        """
+        if self._history is None:
+            return
+        self._close_message_spool()
+        self._message_count = 0
+        retained: dict[int, tuple[Message, dict[str, Any]]] = {}
+        # Open even for an empty history so a rollback to [] clears the spool.
+        self._message_spool_handle = open(  # noqa: SIM115
+            self._message_spool_path(), "w", encoding="utf-8",
+        )
+        for message in self._history:
+            rendered = self._message_to_dict(message)
+            if rendered is None:
+                continue
+            annotation = self._response_metadata.get(id(message))
+            if annotation is not None and annotation[0] is message:
+                rendered.update(annotation[1])
+                retained[id(message)] = annotation
+            self._append_message(rendered)
+        self._message_spool_handle.flush()
+        self._response_metadata = retained
 
     def _write_envelope(self, path: Path) -> None:
         """Stream one compatible JSON envelope without materialising it."""
@@ -338,7 +377,7 @@ class TrajectoryFileObserver(BaseObserver):
         """Rewrite the JSON envelope, coalescing bursts unless *force*.
 
         The envelope is a single document, so every flush still copies all
-        message chunks from the append-only spool. Coalescing bounds that
+        message chunks from the refreshed history spool. Coalescing bounds that
         O(n²) I/O to one copy per ``_COALESCE_N`` events or
         ``_COALESCE_MS`` milliseconds. The copy is streamed, so neither the
         message history nor its serialised twin is materialised in memory.
@@ -373,26 +412,11 @@ class TrajectoryFileObserver(BaseObserver):
                 return
         self._pending_flushes = 0
         self._last_flush_at = time.monotonic()
+        self._sync_history()
         path = self._path("json")
         tmp = path.with_suffix(path.suffix + ".tmp")
         self._write_envelope(tmp)
         os.replace(tmp, path)
-
-    @staticmethod
-    def _synth_id(turn: int, idx: int) -> str:
-        return f"call_{turn}_{idx}"
-
-    @staticmethod
-    def _stringify(value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        return str(value) if value is not None else ""
-
-    @staticmethod
-    def _format_args(args: Any) -> str:
-        if isinstance(args, (dict, list)):
-            return json.dumps(args, ensure_ascii=False)
-        return TrajectoryFileObserver._stringify(args)
 
     def _message_to_dict(self, m: Any) -> dict | None:
         """Pass through native OpenAI-shaped dict messages.
@@ -406,7 +430,19 @@ class TrajectoryFileObserver(BaseObserver):
             # ``redacted_for_trace`` swaps an inline image's base64 for its
             # size. Verbatim, one 1080p screenshot writes ~137 KB here for
             # every turn it stays in history.
-            return dict(redacted_for_trace(m))
+            message = dict(redacted_for_trace(m))
+            if message.get("role") == "tool":
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = _clip(content, _BODY_MAX_CHARS)
+                elif isinstance(content, list):
+                    message["content"] = [
+                        {**block, "text": _clip(block["text"], _BODY_MAX_CHARS)}
+                        if isinstance(block, dict) and isinstance(block.get("text"), str)
+                        else block
+                        for block in content
+                    ]
+            return message
         return None
 
     # ── Lifecycle hooks ─────────────────────────────────────────────────
@@ -419,13 +455,11 @@ class TrajectoryFileObserver(BaseObserver):
     # ``recover_result`` needs to find this file, and the file is not
     # sandbox-visible, so the path is published rather than mounted.
     #
-    # Published into ``ExecutionScope.metadata`` and NOT into a contextvar. This
-    # hook is dispatched by ``notify_observers`` as ``asyncio.create_task`` for
-    # non-critical observers, and this observer is non-critical — a contextvar
-    # ``.set()`` inside that task mutates only the task's own copy of the context
-    # and is invisible to the loop. The scope OBJECT, by contrast, is shared by
-    # reference through the inherited context, so mutating its dict here is seen
-    # by the loop and by every nested tool-call task. Same channel
+    # Published into ``ExecutionScope.metadata`` and NOT into a contextvar.
+    # Non-critical hooks may run in ``asyncio.create_task``; a contextvar
+    # ``.set()`` inside such a task mutates only that task's own context. Scope
+    # metadata works for both awaited and background observers, and is seen
+    # by the loop and every nested tool-call task. Same channel
     # ``agent_loop.py`` already uses for ``current_turn``.
     SCOPE_KEY = "trajectory_jsonl"
 
@@ -484,6 +518,24 @@ class TrajectoryFileObserver(BaseObserver):
         self._write_jsonl(start_record)
         self._flush_json()
 
+    async def on_before_llm(self, ctx: TurnContext) -> Intervention | None:
+        if "json" in self._formats:
+            # Unlike on_llm_input's request copy, this list stays live across
+            # injections, compaction, early exits and cancellation.
+            self._history = ctx.messages
+        return None
+
+    async def on_llm_input(self, ctx: TurnContext) -> None:
+        # Injections from on_before_llm have now been applied. Transient request
+        # addenda belong to the request, not to durable conversation history.
+        self._flush_json()
+
+    async def on_turn_end(self, ctx: TurnContext) -> Intervention | None:
+        if "json" in self._formats:
+            self._history = ctx.messages
+            self._flush_json()
+        return None
+
     async def on_llm_response(
         self, ctx: TurnContext,
     ) -> Intervention | None:
@@ -520,57 +572,21 @@ class TrajectoryFileObserver(BaseObserver):
             record["stop_details"] = ctx.stop_details
         self._write_jsonl(record)
 
-        # JSON envelope: emit prior context once, then this turn.
         if "json" in self._formats:
-            if not self._emitted_prior:
-                # ctx.messages includes the assistant we just got; skip it
-                # and emit ourselves below with reasoning_content split out.
-                for m in list(ctx.messages or [])[:-1]:
-                    d = self._message_to_dict(m)
-                    if d:
-                        self._append_message(d)
-                self._emitted_prior = True
-
-            msg: dict = {
-                "role": "assistant",
-                "content": self._stringify(ctx.ai_text),
-            }
-            if ctx.thinking:
-                msg["reasoning_content"] = self._stringify(ctx.thinking)
-            if ctx.usage:
-                # Per-turn usage (incl. reasoning_tokens) so the JSON envelope
-                # carries the same usage as the .jsonl stream.
-                msg["usage"] = ctx.usage
-            if ctx.thinking_blocks:
-                # Verbatim thinking / reasoning blocks (signatures /
-                # encrypted_content) so the JSON envelope stays replay-able.
-                msg["thinking_blocks"] = ctx.thinking_blocks
-            if ctx.finish_reason and ctx.finish_reason not in _ORDINARY_FINISH_REASONS:
-                msg["finish_reason"] = ctx.finish_reason
-            if ctx.stop_details:
-                msg["stop_details"] = ctx.stop_details
-            if ctx.tool_calls:
-                ids: list[str] = []
-                tcs: list[dict] = []
-                for idx, tc in enumerate(ctx.tool_calls):
-                    cid = tc.get("id") or self._synth_id(ctx.turn, idx)
-                    ids.append(cid)
-                    tcs.append({
-                        "id": cid,
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("name", ""),
-                            "arguments": self._format_args(
-                                tc.get("args", {}),
-                            ),
-                        },
-                    })
-                msg["tool_calls"] = tcs
-                self._tool_call_ids[ctx.turn] = ids
-                self._tool_results_seen[ctx.turn] = 0
-                self._tool_calls_count += len(tcs)
-
-            self._append_message(msg)
+            self._history = ctx.messages
+            # The last assistant may already be followed by skipped/blocked
+            # replies. Never infer its position from messages[-1]. Awaited
+            # dispatch ensures this still refers to the response being observed.
+            assistant = next(
+                (m for m in reversed(ctx.messages) if m.get("role") == "assistant"),
+                None,
+            )
+            if assistant is not None:
+                details = {key: record[key] for key in (
+                    "usage", "thinking_blocks", "finish_reason", "stop_details",
+                ) if key in record}
+                self._response_metadata[id(assistant)] = (assistant, details)
+            self._tool_calls_count += len(ctx.tool_calls)
             self._turns_used = ctx.turn
             self._flush_json()
         return None
@@ -578,13 +594,9 @@ class TrajectoryFileObserver(BaseObserver):
     async def on_tool_result(
         self, ctx: TurnContext, result: ToolResult,
     ) -> ToolResult | None:
-        # ``tool_call_id`` is what makes a JSONL entry addressable: a turn can
-        # hold several results from the same tool (parallel_tool_calls is on),
-        # so ``(turn, name)`` does not identify one. Recorded straight off the
-        # result rather than through the JSON branch's synthesis fallback below
-        # — that fallback advances ``_tool_results_seen``, so sharing it would
-        # double-count, and a synthesised id matches nothing outside the
-        # snapshot anyway. Empty here means the runtime itself had no id.
+        # Results describe what the tool returned, before post-processing and
+        # image capability gating. Only the real history can say what the model
+        # received. Empty ids here mean the runtime itself supplied no id.
         jsonl_record: dict[str, Any] = {
             "t": "result",
             "turn": ctx.turn,
@@ -600,27 +612,6 @@ class TrajectoryFileObserver(BaseObserver):
             jsonl_record["images"] = redacted_tool_result_content("", result.images)
         self._write_jsonl(jsonl_record)
 
-        if "json" in self._formats:
-            cid = getattr(result, "tool_call_id", "") or ""
-            if not cid:
-                ids = self._tool_call_ids.get(ctx.turn, [])
-                seen = self._tool_results_seen.get(ctx.turn, 0)
-                cid = (
-                    ids[seen] if seen < len(ids)
-                    else self._synth_id(ctx.turn, seen)
-                )
-                self._tool_results_seen[ctx.turn] = seen + 1
-            body = _clip(self._stringify(result.result), _BODY_MAX_CHARS)
-            rendered_body = f"[error] {body}" if result.is_error else body
-            self._append_message({
-                "role": "tool",
-                "tool_call_id": cid,
-                "content": redacted_tool_result_content(
-                    rendered_body,
-                    result.images,
-                ),
-            })
-            self._flush_json()
         return None
 
     async def on_compaction(self, event: CompactionEvent) -> None:
@@ -647,6 +638,8 @@ class TrajectoryFileObserver(BaseObserver):
         })
 
     async def on_loop_end(self, result: AgentLoopResult) -> None:
+        if "json" in self._formats:
+            self._history = result.messages
         self._turns_used = max(self._turns_used, result.turns_used)
         self._tool_calls_count = result.tool_calls_count
         self._stopped_by = (
@@ -673,9 +666,16 @@ class TrajectoryFileObserver(BaseObserver):
             # Always release the FD. Keep the forensic spool when the terminal
             # snapshot fails; remove it only after a successful atomic replace.
             self._close_message_spool(cleanup=snapshot_written)
+            self._history = None
+            self._response_metadata.clear()
 
     async def on_loop_cancelled(self) -> None:
-        """Close live handles while preserving crash-forensic sidecars."""
+        """Flush current history and preserve crash-forensic sidecars."""
         self._close_jsonl()
         self._withdraw_jsonl_path()
-        self._close_message_spool()
+        try:
+            self._flush_json(force=True)
+        finally:
+            self._close_message_spool()
+            self._history = None
+            self._response_metadata.clear()

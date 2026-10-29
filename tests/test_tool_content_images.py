@@ -535,12 +535,14 @@ def test_the_trajectory_observer_does_not_write_base64() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_trajectory_records_returned_images_without_base64(tmp_path) -> None:
+@pytest.mark.parametrize("visible", [False, True])
+async def test_live_trajectory_records_image_delivery_without_base64(tmp_path, visible) -> None:
     import json
-    from types import SimpleNamespace
 
     from agent_core.components.observers.trajectory import TrajectoryFileObserver
-    from agent_core.loop_types import LoopConfig, ToolResult
+    from agent_core.llm import LLMResponse
+    from agent_core.loop_types import LoopConfig, LoopPolicy
+    from agent_core.runtime.loop.agent_loop import run_agent_loop
 
     attachment = image_attachment(
         _png(64, 32),
@@ -552,25 +554,41 @@ async def test_live_trajectory_records_returned_images_without_base64(tmp_path) 
         filename="live",
         formats=["json", "jsonl"],
     )
-    await observer.on_loop_start(LoopConfig(task_id="probe"))
-    await observer.on_tool_result(
-        SimpleNamespace(turn=1),
-        ToolResult(
-            name="view_image",
-            args={"path": "/tmp/live.png"},
-            result="image follows",
-            duration_ms=1,
-            tool_call_id="call_1",
-            is_error=False,
-            images=[attachment],
-        ),
+    class ViewImage:
+        name = "view_image"
+
+        async def ainvoke(self, args):
+            return tool_content("image follows", images=[attachment])
+
+    class Client:
+        called = False
+
+        async def chat(self, messages, **kwargs):
+            if not self.called:
+                self.called = True
+                return LLMResponse(tool_calls=[{
+                    "id": "call_1", "type": "function", "function": {
+                        "name": "view_image", "arguments": '{"path":"/tmp/live.png"}',
+                    },
+                }])
+            return LLMResponse(content="done")
+
+    await run_agent_loop(
+        system_prompt="system", user_message="show image", llm=Client(),
+        tools=[ViewImage()], observers=[observer],
+        model_profile=_vision_profile() if visible else _blind_profile(),
+        config=LoopConfig(task_id="probe", max_turns=2,
+                          loop_policy=LoopPolicy(no_tool_behavior="stop")),
     )
-    observer._flush_json(force=True)
 
     envelope = json.loads((tmp_path / "live.json").read_text(encoding="utf-8"))
-    content = envelope["messages"][-1]["content"]
-    assert content[1]["type"] == "image_url"
-    assert "elided from trace" in content[1]["image_url"]["url"]
+    content = next(m["content"] for m in envelope["messages"] if m["role"] == "tool")
+    if visible:
+        assert content[1]["type"] == "image_url"
+        assert "elided from trace" in content[1]["image_url"]["url"]
+    else:
+        assert isinstance(content, str)
+        assert "have NOT" in content
 
     jsonl = (tmp_path / "live.jsonl").read_text(encoding="utf-8")
     assert '"images"' in jsonl
