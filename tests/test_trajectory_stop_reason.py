@@ -112,7 +112,6 @@ async def test_json_snapshot_records_refusal_details(tmp_path, formats):
     obs = TrajectoryFileObserver(tmp_path, filename="t", formats=formats)
     await obs.on_llm_response(_ctx(
         finish_reason="refusal", stop_details={"type": "refusal", "category": "bio"},
-        messages=[{"role": "assistant", "content": ""}],
     ))
     msg = json.loads((tmp_path / "t.json").read_text())["messages"][0]
     assert msg["finish_reason"] == "refusal"

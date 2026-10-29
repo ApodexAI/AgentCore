@@ -17,6 +17,7 @@ from agent_core.loop_types import (
     Intervention,
     LoopConfig,
     LoopPolicy,
+    TurnContext,
 )
 from agent_core.runtime.loop.agent_loop import run_agent_loop
 from agent_core.runtime.loop.model_profile import HistoryPolicy, ModelProfile
@@ -285,7 +286,7 @@ async def test_failed_terminal_replace_keeps_readable_snapshot_and_forensic_spoo
         await trajectory.on_loop_end(AgentLoopResult(messages=[{"role": "user", "content": "latest"}]))
     assert (tmp_path / "trace.json").read_bytes() == previous
     assert json.loads((tmp_path / "trace.messages.spool").read_text())["content"] == "latest"
-    assert trajectory._message_spool_handle is None
+    assert trajectory._spool_entries == []
     assert trajectory._history is None
 
 
@@ -322,3 +323,147 @@ def test_history_body_limits_preserve_blocks_and_do_not_mutate_history(tmp_path,
         assert text.startswith("long\n... [truncated")
     assert "elided from trace" in rendered["content"][1]["image_url"]["url"]
     assert message == original
+
+
+def _turn(messages, **kwargs):
+    fields = {"turn": 1, "max_turns": 5, "task_id": "t", "role_id": "r", "ai_text": "",
+              "thinking": "", "tool_calls": [], "messages": messages, "usage": None,
+              "metadata": {}}
+    fields.update(kwargs)
+    return TurnContext(**fields)
+
+
+async def test_cancellation_after_loop_end_keeps_terminal_snapshot(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    await trajectory.on_loop_start(LoopConfig())
+    history = [{"role": "user", "content": "start"}, {"role": "assistant", "content": "done"}]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    terminal = (tmp_path / "trace.json").read_bytes()
+    # A later critical observer's on_loop_end is cancelled; the loop then
+    # notifies on_loop_cancelled on every observer, this one included.
+    await trajectory.on_loop_cancelled()
+    assert (tmp_path / "trace.json").read_bytes() == terminal
+    assert [m["content"] for m in _messages(tmp_path / "trace.json")] == ["start", "done"]
+
+
+async def test_diagnostics_survive_compaction_that_copies_assistants(tmp_path):
+    class CopyCompact:
+        def compact(self, messages, keep_recent):
+            # Like strip_stale_reasoning: same content, new dict objects.
+            return [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages]
+
+    messages, _, _ = await _run(tmp_path, [
+        LLMResponse(tool_calls=[_call("c")], finish_reason="tool_use"),
+        LLMResponse(content="done"),
+    ], config=LoopConfig(max_turns=4, max_llm_retries=1, compact_after_turns=0,
+                         compactor=CopyCompact(),
+                         loop_policy=LoopPolicy(no_tool_behavior="stop")))
+    first = next(m for m in messages if m["role"] == "assistant")
+    assert first["finish_reason"] == "tool_use"
+
+
+async def test_diagnostics_survive_a_signed_thinking_reset(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    blocks = [{"type": "thinking", "thinking": "r", "signature": "s"}]
+    assistant = {"role": "assistant", "content": [*blocks, {"type": "text", "text": "a"}]}
+    history = [{"role": "user", "content": "start"}, assistant]
+    await trajectory.on_llm_response(_turn(history, ai_text="a", thinking_blocks=blocks,
+                                           usage={"input_tokens": 3}))
+    # _reset_signed_thinking_history substitutes a copy without the blocks.
+    history[1] = {**assistant, "content": [{"type": "text", "text": "a"}]}
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    last = _messages(tmp_path / "trace.json")[-1]
+    assert last["usage"] == {"input_tokens": 3}
+    # The blocks are gone from content, so the annotation must carry them.
+    assert last["thinking_blocks"] == blocks
+
+
+async def test_native_thinking_blocks_are_not_written_twice(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    blocks = [{"type": "thinking", "thinking": "r", "signature": "s"}]
+    history = [{"role": "assistant", "content": [*blocks, {"type": "text", "text": "a"}]}]
+    await trajectory.on_llm_response(_turn(history, thinking_blocks=blocks,
+                                           usage={"input_tokens": 3}))
+    message = _messages(tmp_path / "trace.json")[0]
+    assert "thinking_blocks" not in message
+    assert message["usage"] == {"input_tokens": 3}
+
+
+async def test_non_json_history_values_do_not_freeze_snapshots(tmp_path):
+    import datetime
+
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json", "jsonl"])
+    await trajectory.on_loop_start(LoopConfig())
+    stamp = datetime.datetime(2026, 1, 2, tzinfo=datetime.UTC)
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [_call("c")]},
+        {"role": "tool", "tool_call_id": "c", "content": "ok", "seen_at": stamp,
+         "raw": b"abc"},
+    ]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    tool = _messages(tmp_path / "trace.json")[-1]
+    assert tool["seen_at"] == stamp.isoformat()
+    assert tool["raw"] == "<3 bytes>"
+
+
+async def test_hooks_without_loop_history_still_record_the_turn(tmp_path):
+    from agent_core.loop_types import ToolResult
+
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    await trajectory.on_loop_start(LoopConfig())
+    await trajectory.on_llm_response(_turn(
+        None, ai_text="calling", tool_calls=[{"name": "echo", "args": {"v": 1}}],
+        finish_reason="tool_use",
+    ))
+    await trajectory.on_tool_result(_turn(None), ToolResult(
+        name="echo", args={"v": 1}, result="ok", duration_ms=1, tool_call_id="", is_error=False,
+    ))
+    await trajectory.on_llm_response(_turn(None, turn=2, ai_text="done", tool_calls=None))
+    await trajectory.on_loop_end(AgentLoopResult(messages=[], turns_used=2))
+    messages = _messages(tmp_path / "trace.json")
+    assert [m["role"] for m in messages] == ["assistant", "tool", "assistant"]
+    assert messages[0]["finish_reason"] == "tool_use"
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"v":1}'
+    assert messages[1]["tool_call_id"] == messages[0]["tool_calls"][0]["id"]
+    assert messages[2]["content"] == "done"
+
+
+async def test_tool_results_count_toward_coalesced_snapshots(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_core.components.observers.trajectory._COALESCE_N", 5)
+    _, client, _ = await _run(tmp_path, [
+        LLMResponse(tool_calls=[_call(f"c{i}") for i in range(3)]),
+        LLMResponse(content="done"),
+    ], verify_snapshots=False)
+    # Turn 1 is input + response + 3 results + turn end; without the results
+    # it would only become due at the second input, after the snapshot.
+    assert [m.get("tool_call_id") for m in client.snapshots[1] if m["role"] == "tool"] == [
+        "c0", "c1", "c2",
+    ]
+
+
+async def test_snapshots_render_only_new_or_changed_messages(tmp_path, monkeypatch):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    rendered = []
+    original = trajectory._message_to_dict
+
+    def counting(message):
+        rendered.append(message.get("content"))
+        return original(message)
+
+    monkeypatch.setattr(trajectory, "_message_to_dict", counting)
+    history = [{"role": "user", "content": f"m{i}"} for i in range(3)]
+    trajectory._history = history
+    trajectory._flush_json(force=True)
+    history.append({"role": "user", "content": "m3"})
+    trajectory._flush_json(force=True)
+    assert rendered == ["m0", "m1", "m2", "m3"]
+
+    # Value replacement in place (as image eviction does) is detected.
+    history[1]["content"] = "edited"
+    trajectory._flush_json(force=True)
+    assert rendered[4:] == ["edited", "m2", "m3"]
+    # So is a rewrite that removes messages.
+    history[:] = [history[0], history[3]]
+    trajectory._flush_json(force=True)
+    assert [m["content"] for m in _messages(tmp_path / "trace.json")] == ["m0", "m3"]
+    assert rendered[7:] == ["m3"]
