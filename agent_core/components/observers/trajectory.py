@@ -8,10 +8,10 @@ so partial runs remain readable without retaining full payloads in memory.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import time
-from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -65,6 +65,16 @@ def _json_default(value: Any) -> Any:
 _STREAM_ENCODER = json.JSONEncoder(
     ensure_ascii=False, separators=(",", ":"), default=_json_default,
 )
+
+
+def _json_digest(value: Any) -> bytes:
+    """Hash nested JSON values without retaining a serialized history copy."""
+    digest = hashlib.sha256()
+    for chunk in _STREAM_ENCODER.iterencode(value):
+        digest.update(chunk.encode("utf-8"))
+    return digest.digest()
+
+
 _DEFAULT_FORMAT_ENV_VARS = (
     "AGENT_CORE_TRAJECTORY_FORMATS",
     "FRONTIER_AGENT_TRAJECTORY_FORMATS",
@@ -147,8 +157,8 @@ class TrajectoryFileObserver(BaseObserver):
     # task never moved that work off the event loop; it only reordered it.
     # Awaiting them preserves event order even when a synthetic result needs
     # no async tool execution, where a background on_llm_response could run
-    # AFTER it. Coalescing and re-rendering only new or changed messages keep
-    # the awaited cost per flush small.
+    # AFTER it. Coalescing limits snapshot work; streamed value digests let
+    # unchanged spool prefixes survive while still detecting nested edits.
     critical: bool = True
 
     def __init__(
@@ -222,15 +232,15 @@ class TrajectoryFileObserver(BaseObserver):
         # directly), so the observer assembles the conversation itself.
         self._owns_history: bool = False
         # Diagnostic fields are separate from history, kept as [message,
-        # content fingerprint, details] in response order. Identity binds them
-        # first; the fingerprint re-binds them to the shallow copies that
-        # compaction and thinking resets substitute. Entries whose message left
-        # history are released at the next snapshot.
+        # content fingerprint, details]. Identity binds them first; fingerprints
+        # re-bind only unambiguous copies. Entries without diagnostics still
+        # track lineage so repeated text cannot inherit another turn's details.
+        # Entries whose message left history are released at the next snapshot.
         self._response_metadata: list[list[Any]] = []
         # One (message, signature, end offset) per history entry already in
         # the spool. A snapshot keeps the longest unchanged prefix and
         # re-renders only from the first new, replaced or edited message.
-        self._spool_entries: list[tuple[Any, tuple[Any, ...], int]] = []
+        self._spool_entries: list[tuple[Any, bytes, int]] = []
         # Set by on_loop_end. A cancellation arriving after it (while a later
         # observer still runs) must not overwrite the terminal snapshot.
         self._ended: bool = False
@@ -340,30 +350,12 @@ class TrajectoryFileObserver(BaseObserver):
                 self._message_spool_path().unlink()
 
     @staticmethod
-    def _signature(message: Any, details: Any) -> tuple[Any, ...]:
-        """Shallow structure of *message*, compared by reference identity.
-
-        History edits replace values (``message["content"] = rebuilt``) or
-        whole messages, so identity of each value and content block detects
-        them without re-serialising. Holding the references keeps their ids
-        from being reused before the next comparison.
-        """
-        if not isinstance(message, dict):
-            return (message, details)
-        content = message.get("content")
-        blocks = tuple(content) if isinstance(content, list) else ()
-        return (tuple(message.items()), blocks, details)
+    def _signature(message: Any, details: Any) -> bytes:
+        """Detect value changes, including edits inside existing containers."""
+        return _json_digest((message, details))
 
     @staticmethod
-    def _same(a: Any, b: Any) -> bool:
-        if isinstance(a, tuple) and isinstance(b, tuple):
-            return len(a) == len(b) and all(
-                TrajectoryFileObserver._same(x, y) for x, y in zip(a, b, strict=True)
-            )
-        return a is b
-
-    @staticmethod
-    def _fingerprint(message: Message) -> int:
+    def _fingerprint(message: Message) -> bytes:
         """Content identity that survives reasoning and thinking-block strips."""
         content = message.get("content")
         if isinstance(content, list):
@@ -376,7 +368,7 @@ class TrajectoryFileObserver(BaseObserver):
             tc.get("id") for tc in (message.get("tool_calls") or [])
             if isinstance(tc, dict)
         )
-        return hash((ids, _STREAM_ENCODER.encode(content)))
+        return _json_digest((ids, content))
 
     def _resolve_annotations(self, history: list[Message]) -> dict[int, dict[str, Any]]:
         """Bind diagnostics to the history messages that carry them now."""
@@ -390,12 +382,11 @@ class TrajectoryFileObserver(BaseObserver):
             else:
                 unmatched.append(entry)
         if unmatched:
-            pending: dict[int, deque[list[Any]]] = {}
+            pending: dict[bytes, list[list[Any]]] = {}
             for entry in unmatched:
-                pending.setdefault(entry[1], deque()).append(entry)
+                pending.setdefault(entry[1], []).append(entry)
+            candidates: dict[bytes, list[Message]] = {}
             for message in history:
-                if not pending:
-                    break
                 if (
                     not isinstance(message, dict)
                     or message.get("role") != "assistant"
@@ -403,17 +394,27 @@ class TrajectoryFileObserver(BaseObserver):
                 ):
                     continue
                 fingerprint = self._fingerprint(message)
-                queue = pending.get(fingerprint)
-                if queue:
-                    entry = queue.popleft()
-                    entry[0] = message
-                    bound[id(message)] = entry
-                    if not queue:
-                        del pending[fingerprint]
-        self._response_metadata = [
-            entry for entry in self._response_metadata
-            if bound.get(id(entry[0])) is entry
-        ]
+                if fingerprint in pending:
+                    candidates.setdefault(fingerprint, []).append(message)
+            for fingerprint, sources in pending.items():
+                targets = candidates.get(fingerprint, [])
+                # Identical text does not identify a turn. A compactor may
+                # have dropped any of the sources or kept several copies.
+                # Leave diagnostics in JSONL rather than guessing by order.
+                if len(sources) == 1 and len(targets) == 1:
+                    entry = sources[0]
+                    entry[0] = targets[0]
+                    bound[id(targets[0])] = entry
+        retained: list[list[Any]] = []
+        for message in history:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            entry = bound.get(id(message))
+            if entry is None:
+                entry = [message, self._fingerprint(message), {}]
+                bound[id(message)] = entry
+            retained.append(entry)
+        self._response_metadata = retained
         return {key: entry[2] for key, entry in bound.items()}
 
     def _render(self, message: Any, details: dict[str, Any] | None) -> bytes:
@@ -454,7 +455,7 @@ class TrajectoryFileObserver(BaseObserver):
                 message = history[keep]
                 ref, signature, _ = entries[keep]
                 current = self._signature(message, details_for.get(id(message)))
-                if ref is not message or not self._same(signature, current):
+                if ref is not message or signature != current:
                     break
                 keep += 1
         offset = entries[keep - 1][2] if keep else 0
@@ -681,6 +682,9 @@ class TrajectoryFileObserver(BaseObserver):
             return
         if self._history is None:
             self._history = messages
+            # Resumed histories can contain assistants without diagnostics;
+            # include them when deciding whether a future copy is ambiguous.
+            self._resolve_annotations(messages)
 
     @staticmethod
     def _assistant_from_ctx(ctx: TurnContext) -> Message:
@@ -776,10 +780,14 @@ class TrajectoryFileObserver(BaseObserver):
                 self._history.append(assistant)
             if assistant is not None:
                 details = {key: record[key] for key in _DIAGNOSTIC_KEYS if key in record}
-                if details:
-                    self._response_metadata.append(
-                        [assistant, self._fingerprint(assistant), details],
-                    )
+                entry = next(
+                    (entry for entry in self._response_metadata if entry[0] is assistant), None,
+                )
+                if entry is None:
+                    self._response_metadata.append([assistant, self._fingerprint(assistant), details])
+                else:
+                    entry[1] = self._fingerprint(assistant)
+                    entry[2] = details
             self._tool_calls_count += len(ctx.tool_calls or [])
             self._turns_used = ctx.turn
             self._flush_json()

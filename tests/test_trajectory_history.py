@@ -467,3 +467,115 @@ async def test_snapshots_render_only_new_or_changed_messages(tmp_path, monkeypat
     trajectory._flush_json(force=True)
     assert [m["content"] for m in _messages(tmp_path / "trace.json")] == ["m0", "m3"]
     assert rendered[7:] == ["m3"]
+
+
+@pytest.mark.parametrize("field", ["text", "arguments", "image_meta", "usage"])
+async def test_snapshots_detect_nested_history_edits(tmp_path, field):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    assistant = {
+        "role": "assistant", "content": [{"type": "text", "text": "old"}],
+        "tool_calls": [_call("c")], "image_meta": [{"label": "old", "tokens": 1}],
+    }
+    usage = {"prompt_tokens": 10, "details": {"cached": 1}}
+    history = [assistant]
+    await trajectory.on_llm_response(_turn(history, usage=usage))
+    trajectory._flush_json(force=True)
+    if field == "text":
+        assistant["content"][0]["text"] = "new"
+    elif field == "arguments":
+        assistant["tool_calls"][0]["function"]["arguments"] = '{"value":"new"}'
+    elif field == "image_meta":
+        assistant["image_meta"][0]["label"] = "new"
+    else:
+        usage["details"]["cached"] = 2
+    # Completion must detect edits even when every container keeps its identity.
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    saved = _messages(tmp_path / "trace.json")[0]
+    assert _without_diagnostics([saved]) == history
+    assert saved["usage"] == usage
+
+
+@pytest.mark.parametrize("copies", [1, 2])
+@pytest.mark.parametrize("first_has_details", [False, True])
+async def test_duplicate_assistant_copies_do_not_guess_diagnostics(tmp_path, copies, first_has_details):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace")
+    history = [{"role": "assistant", "content": "same"}]
+    await trajectory.on_llm_response(_turn(
+        history, usage={"prompt_tokens": 10} if first_has_details else None,
+        finish_reason="length" if first_has_details else "stop",
+    ))
+    history.append({"role": "assistant", "content": "same"})
+    await trajectory.on_llm_response(_turn(history, turn=2, usage={"prompt_tokens": 20},
+                                           finish_reason="refusal"))
+    # A compactor copies the retained tail, optionally dropping the first turn.
+    history[:] = [dict(message) for message in history[-copies:]]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    assert _messages(tmp_path / "trace.json") == history
+    events = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
+    assert [event.get("usage") for event in events if event["t"] == "llm"] == [
+        {"prompt_tokens": 10} if first_has_details else None, {"prompt_tokens": 20},
+    ]
+
+
+async def test_identity_keeps_diagnostics_when_other_assistant_has_same_text(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    history = [{"role": "assistant", "content": "same"}]
+    await trajectory.on_llm_response(_turn(history, usage={"prompt_tokens": 10}))
+    history.append({"role": "assistant", "content": "same"})
+    await trajectory.on_llm_response(_turn(history, turn=2, usage={"prompt_tokens": 20}))
+    history[:] = [history[-1]]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    assert _messages(tmp_path / "trace.json")[0]["usage"] == {"prompt_tokens": 20}
+
+
+async def test_copied_diagnostic_does_not_attach_to_multiple_candidates(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    history = [{"role": "assistant", "content": "same"}]
+    await trajectory.on_llm_response(_turn(history, usage={"prompt_tokens": 10}))
+    history[:] = [dict(history[0]), dict(history[0])]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    assert _messages(tmp_path / "trace.json") == history
+
+
+async def test_resumed_assistant_without_details_counts_as_an_ambiguous_source(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    history = [{"role": "assistant", "content": "same"}]
+    await trajectory.on_before_llm(_turn(history))
+    history.append({"role": "assistant", "content": "same"})
+    await trajectory.on_llm_response(_turn(history, usage={"prompt_tokens": 20}))
+    history[:] = [dict(history[0])]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    assert _messages(tmp_path / "trace.json") == history
+
+
+async def test_identity_disambiguates_a_copy_with_identical_text(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    history = [{"role": "assistant", "content": "same"}]
+    await trajectory.on_llm_response(_turn(history, usage={"prompt_tokens": 10}))
+    history.append({"role": "assistant", "content": "same"})
+    await trajectory.on_llm_response(_turn(history, turn=2, usage={"prompt_tokens": 20}))
+    history[-1] = dict(history[-1])
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    assert [m["usage"]["prompt_tokens"] for m in _messages(tmp_path / "trace.json")] == [10, 20]
+
+
+async def test_loop_compactor_can_edit_a_native_block_in_place(tmp_path):
+    class EditBlock:
+        def compact(self, messages, keep_recent):
+            for message in messages:
+                if message.get("role") == "assistant" and isinstance(message.get("content"), list):
+                    for block in message["content"]:
+                        if block.get("type") == "text":
+                            block["text"] = "compacted text"
+            return messages
+
+    messages, _, _ = await _run(tmp_path, [
+        LLMResponse(content=[
+            {"type": "thinking", "thinking": "r", "signature": "s"},
+            {"type": "text", "text": "original"},
+        ], tool_calls=[_call("c")]), LLMResponse(content="done"),
+    ], model_profile=ModelProfile(model_id="test", provider="test", thinking_format="content_block"),
+       config=LoopConfig(max_turns=3, compact_after_turns=0, compactor=EditBlock(),
+                         loop_policy=LoopPolicy(no_tool_behavior="stop")))
+    first = next(m for m in messages if m["role"] == "assistant")
+    assert first["content"][-1]["text"] == "compacted text"

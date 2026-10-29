@@ -48,8 +48,12 @@ replies, post-processed result bodies, injections, rollbacks and compaction.
 It preserves the normalizer's reasoning policy and native content blocks rather
 than reconstructing assistant messages from the executable subset of calls.
 Diagnostic fields (`usage`, `thinking_blocks`, `finish_reason`, `stop_details`)
-remain annotations on the corresponding assistant message, including after
-compaction or a thinking reset substitutes a copy of it; `thinking_blocks` is
+remain annotations on the corresponding assistant message. After compaction
+or a thinking reset substitutes copies, diagnostics are recovered only when
+the remaining source and target are both unique; ambiguous repeated text
+keeps its diagnostics in JSONL rather than inheriting another turn's usage or
+stop reason. Messages without diagnostics, including resumed assistants,
+also count as possible sources. `thinking_blocks` is
 omitted while the same blocks are still native assistant content. Values that
 are not JSON (datetimes, bytes, SDK objects) are written in a lossy string form
 rather than failing the snapshot. Images are redacted
@@ -60,8 +64,10 @@ are outside this durable-history snapshot.
 
 JSON snapshots are coalesced during a run (LLM input and response, each tool
 result and turn end count toward `SWARM_TRAJECTORY_COALESCE_N`) and atomically
-replaced; each snapshot re-renders only messages added or changed since the
-previous one. Completion and cancellation force a snapshot of the latest
+replaced; streamed content digests detect nested edits in messages and their
+diagnostics while allowing the unchanged spool prefix to be reused. Digests
+inspect values on each due snapshot without retaining a serialized history
+copy. Completion and cancellation force a snapshot of the latest
 history, and a cancellation that arrives after completion leaves the terminal
 snapshot untouched. Hosts that drive the hooks without loop history still get
 the assistant and tool entries built from the hook arguments. JSONL is the event
