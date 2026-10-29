@@ -40,6 +40,37 @@ and falls back to core behavior rather than failing the batch, and a fan-in
 interrupt waiter that returns `False` or raises leaves the tool running instead
 of discarding its collected work.
 
+## Trajectory snapshots and events
+
+`TrajectoryFileObserver` writes two complementary formats. The JSON envelope's
+`messages` follows the loop's current history, including engine-generated tool
+replies, post-processed result bodies, injections, rollbacks and compaction.
+It preserves the normalizer's reasoning policy and native content blocks rather
+than reconstructing assistant messages from the executable subset of calls.
+Diagnostic fields (`usage`, `thinking_blocks`, `finish_reason`, `stop_details`)
+remain annotations on the corresponding assistant message, including after
+compaction or a thinking reset substitutes a copy of it; `thinking_blocks` is
+omitted while the same blocks are still native assistant content. Values that
+are not JSON (datetimes, bytes, SDK objects) are written in a lossy string form
+rather than failing the snapshot. Images are redacted
+and tool text obeys `SWARM_TRAJECTORY_BODY_MAX_CHARS` (default 16384; 0 disables
+the cap), so the snapshot is a trace representation rather than a byte-exact
+provider payload. Transient per-request addenda and provider middleware edits
+are outside this durable-history snapshot.
+
+JSON snapshots are coalesced during a run (LLM input and response, each tool
+result and turn end count toward `SWARM_TRAJECTORY_COALESCE_N`) and atomically
+replaced; each snapshot re-renders only messages added or changed since the
+previous one. Completion and cancellation force a snapshot of the latest
+history, and a cancellation that arrives after completion leaves the terminal
+snapshot untouched. Hosts that drive the hooks without loop history still get
+the assistant and tool entries built from the hook arguments. JSONL is the event
+log: it retains original tool outputs before post-processing, and events whose
+messages are later pruned from history. Trajectory hooks are awaited so an
+immediate synthetic result cannot overtake its assistant event. Consumers that
+need the execution events should read JSONL; consumers that need the current
+conversation should read JSON and handle native block-list content.
+
 ## Repeated-invocation metadata has no core-side consumer, by construction
 
 `ToolResult.repeat_count`, `ToolResult.repeat_recovery_id`, `ToolResult.result_id`
