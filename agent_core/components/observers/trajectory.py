@@ -75,20 +75,19 @@ def _line_digest(line: bytes) -> bytes:
 def _lineage(message: Any) -> list[Any]:
     """Objects a shallow copy of *message* still shares with it.
 
-    Compaction and thinking resets copy the message dict but keep its values
-    (or, for a rebuilt content list, its blocks). A message the model produced
-    separately never shares these objects, even when its text is identical.
-    Falsy values are excluded: ``""`` and ``()`` are interpreter singletons.
+    Compaction and thinking resets keep mutable content/tool-call containers
+    or their blocks. Scalar identities are not evidence: even separately
+    decoded nonempty strings can be shared through interpreter caches.
     """
     if not isinstance(message, dict):
         return []
     shared: list[Any] = []
-    for key in ("content", "tool_calls", "reasoning_content"):
+    for key in ("content", "tool_calls"):
         value = message.get(key)
-        if value:
+        if isinstance(value, (dict, list)) and value:
             shared.append(value)
             if isinstance(value, list):
-                shared.extend(item for item in value if item)
+                shared.extend(item for item in value if isinstance(item, (dict, list)) and item)
     return shared
 
 
@@ -411,12 +410,10 @@ class TrajectoryFileObserver(BaseObserver):
             # Map each object a vanished assistant owned to that assistant.
             # The entry still references the old message, so these ids
             # cannot be reused while this lookup is alive.
-            owners: dict[int, list[list[Any]]] = {}
+            owners: dict[int, dict[int, list[Any]]] = {}
             for entry in unmatched:
                 for value in _lineage(entry[0]):
-                    sources = owners.setdefault(id(value), [])
-                    if entry not in sources:
-                        sources.append(entry)
+                    owners.setdefault(id(value), {})[id(entry)] = entry
             if owners:
                 claims: dict[int, list[Message]] = {}
                 for message in history:
@@ -426,15 +423,13 @@ class TrajectoryFileObserver(BaseObserver):
                         or id(message) in bound
                     ):
                         continue
-                    sources: list[list[Any]] = []
+                    sources: dict[int, list[Any]] = {}
                     for value in _lineage(message):
-                        for entry in owners.get(id(value), ()):
-                            if entry not in sources:
-                                sources.append(entry)
+                        sources.update(owners.get(id(value), {}))
                     # A copy of several turns, or several copies of one turn,
                     # identifies nothing. Leave those diagnostics in JSONL.
                     if len(sources) == 1:
-                        claims.setdefault(id(sources[0]), []).append(message)
+                        claims.setdefault(next(iter(sources)), []).append(message)
                 for entry in unmatched:
                     targets = claims.get(id(entry), [])
                     if len(targets) == 1:

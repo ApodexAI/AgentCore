@@ -50,10 +50,13 @@ than reconstructing assistant messages from the executable subset of calls.
 Diagnostic fields (`usage`, `thinking_blocks`, `finish_reason`, `stop_details`)
 remain annotations on the corresponding assistant message. After compaction
 or a thinking reset substitutes a shallow copy, diagnostics move to the copy
-only when it shares content objects with exactly one vanished assistant and no
-other copy claims that assistant. Equal text alone never transfers them, so a
-separately generated reply cannot inherit another turn's usage or stop
-reason; ambiguous or deep-copied turns keep their diagnostics in JSONL.
+only when it shares mutable content/tool-call containers or blocks with exactly
+one vanished assistant and no other copy claims that assistant. Scalar object
+identity is not evidence: separate JSON responses can share cached strings.
+Ambiguous, deep-copied and plain-text-only copies without shared mutable
+structure keep their diagnostics in JSONL when enabled. Source deduplication
+uses entry identity and never compares message dictionaries by value, so cyclic
+host metadata can reach the rendering fallback safely.
 Messages without diagnostics, including resumed assistants, also count as
 possible sources. `thinking_blocks` is
 omitted while the same blocks are still native assistant content. Values that
