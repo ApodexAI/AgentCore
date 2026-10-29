@@ -369,8 +369,11 @@ async def test_diagnostics_survive_a_signed_thinking_reset(tmp_path):
     history = [{"role": "user", "content": "start"}, assistant]
     await trajectory.on_llm_response(_turn(history, ai_text="a", thinking_blocks=blocks,
                                            usage={"input_tokens": 3}))
-    # _reset_signed_thinking_history substitutes a copy without the blocks.
-    history[1] = {**assistant, "content": [{"type": "text", "text": "a"}]}
+    # The real reset substitutes a copy without the blocks.
+    from agent_core.runtime.loop.agent_loop import _reset_signed_thinking_history
+
+    _reset_signed_thinking_history(history)
+    assert history[1] is not assistant
     await trajectory.on_loop_end(AgentLoopResult(messages=history))
     last = _messages(tmp_path / "trace.json")[-1]
     assert last["usage"] == {"input_tokens": 3}
@@ -453,18 +456,18 @@ async def test_snapshots_render_only_new_or_changed_messages(tmp_path, monkeypat
     monkeypatch.setattr(trajectory, "_message_to_dict", counting)
     history = [{"role": "user", "content": f"m{i}"} for i in range(3)]
     trajectory._history = history
-    trajectory._flush_json(force=True)
+    trajectory._flush_json()
     history.append({"role": "user", "content": "m3"})
-    trajectory._flush_json(force=True)
+    trajectory._flush_json()
     assert rendered == ["m0", "m1", "m2", "m3"]
 
     # Value replacement in place (as image eviction does) is detected.
     history[1]["content"] = "edited"
-    trajectory._flush_json(force=True)
+    trajectory._flush_json()
     assert rendered[4:] == ["edited", "m2", "m3"]
     # So is a rewrite that removes messages.
     history[:] = [history[0], history[3]]
-    trajectory._flush_json(force=True)
+    trajectory._flush_json()
     assert [m["content"] for m in _messages(tmp_path / "trace.json")] == ["m0", "m3"]
     assert rendered[7:] == ["m3"]
 
@@ -579,3 +582,107 @@ async def test_loop_compactor_can_edit_a_native_block_in_place(tmp_path):
                          loop_policy=LoopPolicy(no_tool_behavior="stop")))
     first = next(m for m in messages if m["role"] == "assistant")
     assert first["content"][-1]["text"] == "compacted text"
+
+
+async def test_routine_snapshots_do_not_reserialize_the_prefix(tmp_path, monkeypatch):
+    from agent_core.runtime.loop.compact import COMPACTION_SEQ_KEY
+
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    rendered = []
+    original = trajectory._message_to_dict
+
+    def counting(message):
+        rendered.append(message.get("content"))
+        return original(message)
+
+    monkeypatch.setattr(trajectory, "_message_to_dict", counting)
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 4096}}
+    block = {"type": "text", "text": "old"}
+    history = [{"role": "user", "content": [block, image]}, {"role": "assistant", "content": "a"}]
+    metadata = {}
+    await trajectory.on_before_llm(_turn(history, metadata=metadata))
+    await trajectory.on_llm_input(_turn(list(history), metadata=dict(metadata)))
+    await trajectory.on_turn_end(_turn(history, metadata=metadata))
+    assert len(rendered) == 2
+
+    # A nested edit with no compaction is not looked for on routine snapshots.
+    block["text"] = "edited"
+    await trajectory.on_llm_input(_turn(list(history), metadata=dict(metadata)))
+    assert len(rendered) == 2
+    # A compactor run (its counter advances even without a notice) schedules
+    # one deep comparison of the redacted lines, which finds the edit.
+    metadata[COMPACTION_SEQ_KEY] = 1
+    await trajectory.on_llm_input(_turn(list(history), metadata=dict(metadata)))
+    assert _messages(tmp_path / "trace.json")[0]["content"][0]["text"] == "edited"
+    assert "AAAA" not in (tmp_path / "trace.json").read_text()
+    count = len(rendered)
+    await trajectory.on_turn_end(_turn(history, metadata=metadata))
+    assert len(rendered) == count
+
+
+async def test_rollback_notice_schedules_a_deep_check(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    block = {"type": "text", "text": "old"}
+    history = [{"role": "user", "content": [block]}]
+    await trajectory.on_before_llm(_turn(history))
+    await trajectory.on_turn_end(_turn(history))
+    block["text"] = "edited"
+    await trajectory.on_context_compacted(None)
+    await trajectory.on_turn_end(_turn(history))
+    assert _messages(tmp_path / "trace.json")[0]["content"][0]["text"] == "edited"
+
+
+async def test_diagnostics_follow_an_in_place_edit_and_a_later_copy(tmp_path):
+    from agent_core.runtime.loop.agent_loop import _reset_signed_thinking_history
+
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    blocks = [{"type": "thinking", "thinking": "r", "signature": "s"}]
+    text = {"type": "text", "text": "original"}
+    history = [{"role": "assistant", "content": [*blocks, text], "tool_calls": [_call("c")]},
+               {"role": "tool", "tool_call_id": "c", "content": "ok"}]
+    await trajectory.on_llm_response(_turn(history, thinking_blocks=blocks,
+                                           usage={"prompt_tokens": 10}))
+    trajectory._flush_json(force=True)
+    text["text"] = "compacted text"
+    _reset_signed_thinking_history(history)
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    first = _messages(tmp_path / "trace.json")[0]
+    assert first["content"] == [{"type": "text", "text": "compacted text"}]
+    assert first["usage"] == {"prompt_tokens": 10}
+
+
+async def test_a_new_assistant_with_equal_text_never_inherits_a_vanished_copy(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    # Built at runtime so the two strings are distinct objects, as model
+    # output always is; literals would be interned and shared.
+    first = {"role": "assistant", "content": "".join(["o", "k"])}
+    history = [first]
+    await trajectory.on_llm_response(_turn(history, usage={"prompt_tokens": 10},
+                                           finish_reason="length"))
+    history[0] = dict(first)
+    trajectory._flush_json(force=True)
+    assert _messages(tmp_path / "trace.json")[0]["usage"] == {"prompt_tokens": 10}
+    # Within one coalesced window the copy is dropped and an unrelated
+    # assistant with the same text arrives without its own diagnostics.
+    history[:] = [{"role": "assistant", "content": "".join(["o", "k"])}]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    assert _messages(tmp_path / "trace.json") == history
+
+
+async def test_unencodable_history_values_keep_the_snapshot_and_pairing(tmp_path):
+    trajectory = TrajectoryFileObserver(tmp_path, filename="trace", formats=["json"])
+    await trajectory.on_loop_start(LoopConfig())
+    cycle = {}
+    cycle["self"] = cycle
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [_call("c")]},
+        {"role": "tool", "tool_call_id": "c", "content": "ok", "meta": cycle},
+        {"role": "tool", "tool_call_id": "d", "content": "ok", "meta": {(1, 2): "tuple key"}},
+        {"role": "user", "content": "after"},
+    ]
+    await trajectory.on_loop_end(AgentLoopResult(messages=history))
+    messages = _messages(tmp_path / "trace.json")
+    assert [m.get("tool_call_id") for m in messages] == [None, "c", "d", None]
+    assert "unserializable" in messages[1]["trace_error"]
+    assert "unserializable" in messages[2]["trace_error"]
+    assert messages[-1]["content"] == "after"
