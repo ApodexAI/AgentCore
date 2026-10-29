@@ -7,6 +7,16 @@ the GitHub Release body, so a release with no entry here fails.
 
 Versioning follows [docs/versioning.md](docs/versioning.md).
 
+## [0.18.2] - 2026-10-29
+
+### Fixed
+
+- Trajectory JSON snapshots now follow the loop's actual conversation history, including capped and blocked native tool calls, synthetic replies, post-processed result bodies, observer injections, rollbacks and compaction. Awaited trajectory hooks prevent immediate invalid-call results from appearing before their assistant event.
+- Assistant messages preserve the normalizer's reasoning policy and native content blocks. Consumers that need flattened text should use `agent_core.messages.text_of(message["content"])`. JSONL continues to retain execution events and original tool outputs, including events later removed from conversation history.
+- Routine snapshots reuse the spool prefix by reference. Nested in-place edits are checked against redacted rendered lines after compactor runs, compaction/rollback notices, and on completion or cancellation; inline image base64 is never hashed. Unannounced nested edits by other observers appear at the next deep check or final snapshot. Image redaction, configured body limits and coalesced atomic writes remain in place.
+- Diagnostic annotations follow a copied assistant only when it shares mutable content/tool-call containers or blocks with exactly one vanished source and has no competing copy. Cached strings cannot transfer another turn's usage or stop reason. Ambiguous, deep-copied and scalar-only copied messages retain their diagnostics in JSONL when enabled; direct identity bindings remain intact.
+- Cyclic or otherwise unencodable host metadata preserves the message's position with `trace_error` instead of freezing later snapshots. Source deduplication uses object identity without recursively comparing message dictionaries. Completion and cancellation force the latest snapshot, and a cancellation after completion preserves the terminal snapshot.
+
 ## [0.18.1] - 2026-10-14
 
 ### Fixed
