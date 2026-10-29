@@ -8,10 +8,10 @@ so partial runs remain readable without retaining full payloads in memory.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import time
-from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -20,12 +20,14 @@ from agent_core.loop_types import (
     AgentLoopResult,
     BaseObserver,
     CompactionEvent,
+    ContextCompactionContext,
     Intervention,
     LoopConfig,
     ToolResult,
     TurnContext,
 )
 from agent_core.messages import Message
+from agent_core.runtime.loop.compact import COMPACTION_SEQ_KEY
 from agent_core.tool_content import redacted_for_trace, redacted_tool_result_content
 
 _FORMATS: tuple[str, ...] = ("json", "jsonl")
@@ -34,8 +36,6 @@ _DEFAULT_FORMATS: tuple[str, ...] = _FORMATS
 # information and appear on almost every turn, so trajectories omit them.
 _ORDINARY_FINISH_REASONS = frozenset({"end_turn", "stop"})
 _DIAGNOSTIC_KEYS = ("usage", "thinking_blocks", "finish_reason", "stop_details")
-# Blocks a signature-recovery reset strips from assistant content.
-_THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 
 
 def _json_default(value: Any) -> Any:
@@ -65,6 +65,32 @@ def _json_default(value: Any) -> Any:
 _STREAM_ENCODER = json.JSONEncoder(
     ensure_ascii=False, separators=(",", ":"), default=_json_default,
 )
+
+
+def _line_digest(line: bytes) -> bytes:
+    """Digest of one rendered (redacted, clipped) spool line."""
+    return hashlib.blake2b(line, digest_size=16).digest()
+
+
+def _lineage(message: Any) -> list[Any]:
+    """Objects a shallow copy of *message* still shares with it.
+
+    Compaction and thinking resets keep mutable content/tool-call containers
+    or their blocks. Scalar identities are not evidence: even separately
+    decoded nonempty strings can be shared through interpreter caches.
+    """
+    if not isinstance(message, dict):
+        return []
+    shared: list[Any] = []
+    for key in ("content", "tool_calls"):
+        value = message.get(key)
+        if isinstance(value, (dict, list)) and value:
+            shared.append(value)
+            if isinstance(value, list):
+                shared.extend(item for item in value if isinstance(item, (dict, list)) and item)
+    return shared
+
+
 _DEFAULT_FORMAT_ENV_VARS = (
     "AGENT_CORE_TRAJECTORY_FORMATS",
     "FRONTIER_AGENT_TRAJECTORY_FORMATS",
@@ -147,8 +173,8 @@ class TrajectoryFileObserver(BaseObserver):
     # task never moved that work off the event loop; it only reordered it.
     # Awaiting them preserves event order even when a synthetic result needs
     # no async tool execution, where a background on_llm_response could run
-    # AFTER it. Coalescing and re-rendering only new or changed messages keep
-    # the awaited cost per flush small.
+    # AFTER it. Coalescing limits snapshot work; streamed value digests let
+    # unchanged spool prefixes survive while still detecting nested edits.
     critical: bool = True
 
     def __init__(
@@ -221,16 +247,24 @@ class TrajectoryFileObserver(BaseObserver):
         # True when no loop history was offered (a host driving the hooks
         # directly), so the observer assembles the conversation itself.
         self._owns_history: bool = False
-        # Diagnostic fields are separate from history, kept as [message,
-        # content fingerprint, details] in response order. Identity binds them
-        # first; the fingerprint re-binds them to the shallow copies that
-        # compaction and thinking resets substitute. Entries whose message left
-        # history are released at the next snapshot.
-        self._response_metadata: list[list[Any]] = []
-        # One (message, signature, end offset) per history entry already in
-        # the spool. A snapshot keeps the longest unchanged prefix and
-        # re-renders only from the first new, replaced or edited message.
-        self._spool_entries: list[tuple[Any, tuple[Any, ...], int]] = []
+        # Diagnostic fields are separate from history: id(message) ->
+        # [message, details], one entry per assistant in history. Identity
+        # binds them first; a replacement inherits an entry only when it is a
+        # shallow copy of exactly one vanished assistant (see ``_lineage``).
+        # Entries without diagnostics still compete, so repeated text cannot
+        # inherit another turn's details. Entries whose message left history
+        # are released at the next snapshot.
+        self._response_metadata: dict[int, list[Any]] = {}
+        # One (message, reference signature, line digest, end offset) per
+        # history entry already in the spool. A snapshot keeps the longest
+        # unchanged prefix and re-renders from the first difference.
+        self._spool_entries: list[tuple[Any, tuple[Any, ...], bytes, int]] = []
+        # Reference signatures catch replaced messages and values. Edits nested
+        # inside a kept container need the rendered content compared, which
+        # costs a full re-render, so it runs only after a compaction or
+        # rollback notice and on forced (terminal) snapshots.
+        self._deep_check_due: bool = False
+        self._compaction_seq: Any = None
         # Set by on_loop_end. A cancellation arriving after it (while a later
         # observer still runs) must not overwrite the terminal snapshot.
         self._ended: bool = False
@@ -345,8 +379,8 @@ class TrajectoryFileObserver(BaseObserver):
 
         History edits replace values (``message["content"] = rebuilt``) or
         whole messages, so identity of each value and content block detects
-        them without re-serialising. Holding the references keeps their ids
-        from being reused before the next comparison.
+        them without serialising anything. Holding the references keeps their
+        ids from being reused before the next comparison.
         """
         if not isinstance(message, dict):
             return (message, details)
@@ -362,59 +396,53 @@ class TrajectoryFileObserver(BaseObserver):
             )
         return a is b
 
-    @staticmethod
-    def _fingerprint(message: Message) -> int:
-        """Content identity that survives reasoning and thinking-block strips."""
-        content = message.get("content")
-        if isinstance(content, list):
-            content = [
-                block for block in content
-                if not isinstance(block, dict)
-                or block.get("type") not in _THINKING_BLOCK_TYPES
-            ]
-        ids = tuple(
-            tc.get("id") for tc in (message.get("tool_calls") or [])
-            if isinstance(tc, dict)
-        )
-        return hash((ids, _STREAM_ENCODER.encode(content)))
-
     def _resolve_annotations(self, history: list[Message]) -> dict[int, dict[str, Any]]:
         """Bind diagnostics to the history messages that carry them now."""
         present = {id(message): message for message in history}
         bound: dict[int, list[Any]] = {}
         unmatched: list[list[Any]] = []
-        for entry in self._response_metadata:
-            ref = entry[0]
-            if present.get(id(ref)) is ref and id(ref) not in bound:
-                bound[id(ref)] = entry
+        for key, entry in self._response_metadata.items():
+            if present.get(key) is entry[0]:
+                bound[key] = entry
             else:
                 unmatched.append(entry)
         if unmatched:
-            pending: dict[int, deque[list[Any]]] = {}
+            # Map each object a vanished assistant owned to that assistant.
+            # The entry still references the old message, so these ids
+            # cannot be reused while this lookup is alive.
+            owners: dict[int, dict[int, list[Any]]] = {}
             for entry in unmatched:
-                pending.setdefault(entry[1], deque()).append(entry)
-            for message in history:
-                if not pending:
-                    break
-                if (
-                    not isinstance(message, dict)
-                    or message.get("role") != "assistant"
-                    or id(message) in bound
-                ):
-                    continue
-                fingerprint = self._fingerprint(message)
-                queue = pending.get(fingerprint)
-                if queue:
-                    entry = queue.popleft()
-                    entry[0] = message
-                    bound[id(message)] = entry
-                    if not queue:
-                        del pending[fingerprint]
-        self._response_metadata = [
-            entry for entry in self._response_metadata
-            if bound.get(id(entry[0])) is entry
-        ]
-        return {key: entry[2] for key, entry in bound.items()}
+                for value in _lineage(entry[0]):
+                    owners.setdefault(id(value), {})[id(entry)] = entry
+            if owners:
+                claims: dict[int, list[Message]] = {}
+                for message in history:
+                    if (
+                        not isinstance(message, dict)
+                        or message.get("role") != "assistant"
+                        or id(message) in bound
+                    ):
+                        continue
+                    sources: dict[int, list[Any]] = {}
+                    for value in _lineage(message):
+                        sources.update(owners.get(id(value), {}))
+                    # A copy of several turns, or several copies of one turn,
+                    # identifies nothing. Leave those diagnostics in JSONL.
+                    if len(sources) == 1:
+                        claims.setdefault(next(iter(sources)), []).append(message)
+                for entry in unmatched:
+                    targets = claims.get(id(entry), [])
+                    if len(targets) == 1:
+                        entry[0] = targets[0]
+                        bound[id(targets[0])] = entry
+        retained: dict[int, list[Any]] = {}
+        for message in history:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            entry = bound.get(id(message)) or [message, {}]
+            retained[id(message)] = entry
+        self._response_metadata = retained
+        return {key: entry[1] for key, entry in retained.items() if entry[1]}
 
     def _render(self, message: Any, details: dict[str, Any] | None) -> bytes:
         rendered = self._message_to_dict(message)
@@ -430,9 +458,26 @@ class TrajectoryFileObserver(BaseObserver):
                 # Already preserved verbatim as native content blocks.
                 details = {k: v for k, v in details.items() if k != "thinking_blocks"}
             rendered.update(details)
-        return (_STREAM_ENCODER.encode(rendered) + "\n").encode("utf-8")
+        try:
+            text = _STREAM_ENCODER.encode(rendered)
+        except (TypeError, ValueError, RecursionError) as exc:
+            # Non-string keys or a reference cycle in host metadata. Keep the
+            # message's place (and its tool pairing) instead of losing the
+            # whole snapshot.
+            fallback = {
+                key: rendered[key] for key in ("role", "tool_call_id", "tool_calls")
+                if key in rendered
+            }
+            fallback["content"] = str(rendered.get("content", ""))
+            fallback["trace_error"] = f"unserializable message: {exc}"
+            try:
+                text = _STREAM_ENCODER.encode(fallback)
+            except (TypeError, ValueError, RecursionError):
+                fallback.pop("tool_calls", None)
+                text = _STREAM_ENCODER.encode(fallback)
+        return (text + "\n").encode("utf-8")
 
-    def _sync_history(self) -> None:
+    def _sync_history(self, *, deep: bool = False) -> None:
         """Bring the spool up to the real history, including in-place edits.
 
         A length/delta cursor is insufficient: compaction, rollback, thinking
@@ -440,6 +485,10 @@ class TrajectoryFileObserver(BaseObserver):
         The unchanged prefix stays on disk; from the first difference onwards
         the spool is truncated and re-rendered. Each message is rendered whole
         before it is written, so a failure leaves a consistent prefix.
+
+        Prefix messages are compared by reference signature. *deep* also
+        re-renders them and compares the redacted line, which catches edits
+        nested inside a container the message kept.
         """
         history = self._history
         if history is None:
@@ -448,16 +497,24 @@ class TrajectoryFileObserver(BaseObserver):
         entries = self._spool_entries
         path = self._message_spool_path()
         keep = 0
+        first_line: bytes | None = None
         if path.exists():
             limit = min(len(entries), len(history))
             while keep < limit:
                 message = history[keep]
-                ref, signature, _ = entries[keep]
-                current = self._signature(message, details_for.get(id(message)))
-                if ref is not message or not self._same(signature, current):
+                ref, signature, digest, _ = entries[keep]
+                details = details_for.get(id(message))
+                if ref is not message or not self._same(
+                    signature, self._signature(message, details),
+                ):
                     break
+                if deep:
+                    line = self._render(message, details)
+                    if _line_digest(line) != digest:
+                        first_line = line
+                        break
                 keep += 1
-        offset = entries[keep - 1][2] if keep else 0
+        offset = entries[keep - 1][3] if keep else 0
         del entries[keep:]
         # Open even for an empty history so a rollback to [] clears the spool.
         with path.open("r+b" if keep else "wb") as fh:
@@ -465,10 +522,13 @@ class TrajectoryFileObserver(BaseObserver):
             fh.truncate()
             for message in history[keep:]:
                 details = details_for.get(id(message))
-                line = self._render(message, details)
+                line = first_line if first_line is not None else self._render(message, details)
+                first_line = None
                 fh.write(line)
                 offset += len(line)
-                entries.append((message, self._signature(message, details), offset))
+                entries.append((
+                    message, self._signature(message, details), _line_digest(line), offset,
+                ))
 
     def _write_envelope(self, path: Path) -> None:
         """Stream one compatible JSON envelope without materialising it."""
@@ -553,7 +613,10 @@ class TrajectoryFileObserver(BaseObserver):
                 return
         self._pending_flushes = 0
         self._last_flush_at = time.monotonic()
-        self._sync_history()
+        deep = force or self._deep_check_due
+        self._sync_history(deep=deep)
+        if deep:
+            self._deep_check_due = False
         path = self._path("json")
         tmp = path.with_suffix(path.suffix + ".tmp")
         self._write_envelope(tmp)
@@ -639,6 +702,8 @@ class TrajectoryFileObserver(BaseObserver):
         self._role_id = config.role_id
         self._max_turns = config.max_turns
         self._ended = False
+        self._deep_check_due = False
+        self._compaction_seq = None
         # After ``_task_id`` is set: it is the stem fallback when no explicit
         # ``filename`` was passed.
         self._publish_jsonl_path()
@@ -665,22 +730,45 @@ class TrajectoryFileObserver(BaseObserver):
         # injections, compaction, early exits and cancellation. The loop
         # rewrites it in place, so binding once per run is enough.
         self._bind_history(ctx.messages)
+        self._note_compaction(ctx)
         return None
 
     async def on_llm_input(self, ctx: TurnContext) -> None:
         # Injections from on_before_llm have now been applied. Transient request
         # addenda belong to the request, not to durable conversation history.
+        self._note_compaction(ctx)
         self._flush_json()
 
     async def on_turn_end(self, ctx: TurnContext) -> Intervention | None:
+        self._note_compaction(ctx)
         self._flush_json()
         return None
+
+    async def on_context_compacted(self, ctx: ContextCompactionContext) -> None:
+        # Rollbacks and context-limit pops announce themselves here.
+        self._deep_check_due = True
+
+    def _note_compaction(self, ctx: TurnContext) -> None:
+        """Schedule a deep check when a compactor ran since the last look.
+
+        A compactor may edit blocks in place, leaving every reference intact,
+        and then the loop sends no ``on_context_compacted``. Its run counter in
+        loop metadata advances regardless.
+        """
+        seq = (ctx.metadata or {}).get(COMPACTION_SEQ_KEY)
+        if seq != self._compaction_seq:
+            if self._compaction_seq is not None or seq:
+                self._deep_check_due = True
+            self._compaction_seq = seq
 
     def _bind_history(self, messages: list[Message] | None) -> None:
         if "json" not in self._formats or self._owns_history or messages is None:
             return
         if self._history is None:
             self._history = messages
+            # Resumed histories can contain assistants without diagnostics;
+            # include them when deciding whether a future copy is ambiguous.
+            self._resolve_annotations(messages)
 
     @staticmethod
     def _assistant_from_ctx(ctx: TurnContext) -> Message:
@@ -776,10 +864,11 @@ class TrajectoryFileObserver(BaseObserver):
                 self._history.append(assistant)
             if assistant is not None:
                 details = {key: record[key] for key in _DIAGNOSTIC_KEYS if key in record}
-                if details:
-                    self._response_metadata.append(
-                        [assistant, self._fingerprint(assistant), details],
-                    )
+                entry = self._response_metadata.get(id(assistant))
+                if entry is not None and entry[0] is assistant:
+                    entry[1] = details
+                else:
+                    self._response_metadata[id(assistant)] = [assistant, details]
             self._tool_calls_count += len(ctx.tool_calls or [])
             self._turns_used = ctx.turn
             self._flush_json()
@@ -835,6 +924,7 @@ class TrajectoryFileObserver(BaseObserver):
         by the summariser's own output length, not by tool output, so it does
         not need the ``_BODY_MAX_CHARS`` guard that tool results do.
         """
+        self._deep_check_due = True
         self._write_jsonl({
             "t": "compaction",
             "turn": event.turn,
@@ -881,7 +971,7 @@ class TrajectoryFileObserver(BaseObserver):
             self._close_message_spool(cleanup=snapshot_written)
             self._history = None
             self._owns_history = False
-            self._response_metadata = []
+            self._response_metadata = {}
 
     async def on_loop_cancelled(self) -> None:
         """Flush current history and preserve crash-forensic sidecars."""
@@ -897,4 +987,4 @@ class TrajectoryFileObserver(BaseObserver):
             self._close_message_spool()
             self._history = None
             self._owns_history = False
-            self._response_metadata = []
+            self._response_metadata = {}

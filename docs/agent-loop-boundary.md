@@ -48,8 +48,17 @@ replies, post-processed result bodies, injections, rollbacks and compaction.
 It preserves the normalizer's reasoning policy and native content blocks rather
 than reconstructing assistant messages from the executable subset of calls.
 Diagnostic fields (`usage`, `thinking_blocks`, `finish_reason`, `stop_details`)
-remain annotations on the corresponding assistant message, including after
-compaction or a thinking reset substitutes a copy of it; `thinking_blocks` is
+remain annotations on the corresponding assistant message. After compaction
+or a thinking reset substitutes a shallow copy, diagnostics move to the copy
+only when it shares mutable content/tool-call containers or blocks with exactly
+one vanished assistant and no other copy claims that assistant. Scalar object
+identity is not evidence: separate JSON responses can share cached strings.
+Ambiguous, deep-copied and plain-text-only copies without shared mutable
+structure keep their diagnostics in JSONL when enabled. Source deduplication
+uses entry identity and never compares message dictionaries by value, so cyclic
+host metadata can reach the rendering fallback safely.
+Messages without diagnostics, including resumed assistants, also count as
+possible sources. `thinking_blocks` is
 omitted while the same blocks are still native assistant content. Values that
 are not JSON (datetimes, bytes, SDK objects) are written in a lossy string form
 rather than failing the snapshot. Images are redacted
@@ -60,8 +69,11 @@ are outside this durable-history snapshot.
 
 JSON snapshots are coalesced during a run (LLM input and response, each tool
 result and turn end count toward `SWARM_TRAJECTORY_COALESCE_N`) and atomically
-replaced; each snapshot re-renders only messages added or changed since the
-previous one. Completion and cancellation force a snapshot of the latest
+replaced. Routine snapshots compare the spool prefix by reference, which
+catches replaced messages and values without serializing history. Edits nested
+inside a kept container are found by comparing redacted rendered lines, a
+full pass that runs after a compactor run, a rollback or context-limit notice,
+and on completion or cancellation. Completion and cancellation force a snapshot of the latest
 history, and a cancellation that arrives after completion leaves the terminal
 snapshot untouched. Hosts that drive the hooks without loop history still get
 the assistant and tool entries built from the hook arguments. JSONL is the event
